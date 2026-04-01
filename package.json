@@ -1,0 +1,38 @@
+{
+  "name": "langgraph-workflow-bridge-prod",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Production-oriented local-first orchestration starter with LangGraph, SQLite persistence, worktree isolation, typed bridge operations, recovery, tests, and a minimal React UI.",
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/**/*.test.ts",
+    "api": "node --experimental-strip-types src/apps/api.ts",
+    "worker": "node --experimental-strip-types src/apps/worker.ts",
+    "seed": "node --experimental-strip-types src/apps/seed.ts",
+    "demo": "node --experimental-strip-types src/apps/demo.ts",
+    "ui": "vite",
+    "build:ui": "vite build",
+    "preview:ui": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.1.38",
+    "@langchain/langgraph": "^1.2.6",
+    "@langchain/ollama": "^1.2.6",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "zod": "^3.25.76",
+    "opencode-ai": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
+    "@vitejs/plugin-react": "^4.5.1",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.0"
+  }
+}
