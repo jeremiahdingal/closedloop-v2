@@ -85,6 +85,8 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       }
     }
 
+    emit({ kind: "text", text: `[iteration ${iteration + 1}/${maxIterations}] Calling model...` });
+
     // Make streaming request
     let response: Response;
     try {
@@ -257,6 +259,8 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         emit({ kind: "tool_error", call: toolCall, error: validated.message });
         history.record(completeCall.name, {}, true);
 
+        console.log(`  [ERROR] ${completeCall.name}: ${validated.message}`);
+
         assistantToolCalls.push({
           id: completeCall.id,
           type: "function",
@@ -291,6 +295,8 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         emit({ kind: "tool_result", result: { callId: completeCall.id, name: "finish", output: summary } });
         emit({ kind: "complete", result, iterations: iteration + 1 });
 
+        console.log(`  [FINISH] ${summary}`);
+
         return {
           text: result,
           toolCalls: collectedToolCalls,
@@ -303,10 +309,14 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       emit({ kind: "tool_call", call: toolCall });
       collectedToolCalls.push(toolCall);
 
+      console.log(`  [TOOL] ${validated.name}(${JSON.stringify(validated.args).slice(0, 100)})`);
+
       const result = await executeToolCall(toolCall, ctx);
       history.record(validated.name, validated.args, result.isError ?? false);
 
       emit({ kind: "tool_result", result });
+
+      console.log(`  [RESULT] ${validated.name}: ${result.output.slice(0, 100)}${result.output.length > 100 ? '...' : ''}`);
 
       assistantToolCalls.push({
         id: completeCall.id,
