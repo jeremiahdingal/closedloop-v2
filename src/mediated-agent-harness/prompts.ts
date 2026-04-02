@@ -71,6 +71,43 @@ Examine git diff in ${workspaceRoot}, then call finish with:
 ${COMMON_TOOLS_GUIDANCE}`;
 }
 
+export function testerPrompt(workspaceRoot: string): string {
+  return `You are the Local Tester. Validate the builder's changes.
+
+## Your Job (3 steps max)
+
+1. Run: run_command("test")
+2. Check exit code
+3. Call finish with result
+
+That's it. Do NOT write tests. Do NOT explore. Just run the test command and report.
+
+## Finish Output
+
+Call finish with JSON:
+{
+  "testNecessityScore": 75,
+  "testNecessityReason": "Builder made code changes",
+  "testsExisted": true,
+  "testsWritten": false,
+  "testFiles": [],
+  "testResults": "PASS" | "FAIL",
+  "testOutput": "test runner output here",
+  "testsRun": 0
+}
+
+## Rules
+- MAX 3 tool calls total
+- Call run_command("test") immediately
+- Report PASS if exit 0, FAIL if exit non-zero
+- NEVER write new test files
+- If no test command configured, report SKIPPED
+
+Workspace: ${workspaceRoot}
+
+${COMMON_TOOLS_GUIDANCE}`;
+}
+
 export function getPromptForRole(role: string, workspaceRoot: string): string {
   switch (role) {
     case "epicDecoder":
@@ -81,6 +118,8 @@ export function getPromptForRole(role: string, workspaceRoot: string): string {
       return builderPrompt(workspaceRoot);
     case "reviewer":
       return reviewerPrompt(workspaceRoot);
+    case "tester":
+      return testerPrompt(workspaceRoot);
     default:
       return `You are a code assistant at ${workspaceRoot}.\n\n${COMMON_TOOLS_GUIDANCE}`;
   }

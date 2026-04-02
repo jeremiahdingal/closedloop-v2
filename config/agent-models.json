@@ -1,8 +1,8 @@
 {
-  "epicDecoder": "opencode:qwen3-coder:30b",
-  "builder": "opencode:qwen3-coder:30b",
-  "reviewer": "glm-4.7-flash:q4_K_M",
-  "tester": "glm-4.7-flash:q4_K_M",
+  "epicDecoder": "mediated:qwen3-coder:30b",
+  "builder": "mediated:qwen3-coder:30b",
+  "reviewer": "mediated:glm-4.7-flash:q4_K_M",
+  "tester": "mediated:glm-4.7-flash:q4_K_M",
   "epicReviewer": "mediated:glm-4.7-flash:q4_K_M",
   "doctor": "qwen3:8b"
 }
