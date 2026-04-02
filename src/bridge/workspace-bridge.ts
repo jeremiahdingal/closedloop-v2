@@ -1,5 +1,5 @@
 import path from "node:path";
-import { readFile, rm, stat, writeFile } from "node:fs/promises";
+import { readFile, rm, stat, writeFile, cp } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { AppDatabase } from "../db/database.ts";
@@ -37,24 +37,33 @@ export class WorkspaceBridge {
     await stat(gitDir);
   }
 
-  async createWorkspace(input: { ticketId: string; runId: string; baseRef?: string; owner: string }): Promise<WorkspaceRecord> {
-    await this.assertGitRepo(this.config.repoRoot);
-
+  async createWorkspace(input: { ticketId: string; runId: string; baseRef?: string; owner: string; targetDir: string }): Promise<WorkspaceRecord> {
+    const isGitRepo = await stat(path.join(input.targetDir, ".git")).then(() => true).catch(() => false);
+    
     const workspaceId = randomId("ws");
     const branchName = `ticket/${input.ticketId}-${workspaceId.slice(-6)}`;
     const worktreePath = path.join(this.config.workspacesDir, workspaceId);
     await ensureDir(this.config.workspacesDir);
 
-    const baseRef = input.baseRef ?? "HEAD";
-    const base = await git(this.config.repoRoot, ["rev-parse", baseRef]);
-    const baseCommit = base.stdout.trim();
+    let baseCommit = "";
+    if (isGitRepo) {
+      const baseRef = input.baseRef ?? "HEAD";
+      const base = await git(input.targetDir, ["rev-parse", baseRef]);
+      baseCommit = base.stdout.trim();
+      await git(input.targetDir, ["worktree", "add", "-b", branchName, worktreePath, baseCommit]);
+    } else {
+      await cp(input.targetDir, worktreePath, { recursive: true });
+      await git(worktreePath, ["init"]);
+      await git(worktreePath, ["add", "-A"]);
+      await git(worktreePath, ["commit", "-m", "Initial state --allow-empty"]);
+      baseCommit = "initial";
+    }
 
-    await git(this.config.repoRoot, ["worktree", "add", "-b", branchName, worktreePath, baseCommit]);
     const workspace = this.db.createWorkspace({
       id: workspaceId,
       ticketId: input.ticketId,
       runId: input.runId,
-      repoRoot: this.config.repoRoot,
+      repoRoot: input.targetDir,
       worktreePath,
       branchName,
       baseCommit,
@@ -63,7 +72,7 @@ export class WorkspaceBridge {
       leaseOwner: input.owner
     });
 
-    await this.logAudit("workspace.log", `created workspace=${workspaceId} ticket=${input.ticketId} path=${worktreePath}`);
+    await this.logAudit("workspace.log", `created workspace=${workspaceId} ticket=${input.ticketId} path=${worktreePath} target=${input.targetDir}`);
     return workspace;
   }
 
@@ -71,10 +80,11 @@ export class WorkspaceBridge {
     const workspace = this.db.getWorkspace(workspaceId);
     if (!workspace) return;
     try {
-      await git(this.config.repoRoot, ["worktree", "remove", workspace.worktreePath, ...(force ? ["--force"] : [])]);
+      await git(workspace.repoRoot, ["worktree", "remove", workspace.worktreePath, ...(force ? ["--force"] : [])]);
     } catch {
       await rm(workspace.worktreePath, { recursive: true, force: true });
     }
+    await this.deleteWorkspaceBranch(workspace);
     this.db.updateWorkspace({ workspaceId, status: "cleaned", leaseOwner: null });
     this.db.deleteLease("workspace", workspaceId);
     await this.logAudit("workspace.log", `cleaned workspace=${workspaceId}`);
@@ -92,6 +102,23 @@ export class WorkspaceBridge {
     });
     this.db.deleteLease("workspace", workspaceId);
     await this.logAudit("workspace.log", `archived workspace=${workspaceId} head=${head.stdout.trim()}`);
+  }
+
+  async cleanupArchivedWorkspaces(retentionHours = this.config.workspaceRetentionHours): Promise<WorkspaceRecord[]> {
+    const cutoffIso = new Date(Date.now() - retentionHours * 60 * 60 * 1000).toISOString();
+    const archived = this.db.listArchivedWorkspacesOlderThan(cutoffIso);
+    const cleaned: WorkspaceRecord[] = [];
+
+    for (const workspace of archived) {
+      await this.removeWorkspaceWorktree(workspace);
+      await this.deleteWorkspaceBranch(workspace);
+      this.db.updateWorkspace({ workspaceId: workspace.id, status: "cleaned", leaseOwner: null });
+      this.db.deleteLease("workspace", workspace.id);
+      cleaned.push({ ...workspace, status: "cleaned", leaseOwner: null });
+      await this.logAudit("workspace.log", `cleaned workspace=${workspace.id} branch=${workspace.branchName}`);
+    }
+
+    return cleaned;
   }
 
   policyFor(workspace: WorkspaceRecord, allowedPaths: string[]): PathPolicy {
@@ -174,8 +201,26 @@ export class WorkspaceBridge {
 
   async gitDiff(workspaceId: string): Promise<string> {
     const workspace = this.requireWorkspace(workspaceId);
-    const result = await git(workspace.worktreePath, ["diff", "--", "."]);
+    await git(workspace.worktreePath, ["add", "-A"]);
+    const result = await git(workspace.worktreePath, ["diff", "--staged", "--", "."]);
     return result.stdout.trim();
+  }
+
+  async gitPush(input: { workspaceId: string; remote?: string }): Promise<string> {
+    const workspace = this.requireWorkspace(input.workspaceId);
+    const remote = input.remote ?? "origin";
+    await git(workspace.worktreePath, ["push", "-u", remote, workspace.branchName]);
+    return `${remote}/${workspace.branchName}`;
+  }
+
+  async gitRemoteUrl(workspaceId: string): Promise<string | null> {
+    const workspace = this.requireWorkspace(workspaceId);
+    try {
+      const result = await git(workspace.worktreePath, ["remote", "get-url", "origin"]);
+      return result.stdout.trim();
+    } catch {
+      return null;
+    }
   }
 
   async gitStatus(workspaceId: string): Promise<string> {
@@ -195,6 +240,25 @@ export class WorkspaceBridge {
     const head = await git(workspace.worktreePath, ["rev-parse", "HEAD"]);
     this.db.updateWorkspace({ workspaceId: input.workspaceId, headCommit: head.stdout.trim() });
     return head.stdout.trim();
+  }
+
+  async getDiffStats(workspaceId: string): Promise<{ path: string; additions: number; deletions: number }[]> {
+    const workspace = this.requireWorkspace(workspaceId);
+    await git(workspace.worktreePath, ["add", "-A"]);
+    const result = await git(workspace.worktreePath, ["diff", "--staged", "--stat", "--", "."]);
+    const lines = result.stdout.trim().split("\n").filter(l => l.includes("|"));
+    return lines.map(line => {
+      const parts = line.split("|");
+      const filePath = parts[0].trim();
+      const stats = parts[1].trim();
+      const addMatch = stats.match(/(\d+)\s+\+/);
+      const delMatch = stats.match(/(\d+)\s+-/);
+      return {
+        path: filePath,
+        additions: addMatch ? parseInt(addMatch[1]) : 0,
+        deletions: delMatch ? parseInt(delMatch[1]) : 0
+      };
+    });
   }
 
   async saveArtifact(input: {
@@ -254,7 +318,9 @@ export class WorkspaceBridge {
       runId: input.runId,
       ticketId: input.ticketId,
       toolName: `command:${input.commandName}`,
-      argv: ["bash", "-lc", command],
+      argv: process.platform === "win32"
+        ? ["cmd", "/c", command]
+        : ["bash", "-lc", command],
       timeoutMs: input.timeoutMs ?? 180_000,
       inputJson: { commandName: input.commandName, command }
     });
@@ -322,5 +388,21 @@ export class WorkspaceBridge {
     const workspace = this.db.getWorkspace(workspaceId);
     if (!workspace) throw new Error(`Workspace not found: ${workspaceId}`);
     return workspace;
+  }
+
+  private async removeWorkspaceWorktree(workspace: WorkspaceRecord): Promise<void> {
+    try {
+      await git(workspace.repoRoot, ["worktree", "remove", "--force", workspace.worktreePath]);
+    } catch {
+      await rm(workspace.worktreePath, { recursive: true, force: true });
+    }
+  }
+
+  private async deleteWorkspaceBranch(workspace: WorkspaceRecord): Promise<void> {
+    try {
+      await git(workspace.repoRoot, ["branch", "-D", workspace.branchName]);
+    } catch {
+      // Branch may already be gone if the worktree was cleaned manually.
+    }
   }
 }
