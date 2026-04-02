@@ -18,6 +18,9 @@ import {
   validateReviewerVerdict
 } from "./validation.ts";
 import { OpenCodeRunner } from "./opencode.ts";
+import { CodexRunner } from "./codex.ts";
+import { MediatedAgentHarness } from "../mediated-agent-harness/index.ts";
+import type { ToolExecutionContext } from "../mediated-agent-harness/types.ts";
 
 export type StreamHook = (event: AgentStreamPayload) => void;
 
@@ -31,6 +34,9 @@ export interface ModelGateway {
   getFailureDecision(prompt: string): Promise<FailureDecision>;
   runBuilderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<OpenCodeBuilderResult>;
   runGoalReviewInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview>;
+  runEpicDecoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition>;
+  runEpicDecoderOpenCode?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition>;
+  runEpicReviewerCodex?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview>;
 }
 
 function buildZodSchemas(z: any) {
@@ -76,19 +82,35 @@ function buildZodSchemas(z: any) {
   };
 }
 
+function resolveOllamaModel(role: AgentRole, models: Record<AgentRole, string>): string {
+  const raw = models[role];
+  if (raw.startsWith("opencode:")) return raw.slice("opencode:".length);
+  if (raw.startsWith("mediated:")) return raw.slice("mediated:".length);
+  if (raw === "ollama") return process.env.OLLAMA_FALLBACK_MODEL || models.doctor || "qwen3:8b";
+  if (raw === "codex-cli") {
+    if (role === "epicDecoder") return process.env.OLLAMA_EPICDECODER_MODEL || process.env.OLLAMA_FALLBACK_MODEL || models.doctor || "qwen3:8b";
+    if (role === "epicReviewer") return process.env.OLLAMA_EPICREVIEWER_MODEL || process.env.OLLAMA_FALLBACK_MODEL || models.doctor || "qwen3:8b";
+    return process.env.OLLAMA_FALLBACK_MODEL || models.doctor || "qwen3:8b";
+  }
+  return raw;
+}
+
 export class OllamaGateway implements ModelGateway {
-  readonly models = loadConfig().models;
+  get models(): Record<AgentRole, string> {
+    return loadConfig().models;
+  }
   private readonly baseUrl: string;
   constructor(baseUrl = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434") {
     this.baseUrl = baseUrl;
   }
 
   async rawPrompt(role: AgentRole, prompt: string): Promise<string> {
+    const model = resolveOllamaModel(role, this.models);
     const response = await fetch(`${this.baseUrl}/api/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: this.models[role],
+        model,
         prompt,
         stream: false,
         options: { temperature: 0 }
@@ -109,8 +131,9 @@ export class OllamaGateway implements ModelGateway {
       ]);
       const z = (zodPkg as any).z ?? zodPkg;
       const schemas = buildZodSchemas(z);
+      const resolvedModel = resolveOllamaModel(role, this.models);
       const model = new ChatOllama({
-        model: this.models[role],
+        model: resolvedModel,
         temperature: 0,
         baseUrl: this.baseUrl
       });
@@ -122,7 +145,7 @@ export class OllamaGateway implements ModelGateway {
   }
 
   async getGoalDecomposition(prompt: string): Promise<GoalDecomposition> {
-    return this.invokeStructured("goalDecomposer", prompt, validateGoalDecomposition, "goalDecomposition");
+    return this.invokeStructured("epicDecoder", prompt, validateGoalDecomposition, "goalDecomposition");
   }
 
   async getBuilderPlan(prompt: string): Promise<BuilderPlan> {
@@ -134,7 +157,7 @@ export class OllamaGateway implements ModelGateway {
   }
 
   async getGoalReview(prompt: string): Promise<GoalReview> {
-    return this.invokeStructured("goalReviewer", prompt, validateGoalReview, "goalReview");
+    return this.invokeStructured("epicReviewer", prompt, validateGoalReview, "goalReview");
   }
 
   async getFailureDecision(prompt: string): Promise<FailureDecision> {
@@ -143,13 +166,17 @@ export class OllamaGateway implements ModelGateway {
 }
 
 export class OpenCodeHybridGateway implements ModelGateway {
-  readonly models = loadConfig().models;
+  get models(): Record<AgentRole, string> {
+    return loadConfig().models;
+  }
   private readonly ollama: OllamaGateway;
   private readonly opencode: OpenCodeRunner;
+  private readonly codex: CodexRunner;
 
   constructor() {
     this.ollama = new OllamaGateway();
     this.opencode = new OpenCodeRunner();
+    this.codex = new CodexRunner();
   }
 
   rawPrompt(role: AgentRole, prompt: string): Promise<string> {
@@ -181,12 +208,27 @@ export class OpenCodeHybridGateway implements ModelGateway {
   }
 
   runGoalReviewInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview> {
-    return this.opencode.runGoalReviewer({ role: "goalReviewer", ...input });
+    return this.opencode.runEpicReviewer({ role: "epicReviewer", ...input });
+  }
+
+  runEpicDecoderInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition> {
+    return this.codex.runEpicDecoder({ role: "epicDecoder", ...input });
+  }
+
+  async runEpicDecoderOpenCode(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition> {
+    const parsed = await this.opencode.runEpicDecoder({ role: "epicDecoder", ...input });
+    return validateGoalDecomposition(parsed);
+  }
+
+  runEpicReviewerCodex(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview> {
+    return this.codex.runEpicReviewer({ role: "epicReviewer", ...input });
   }
 }
 
 export class DryRunGateway implements ModelGateway {
-  readonly models = loadConfig().models;
+  get models(): Record<AgentRole, string> {
+    return loadConfig().models;
+  }
 
   async rawPrompt(_role: AgentRole, _prompt: string): Promise<string> {
     return JSON.stringify({ ok: true });
@@ -261,8 +303,21 @@ export class DryRunGateway implements ModelGateway {
   }
 
   async runBuilderInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<OpenCodeBuilderResult> {
+    const { writeFile, mkdir } = await import("node:fs/promises");
+    const path = await import("node:path");
     const plan = await this.getBuilderPlan(input.prompt);
     input.onStream?.({ agentRole: "builder", source: "orchestrator", streamKind: "status", content: "[dry-run] Builder started", runId: input.runId, ticketId: input.ticketId, epicId: input.epicId, sequence: 0, done: false });
+    // Write the planned files so gitDiff sees a real diff
+    for (const op of plan.operations) {
+      const fullPath = path.join(input.cwd, op.path);
+      await mkdir(path.dirname(fullPath), { recursive: true });
+      if (op.kind === "append_file") {
+        const existing = await import("node:fs/promises").then((m) => m.readFile(fullPath, "utf8").catch(() => ""));
+        await writeFile(fullPath, existing + op.content, "utf8");
+      } else {
+        await writeFile(fullPath, op.content, "utf8");
+      }
+    }
     input.onStream?.({ agentRole: "builder", source: "orchestrator", streamKind: "assistant", content: plan.summary, runId: input.runId, ticketId: input.ticketId, epicId: input.epicId, sequence: 1, done: false });
     input.onStream?.({ agentRole: "builder", source: "orchestrator", streamKind: "status", content: "[dry-run] Builder completed", runId: input.runId, ticketId: input.ticketId, epicId: input.epicId, sequence: 2, done: true });
     return { summary: plan.summary, sessionId: null, rawOutput: plan.summary };
@@ -270,7 +325,9 @@ export class DryRunGateway implements ModelGateway {
 }
 
 export class MockGateway implements ModelGateway {
-  readonly models = loadConfig().models;
+  get models(): Record<AgentRole, string> {
+    return loadConfig().models;
+  }
   private readonly responses: Partial<{
     goalDecomposition: GoalDecomposition;
     builderPlans: BuilderPlan[];
@@ -319,4 +376,330 @@ export class MockGateway implements ModelGateway {
     if (!decision) throw new Error("Missing mock failure decision");
     return decision;
   }
+}
+
+export class MediatedAgentHarnessGateway implements ModelGateway {
+  get models(): Record<AgentRole, string> {
+    return loadConfig().models;
+  }
+
+  private readonly ollama: OllamaGateway;
+  private readonly ollamaBaseURL: string;
+  private readonly braveApiKey: string | undefined;
+
+  constructor(ollamaBaseURL?: string) {
+    this.ollamaBaseURL = ollamaBaseURL || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
+    this.ollama = new OllamaGateway(this.ollamaBaseURL);
+    this.braveApiKey = process.env.BRAVE_API_KEY;
+  }
+
+  rawPrompt(role: AgentRole, prompt: string): Promise<string> {
+    return this.ollama.rawPrompt(role, prompt);
+  }
+
+  getGoalDecomposition(prompt: string): Promise<GoalDecomposition> {
+    return this.ollama.getGoalDecomposition(prompt);
+  }
+
+  getBuilderPlan(prompt: string): Promise<BuilderPlan> {
+    return this.ollama.getBuilderPlan(prompt);
+  }
+
+  getReviewerVerdict(prompt: string): Promise<ReviewerVerdict> {
+    return this.ollama.getReviewerVerdict(prompt);
+  }
+
+  getGoalReview(prompt: string): Promise<GoalReview> {
+    return this.ollama.getGoalReview(prompt);
+  }
+
+  getFailureDecision(prompt: string): Promise<FailureDecision> {
+    return this.ollama.getFailureDecision(prompt);
+  }
+
+  async runEpicDecoderInWorkspace(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    epicId?: string | null;
+    onStream?: StreamHook;
+  }): Promise<GoalDecomposition> {
+    const model = this.resolveHarnessModel("epicDecoder");
+    input.onStream?.({
+      agentRole: "epicDecoder",
+      source: "orchestrator",
+      streamKind: "status",
+      content: "Decomposing via mediated agent harness...",
+      runId: input.runId,
+      epicId: input.epicId,
+      sequence: 0,
+    });
+
+    const toolContext = this.buildToolContext(input.cwd, "epicDecoder");
+
+    const harness = new MediatedAgentHarness({
+      baseURL: `${this.ollamaBaseURL}/v1`,
+      apiKey: "ollama",
+      model,
+      braveApiKey: this.braveApiKey,
+      toolContext,
+    });
+
+    const result = await harness.run("epicDecoder", input.prompt, {
+      maxIterations: 25,
+      timeoutMs: 600_000,
+      onEvent: (event) => {
+        if (event.kind === "text" || event.kind === "thinking") {
+          input.onStream?.({
+            agentRole: "epicDecoder",
+            source: "mediated-harness",
+            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
+            content: event.text,
+            runId: input.runId,
+            epicId: input.epicId,
+            sequence: 0,
+          });
+        }
+        if (event.kind === "tool_call") {
+          input.onStream?.({
+            agentRole: "epicDecoder",
+            source: "mediated-harness",
+            streamKind: "status",
+            content: `Tool: ${event.call.name}`,
+            runId: input.runId,
+            epicId: input.epicId,
+            sequence: 0,
+          });
+        }
+        if (event.kind === "complete") {
+          input.onStream?.({
+            agentRole: "epicDecoder",
+            source: "mediated-harness",
+            streamKind: "status",
+            content: `Completed in ${event.iterations} iterations`,
+            runId: input.runId,
+            epicId: input.epicId,
+            sequence: 0,
+          });
+        }
+      },
+    });
+
+    return validateGoalDecomposition(parseJsonText(result.text));
+  }
+
+  async runGoalReviewInWorkspace(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    epicId?: string | null;
+    onStream?: StreamHook;
+  }): Promise<GoalReview> {
+    const model = this.resolveHarnessModel("epicReviewer");
+    input.onStream?.({
+      agentRole: "epicReviewer",
+      source: "orchestrator",
+      streamKind: "status",
+      content: "Reviewing via mediated agent harness...",
+      runId: input.runId,
+      epicId: input.epicId,
+      sequence: 0,
+    });
+
+    const toolContext = this.buildToolContext(input.cwd, "epicReviewer");
+
+    const harness = new MediatedAgentHarness({
+      baseURL: `${this.ollamaBaseURL}/v1`,
+      apiKey: "ollama",
+      model,
+      braveApiKey: this.braveApiKey,
+      toolContext,
+    });
+
+    const result = await harness.run("epicReviewer", input.prompt, {
+      maxIterations: 25,
+      timeoutMs: 600_000,
+      onEvent: (event) => {
+        if (event.kind === "text" || event.kind === "thinking") {
+          input.onStream?.({
+            agentRole: "epicReviewer",
+            source: "mediated-harness",
+            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
+            content: event.text,
+            runId: input.runId,
+            epicId: input.epicId,
+            sequence: 0,
+          });
+        }
+        if (event.kind === "tool_call") {
+          input.onStream?.({
+            agentRole: "epicReviewer",
+            source: "mediated-harness",
+            streamKind: "status",
+            content: `Tool: ${event.call.name}`,
+            runId: input.runId,
+            epicId: input.epicId,
+            sequence: 0,
+          });
+        }
+      },
+    });
+
+    return validateGoalReview(parseJsonText(result.text));
+  }
+
+  async runBuilderInWorkspace(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    ticketId?: string | null;
+    epicId?: string | null;
+    onStream?: StreamHook;
+  }): Promise<OpenCodeBuilderResult> {
+    const model = this.resolveHarnessModel("builder");
+    input.onStream?.({
+      agentRole: "builder",
+      source: "orchestrator",
+      streamKind: "status",
+      content: "Building via mediated agent harness...",
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+    });
+
+    const toolContext = this.buildToolContext(input.cwd, "builder");
+
+    const harness = new MediatedAgentHarness({
+      baseURL: `${this.ollamaBaseURL}/v1`,
+      apiKey: "ollama",
+      model,
+      braveApiKey: this.braveApiKey,
+      toolContext,
+    });
+
+    const result = await harness.run("builder", input.prompt, {
+      maxIterations: 30,
+      timeoutMs: 900_000,
+      onEvent: (event) => {
+        if (event.kind === "text" || event.kind === "thinking") {
+          input.onStream?.({
+            agentRole: "builder",
+            source: "mediated-harness",
+            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
+            content: event.text,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+          });
+        }
+        if (event.kind === "tool_call") {
+          input.onStream?.({
+            agentRole: "builder",
+            source: "mediated-harness",
+            streamKind: "status",
+            content: `Tool: ${event.call.name}`,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+          });
+        }
+      },
+    });
+
+    return {
+      summary: result.text.slice(0, 500),
+      sessionId: null,
+      rawOutput: result.text,
+    };
+  }
+
+  private resolveHarnessModel(role: AgentRole): string {
+    const raw = this.models[role];
+    if (raw.startsWith("mediated:")) return raw.slice("mediated:".length);
+    return raw;
+  }
+
+  private buildToolContext(cwd: string, workspaceId: string): ToolExecutionContext {
+    return {
+      cwd,
+      workspaceId,
+      allowedPaths: ["*"],
+      braveApiKey: this.braveApiKey,
+      readFiles: async (paths) => {
+        const { readFile } = await import("node:fs/promises");
+        const path = await import("node:path");
+        const result: Record<string, string> = {};
+        for (const p of paths) {
+          try {
+            result[p] = await readFile(path.join(cwd, p), "utf-8");
+          } catch {}
+        }
+        return result;
+      },
+      writeFiles: async (files) => {
+        const { writeFile, mkdir } = await import("node:fs/promises");
+        const path = await import("node:path");
+        for (const f of files) {
+          const fullPath = path.join(cwd, f.path);
+          await mkdir(path.dirname(fullPath), { recursive: true });
+          await writeFile(fullPath, f.content, "utf-8");
+        }
+      },
+      gitDiff: async () => {
+        const { execFile } = await import("node:child_process");
+        const { promisify } = await import("node:util");
+        const execFileAsync = promisify(execFile);
+        try {
+          const { stdout } = await execFileAsync("git", ["diff"], { cwd, timeout: 10000 });
+          return stdout;
+        } catch { return ""; }
+      },
+      gitStatus: async () => {
+        const { execFile } = await import("node:child_process");
+        const { promisify } = await import("node:util");
+        const execFileAsync = promisify(execFile);
+        try {
+          const { stdout } = await execFileAsync("git", ["status", "--short"], { cwd, timeout: 10000 });
+          return stdout;
+        } catch { return ""; }
+      },
+      runNamedCommand: async (name) => {
+        const config = loadConfig();
+        const command = config.commandCatalog[name as keyof typeof config.commandCatalog];
+        if (!command) return { stdout: "", stderr: `Unknown command: ${name}`, exitCode: 1 };
+        const { exec } = await import("node:child_process");
+        const { promisify } = await import("node:util");
+        const execAsync = promisify(exec);
+        try {
+          const { stdout, stderr } = await execAsync(command, { cwd, timeout: 120_000 });
+          return { stdout, stderr, exitCode: 0 };
+        } catch (err: any) {
+          return { stdout: err.stdout ?? "", stderr: err.stderr ?? String(err), exitCode: err.code ?? 1 };
+        }
+      },
+      saveArtifact: async (opts) => {
+        const { writeFile, mkdir } = await import("node:fs/promises");
+        const path = await import("node:path");
+        const config = loadConfig();
+        const dir = path.join(config.artifactsDir, workspaceId);
+        await mkdir(dir, { recursive: true });
+        const artifactPath = path.join(dir, `${opts.name}.txt`);
+        await writeFile(artifactPath, opts.content, "utf-8");
+        return artifactPath;
+      },
+    };
+  }
+}
+
+export function createGateway(): ModelGateway {
+  const models = loadConfig().models;
+  // If any role uses mediated: prefix, use the mediated harness gateway
+  const hasMediated = Object.values(models).some(m => m.startsWith("mediated:"));
+  if (hasMediated) {
+    return new MediatedAgentHarnessGateway();
+  }
+  return new OpenCodeHybridGateway();
 }

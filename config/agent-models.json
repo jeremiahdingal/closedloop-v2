@@ -1,8 +1,8 @@
 {
-  "goalDecomposer": "qwen3-coder:30b",
-  "builder": "qwen3-coder:30b",
-  "reviewer": "qwen3-coder:14b",
+  "epicDecoder": "opencode:qwen3-coder:30b",
+  "builder": "opencode:qwen3-coder:30b",
+  "reviewer": "glm-4.7-flash:q4_K_M",
   "tester": "glm-4.7-flash:q4_K_M",
-  "goalReviewer": "qwen3-coder:30b",
+  "epicReviewer": "mediated:glm-4.7-flash:q4_K_M",
   "doctor": "qwen3:8b"
 }

@@ -1,11 +1,14 @@
 import { AppDatabase } from "../db/database.ts";
 import { randomId, nowIso } from "../utils.ts";
-import { goalDecomposerPrompt, goalReviewerPrompt, goalReviewerToolingPrompt } from "./prompts.ts";
+import { epicDecoderPrompt, epicDecoderToolingPrompt, epicReviewerPrompt, epicReviewerToolingPrompt, epicReviewerCodexPrompt } from "./prompts.ts";
 import type { ModelGateway } from "./models.ts";
-import type { AgentStreamPayload, EpicRecord, GoalTicketPlan } from "../types.ts";
+import type { AgentStreamPayload, EpicRecord, GoalDecomposition, GoalTicketPlan } from "../types.ts";
 import { TicketRunner } from "./ticket-runner.ts";
 import { loadConfig } from "../config.ts";
 import { loadLangGraphRuntime, type LangGraphRuntime } from "./langgraph-loader.ts";
+import { formatOpenCodeFailure } from "./opencode.ts";
+import { formatCodexFailure } from "./codex.ts";
+import { LifecycleService } from "./lifecycle.ts";
 
 type GoalGraphState = {
   runId: string;
@@ -18,16 +21,60 @@ type GoalGraphState = {
   status: "pending" | "executing" | "reviewing" | "done" | "failed";
 };
 
+function sanitizeAllowedPaths(paths: string[]): string[] {
+  if (!paths.length) return ["*"];
+  const normalized = paths
+    .map((pathValue) => String(pathValue || "").trim())
+    .filter(Boolean)
+    .map((pathValue) => {
+      const lower = pathValue.toLowerCase();
+      if (lower === "root" || lower === "repo-root" || lower === "repository-root" || lower === "project-root" || lower === "/") {
+        return "*";
+      }
+      return pathValue.replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/$/, "") || "*";
+    });
+
+  const hasInvalidTicketLike = normalized.some((p) => /^[A-Z]{2,}-\d+$/.test(p) || /^\d+$/.test(p));
+  if (hasInvalidTicketLike) return ["src", "lib", "test", "docs"];
+  return Array.from(new Set(normalized));
+}
+
+function normalizeGoalTicketPlans(epicId: string, tickets: GoalTicketPlan[]): GoalTicketPlan[] {
+  const normalized = tickets.map((ticket) => ({
+    ...ticket,
+    id: ticket.id.startsWith(`${epicId}__`) ? ticket.id : `${epicId}__${ticket.id}`,
+    allowedPaths: sanitizeAllowedPaths(ticket.allowedPaths)
+  }));
+
+  const idMap = new Map<string, string>();
+  normalized.forEach((ticket, index) => {
+    idMap.set(tickets[index].id, ticket.id);
+    idMap.set(ticket.id, ticket.id);
+  });
+
+  return normalized.map((ticket, index) => ({
+    ...ticket,
+    dependencies: Array.from(new Set(
+      (tickets[index]?.dependencies ?? [])
+        .map((dependency) => idMap.get(dependency))
+        .filter((dependency): dependency is string => Boolean(dependency))
+    ))
+  }));
+}
+
 export class GoalRunner {
   readonly config = loadConfig();
+  private readonly heartbeatIntervalMs = 15_000;
   private readonly db: AppDatabase;
   private readonly ticketRunner: TicketRunner;
   private readonly gateway: ModelGateway;
+  private readonly lifecycle: LifecycleService;
 
-  constructor(db: AppDatabase, ticketRunner: TicketRunner, gateway: ModelGateway) {
+  constructor(db: AppDatabase, ticketRunner: TicketRunner, gateway: ModelGateway, lifecycle: LifecycleService) {
     this.db = db;
     this.ticketRunner = ticketRunner;
     this.gateway = gateway;
+    this.lifecycle = lifecycle;
   }
 
   async enqueueGoal(epicId: string): Promise<string> {
@@ -67,6 +114,9 @@ export class GoalRunner {
     if (!run || !run.epicId) throw new Error(`Epic run not found: ${runId}`);
     const epic = this.db.getEpic(run.epicId);
     if (!epic) throw new Error(`Epic not found: ${run.epicId}`);
+    this.assertNotCancelled(epic.id);
+
+    this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting LangGraph epic run for: ${epic.title}`, runId, epicId: epic.id, sequence: 0 });
 
     const { StateGraph, StateSchema, START, END, MemorySaver, z } = runtime;
     const GoalState = new StateSchema({
@@ -81,17 +131,12 @@ export class GoalRunner {
     });
 
     const decomposeGoal = async (_state: GoalGraphState) => {
+      this.assertNotCancelled(epic.id);
       this.db.updateRun({ runId, status: "running", currentNode: "decompose_goal", heartbeatAt: nowIso(), lastMessage: "Decomposing goal." });
       this.db.updateEpicStatus(epic.id, "executing");
 
-      const plan = await this.gateway.getGoalDecomposition(goalDecomposerPrompt(epic));
-      const normalizedPlans = plan.tickets.map((ticket) => ({ ...ticket, id: `${epic.id}__${ticket.id}` }));
-      const idMap = new Map(plan.tickets.map((ticket, index) => [ticket.id, normalizedPlans[index].id]));
-      for (const planTicket of normalizedPlans) {
-        planTicket.dependencies = plan.tickets
-          .find((original) => `${epic.id}__${original.id}` === planTicket.id)?.dependencies
-          .map((dependency) => idMap.get(dependency) ?? dependency) ?? [];
-      }
+      const plan = await this.withEpicHeartbeat(runId, epic.id, "decompose_goal", "Decomposing goal.", () => this.runEpicDecoder(epic, runId));
+      const normalizedPlans = normalizeGoalTicketPlans(epic.id, plan.tickets);
       const createdTickets = this.db.transaction(() => normalizedPlans.map((ticket) =>
         this.db.createTicket({
           id: ticket.id,
@@ -103,6 +148,8 @@ export class GoalRunner {
           allowedPaths: ticket.allowedPaths,
           priority: ticket.priority,
           status: "queued",
+          diffFiles: [],
+          prUrl: null,
           metadata: { maxBuildAttempts: 3, sourceTicketId: ticket.id }
         })
       ));
@@ -114,19 +161,29 @@ export class GoalRunner {
     };
 
     const executeTickets = async (state: GoalGraphState) => {
+      this.assertNotCancelled(epic.id);
       this.db.updateRun({ runId, status: "running", currentNode: "execute_tickets", heartbeatAt: nowIso(), lastMessage: "Executing tickets." });
+      this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Found ${state.ticketIds.length} tickets to execute`, runId, epicId: epic.id, sequence: 0 });
       const createdTickets = state.ticketIds.map((ticketId) => this.db.getTicket(ticketId)).filter(Boolean) as any[];
       const summaries: string[] = [];
       for (const ticket of createdTickets.filter((item) => item.dependencies.length === 0)) {
+        this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting ticket: ${ticket.id}`, runId, epicId: epic.id, ticketId: ticket.id, sequence: 1 });
         if (!ticket.currentRunId) await this.ticketRunner.start(ticket.id, epic.id);
       }
 
       for (const ticket of createdTickets) {
+        this.assertNotCancelled(epic.id);
         let current = this.db.getTicket(ticket.id);
         while (current && (current.status === "queued" || current.status === "building" || current.status === "reviewing" || current.status === "testing")) {
           const queuedRun = this.db.listRuns().find((record) => record.ticketId === ticket.id && (record.status === "queued" || record.status === "running"));
-          if (queuedRun?.status === "queued") {
-            await this.ticketRunner.runExisting(queuedRun.id);
+          if (!queuedRun) break; // no run started yet and none running — ticket is waiting on deps that won't be satisfied
+          if (queuedRun.status === "queued") {
+            try {
+              await this.ticketRunner.runExisting(queuedRun.id);
+            } catch {
+              // ticket run crashed — DB already updated to failed; continue to next ticket
+              break;
+            }
           }
           current = this.db.getTicket(ticket.id);
         }
@@ -137,7 +194,13 @@ export class GoalRunner {
           if (depCurrent?.status === "queued" && depsReady && !depCurrent.currentRunId) {
             await this.ticketRunner.start(depCurrent.id, epic.id);
             const depRun = this.db.listRuns().find((record) => record.ticketId === depCurrent.id && record.status === "queued");
-            if (depRun) await this.ticketRunner.runExisting(depRun.id);
+            if (depRun) {
+              try {
+                await this.ticketRunner.runExisting(depRun.id);
+              } catch {
+                // dependent ticket crashed — continue
+              }
+            }
           }
         }
       }
@@ -145,7 +208,9 @@ export class GoalRunner {
     };
 
     const reviewGoal = async (state: GoalGraphState) => {
+      this.assertNotCancelled(epic.id);
       this.db.updateRun({ runId, status: "running", currentNode: "goal_review", heartbeatAt: nowIso(), lastMessage: "Reviewing epic." });
+      this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting goal review with ${state.ticketIds.length} tickets`, runId, epicId: epic.id, sequence: 0 });
       const ticketPlans = state.ticketIds.map((ticketId) => this.db.getTicket(ticketId)).filter(Boolean).map((ticket) => ({
         id: ticket!.id,
         title: ticket!.title,
@@ -155,7 +220,22 @@ export class GoalRunner {
         allowedPaths: ticket!.allowedPaths,
         priority: ticket!.priority
       })) as GoalTicketPlan[];
-      const review = await this.runGoalReview(epic, ticketPlans, state.ticketSummaries, runId);
+      const tickets = this.db.listTickets(epic.id);
+      const incompleteTickets = tickets.filter((ticket) => ticket.status !== "approved");
+      if (incompleteTickets.length) {
+        const summary = `Epic review blocked: ${incompleteTickets.map((ticket) => `${ticket.id}:${ticket.status}`).join(", ")}`;
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: summary, runId, epicId: epic.id, sequence: 1, done: true });
+        return {
+          reviewVerdict: "failed",
+          reviewSummary: summary,
+          status: "failed"
+        } satisfies Partial<GoalGraphState>;
+      }
+      const prUrls = tickets.filter(t => t.prUrl).map(t => t.prUrl!);
+      const review = await this.withEpicHeartbeat(runId, epic.id, "goal_review", "Reviewing epic.", () =>
+        this.runEpicReview(epic, ticketPlans, state.ticketSummaries, prUrls, runId)
+      );
+      this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Goal review complete: ${review.verdict}`, runId, epicId: epic.id, sequence: 1 });
       return {
         reviewVerdict: review.verdict,
         reviewSummary: review.summary,
@@ -164,6 +244,7 @@ export class GoalRunner {
     };
 
     const finalizeGoal = async (state: GoalGraphState) => {
+      this.assertNotCancelled(epic.id);
       const approved = state.reviewVerdict === "approved";
       this.db.updateEpicStatus(epic.id, approved ? "done" : "failed");
       this.db.updateRun({
@@ -200,7 +281,12 @@ export class GoalRunner {
       .addEdge("finalize_goal", END);
 
     const graph = graphBuilder.compile(MemorySaver ? { checkpointer: new MemorySaver() } : undefined);
-    await graph.invoke({ runId, epicId: epic.id }, { configurable: { thread_id: runId } });
+    try {
+      await graph.invoke({ runId, epicId: epic.id }, { configurable: { thread_id: runId } });
+    } catch (error) {
+      if (error instanceof EpicCancelledError) return;
+      throw error;
+    }
   }
 
   private async runExistingLegacy(runId: string): Promise<void> {
@@ -208,18 +294,13 @@ export class GoalRunner {
     if (!run || !run.epicId) throw new Error(`Epic run not found: ${runId}`);
     const epic = this.db.getEpic(run.epicId);
     if (!epic) throw new Error(`Epic not found: ${run.epicId}`);
+    this.assertNotCancelled(epic.id);
 
     this.db.updateRun({ runId, status: "running", currentNode: "decompose_goal", heartbeatAt: nowIso(), lastMessage: "Decomposing goal." });
     this.db.updateEpicStatus(epic.id, "executing");
 
-    const plan = await this.gateway.getGoalDecomposition(goalDecomposerPrompt(epic));
-    const normalizedPlans = plan.tickets.map((ticket) => ({ ...ticket, id: `${epic.id}__${ticket.id}` }));
-    const idMap = new Map(plan.tickets.map((ticket, index) => [ticket.id, normalizedPlans[index].id]));
-    for (const planTicket of normalizedPlans) {
-      planTicket.dependencies = plan.tickets
-        .find((original) => `${epic.id}__${original.id}` === planTicket.id)?.dependencies
-        .map((dependency) => idMap.get(dependency) ?? dependency) ?? [];
-    }
+    const plan = await this.withEpicHeartbeat(runId, epic.id, "decompose_goal", "Decomposing goal.", () => this.runEpicDecoder(epic, runId));
+    const normalizedPlans = normalizeGoalTicketPlans(epic.id, plan.tickets);
 
     const createdTickets = this.db.transaction(() => normalizedPlans.map((ticket) =>
       this.db.createTicket({
@@ -232,22 +313,31 @@ export class GoalRunner {
         allowedPaths: ticket.allowedPaths,
         priority: ticket.priority,
         status: "queued",
+        diffFiles: [],
+        prUrl: null,
         metadata: { maxBuildAttempts: 3, sourceTicketId: ticket.id }
       })
     ));
 
     for (const ticket of createdTickets.filter((item) => item.dependencies.length === 0)) {
+      this.assertNotCancelled(epic.id);
       await this.ticketRunner.start(ticket.id, epic.id);
     }
 
     const summaries: string[] = [];
     const ticketPlans: GoalTicketPlan[] = normalizedPlans;
     for (const ticket of createdTickets) {
+      this.assertNotCancelled(epic.id);
       let current = this.db.getTicket(ticket.id);
       while (current && (current.status === "queued" || current.status === "building" || current.status === "reviewing" || current.status === "testing")) {
         const queuedRun = this.db.listRuns().find((record) => record.ticketId === ticket.id && (record.status === "queued" || record.status === "running"));
-        if (queuedRun?.status === "queued") {
-          await this.ticketRunner.runExisting(queuedRun.id);
+        if (!queuedRun) break; // no run started yet and none running — ticket is waiting on deps that won't be satisfied
+        if (queuedRun.status === "queued") {
+          try {
+            await this.ticketRunner.runExisting(queuedRun.id);
+          } catch {
+            break;
+          }
         }
         current = this.db.getTicket(ticket.id);
       }
@@ -258,13 +348,46 @@ export class GoalRunner {
         if (depCurrent?.status === "queued" && depsReady && !depCurrent.currentRunId) {
           await this.ticketRunner.start(depCurrent.id, epic.id);
           const depRun = this.db.listRuns().find((record) => record.ticketId === depCurrent.id && record.status === "queued");
-          if (depRun) await this.ticketRunner.runExisting(depRun.id);
+          if (depRun) {
+            try {
+              await this.ticketRunner.runExisting(depRun.id);
+            } catch {
+              // continue
+            }
+          }
         }
       }
     }
 
     this.db.updateRun({ runId, currentNode: "goal_review", heartbeatAt: nowIso(), lastMessage: "Reviewing epic." });
-    const review = await this.runGoalReview(epic, ticketPlans, summaries, runId);
+    const tickets = this.db.listTickets(epic.id);
+    const incompleteTickets = tickets.filter((ticket) => ticket.status !== "approved");
+    if (incompleteTickets.length) {
+      const summary = `Epic review blocked: ${incompleteTickets.map((ticket) => `${ticket.id}:${ticket.status}`).join(", ")}`;
+      this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: summary, runId, epicId: epic.id, sequence: 1, done: true });
+      this.db.updateEpicStatus(epic.id, "failed");
+      this.db.updateRun({
+        runId,
+        status: "failed",
+        currentNode: "complete",
+        heartbeatAt: nowIso(),
+        lastMessage: summary,
+        errorText: summary
+      });
+      this.db.recordEvent({
+        aggregateType: "epic",
+        aggregateId: epic.id,
+        runId,
+        kind: "epic_reviewed",
+        message: summary,
+        payload: { verdict: "failed", ticketSummaries: summaries }
+      });
+      return;
+    }
+    const prUrls = tickets.filter(t => t.prUrl).map(t => t.prUrl!);
+    const review = await this.withEpicHeartbeat(runId, epic.id, "goal_review", "Reviewing epic.", () =>
+      this.runEpicReview(epic, ticketPlans, summaries, prUrls, runId)
+    );
     this.db.updateEpicStatus(epic.id, review.verdict === "approved" ? "done" : "failed");
     this.db.updateRun({
       runId,
@@ -284,19 +407,113 @@ export class GoalRunner {
     });
   }
 
-  private async runGoalReview(epic: EpicRecord, ticketPlans: GoalTicketPlan[], summaries: string[], runId: string) {
-    if (this.gateway.runGoalReviewInWorkspace) {
-      return this.gateway.runGoalReviewInWorkspace({
-        cwd: this.config.repoRoot,
-        prompt: goalReviewerToolingPrompt(epic, ticketPlans, summaries),
-        runId,
-        epicId: epic.id,
-        onStream: (event) => this.recordAgentStream(event)
-      });
+  private async runEpicDecoder(epic: EpicRecord, runId: string): Promise<GoalDecomposition> {
+    if (this.gateway.runEpicDecoderInWorkspace && this.gateway.models.epicDecoder === "codex-cli") {
+      try {
+        this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "status", content: "Decomposing via Codex...", runId, epicId: epic.id, sequence: 0 });
+        const result = await this.gateway.runEpicDecoderInWorkspace({
+          cwd: epic.targetDir,
+          prompt: epicDecoderToolingPrompt(epic),
+          runId,
+          epicId: epic.id,
+          onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
+        });
+        this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "assistant", content: `Decomposed into ${result.tickets.length} tickets.\nSummary: ${result.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
+        return result;
+      } catch (err) {
+        this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "stderr", content: `${formatCodexFailure(err)}. Falling back to Ollama.`, runId, epicId: epic.id, sequence: 0 });
+      }
     }
-    this.recordAgentStream({ agentRole: "goalReviewer", source: "orchestrator", streamKind: "status", content: "Goal review started...", runId, epicId: epic.id, sequence: 0 });
-    const review = await this.gateway.getGoalReview(goalReviewerPrompt(epic, ticketPlans, summaries));
-    this.recordAgentStream({ agentRole: "goalReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} — ${review.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
+    if (this.gateway.runEpicDecoderOpenCode && this.gateway.models.epicDecoder.startsWith("opencode:")) {
+      try {
+        this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "status", content: "Decomposing via OpenCode...", runId, epicId: epic.id, sequence: 0 });
+        const result = await this.gateway.runEpicDecoderOpenCode({
+          cwd: epic.targetDir,
+          prompt: epicDecoderToolingPrompt(epic),
+          runId,
+          epicId: epic.id,
+          onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
+        });
+        this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "assistant", content: `Decomposed into ${result.tickets.length} tickets.\nSummary: ${result.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
+        return result;
+      } catch (err) {
+        this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "stderr", content: `${formatOpenCodeFailure(err)}. Falling back to Ollama.`, runId, epicId: epic.id, sequence: 0 });
+      }
+    }
+    if (this.gateway.runEpicDecoderInWorkspace && this.gateway.models.epicDecoder.startsWith("mediated:")) {
+      try {
+        this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "status", content: "Decomposing via mediated agent harness...", runId, epicId: epic.id, sequence: 0 });
+        const result = await this.gateway.runEpicDecoderInWorkspace({
+          cwd: epic.targetDir,
+          prompt: epicDecoderToolingPrompt(epic),
+          runId,
+          epicId: epic.id,
+          onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
+        });
+        this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "assistant", content: `Decomposed into ${result.tickets.length} tickets.\nSummary: ${result.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
+        return result;
+      } catch (err) {
+        this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "stderr", content: `Mediated harness failed: ${err instanceof Error ? err.message : String(err)}. Falling back to Ollama.`, runId, epicId: epic.id, sequence: 0 });
+      }
+    }
+    this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "status", content: "Decomposing goal into tickets via Ollama...", runId, epicId: epic.id, sequence: 0, done: false });
+    const plan = await this.gateway.getGoalDecomposition(epicDecoderPrompt(epic));
+    this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "assistant", content: `Decomposed into ${plan.tickets.length} tickets.\nSummary: ${plan.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
+    return plan;
+  }
+
+  private async runEpicReview(epic: EpicRecord, ticketPlans: GoalTicketPlan[], summaries: string[], prUrls: string[], runId: string) {
+    if (this.gateway.runEpicReviewerCodex && this.gateway.models.epicReviewer === "codex-cli") {
+      try {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: "Goal review started via Codex...", runId, epicId: epic.id, sequence: 0 });
+        const review = await this.gateway.runEpicReviewerCodex({
+          cwd: epic.targetDir,
+          prompt: epicReviewerCodexPrompt(epic, ticketPlans, summaries, prUrls),
+          runId,
+          epicId: epic.id,
+          onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
+        });
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} — ${review.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
+        return review;
+      } catch (err) {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "stderr", content: `${formatCodexFailure(err)}. Falling back to OpenCode.`, runId, epicId: epic.id, sequence: 0 });
+      }
+    }
+    if (this.gateway.runGoalReviewInWorkspace && !this.gateway.models.epicReviewer.startsWith("mediated:")) {
+      try {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: "Goal review started via OpenCode...", runId, epicId: epic.id, sequence: 0 });
+        const review = await this.gateway.runGoalReviewInWorkspace({
+          cwd: epic.targetDir,
+          prompt: epicReviewerToolingPrompt(epic, ticketPlans, summaries, prUrls),
+          runId,
+          epicId: epic.id,
+          onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
+        });
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} — ${review.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
+        return review;
+      } catch (err) {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "stderr", content: `${formatOpenCodeFailure(err)}. Falling back to Ollama.`, runId, epicId: epic.id, sequence: 0 });
+      }
+    }
+    if (this.gateway.runGoalReviewInWorkspace && this.gateway.models.epicReviewer.startsWith("mediated:")) {
+      try {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: "Goal review started via mediated agent harness...", runId, epicId: epic.id, sequence: 0 });
+        const review = await this.gateway.runGoalReviewInWorkspace({
+          cwd: epic.targetDir,
+          prompt: epicReviewerToolingPrompt(epic, ticketPlans, summaries, prUrls),
+          runId,
+          epicId: epic.id,
+          onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
+        });
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} — ${review.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
+        return review;
+      } catch (err) {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "stderr", content: `Mediated harness failed: ${err instanceof Error ? err.message : String(err)}. Falling back to Ollama.`, runId, epicId: epic.id, sequence: 0 });
+      }
+    }
+    this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: "Goal review started via Ollama...", runId, epicId: epic.id, sequence: 0 });
+    const review = await this.gateway.getGoalReview(epicReviewerPrompt(epic, ticketPlans, summaries, prUrls));
+    this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} — ${review.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
     return review;
   }
 
@@ -312,12 +529,41 @@ export class GoalRunner {
     });
   }
 
-  static createEpic(db: AppDatabase, input: { id?: string; title: string; goalText: string }): EpicRecord {
+  static createEpic(db: AppDatabase, input: { id?: string; title: string; goalText: string; targetDir: string }): EpicRecord {
     return db.createEpic({
       id: input.id ?? randomId("epic"),
       title: input.title,
       goalText: input.goalText,
+      targetDir: input.targetDir,
       status: "planning"
     });
   }
+
+  private assertNotCancelled(epicId: string): void {
+    if (this.lifecycle.isEpicCancelled(epicId)) {
+      throw new EpicCancelledError(`Epic ${epicId} cancelled by user.`);
+    }
+  }
+
+  private epicHeartbeat(runId: string, epicId: string, node: string, message: string): void {
+    this.assertNotCancelled(epicId);
+    this.db.updateRun({ runId, status: "running", currentNode: node, heartbeatAt: nowIso(), lastMessage: message });
+  }
+
+  private async withEpicHeartbeat<T>(runId: string, epicId: string, node: string, message: string, task: () => Promise<T>): Promise<T> {
+    const timer = setInterval(() => {
+      try {
+        this.epicHeartbeat(runId, epicId, node, message);
+      } catch {
+        // Let the in-flight task surface the real failure.
+      }
+    }, this.heartbeatIntervalMs);
+    try {
+      return await task();
+    } finally {
+      clearInterval(timer);
+    }
+  }
 }
+
+class EpicCancelledError extends Error {}

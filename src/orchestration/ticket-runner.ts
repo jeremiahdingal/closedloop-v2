@@ -3,6 +3,7 @@ import type {
   FailureDecision,
   HandoffPacket,
   OpenCodeBuilderResult,
+  OpenCodeLaunchInfo,
   ReviewerVerdict,
   TicketContextPacket,
   TicketRecord
@@ -15,6 +16,8 @@ import { randomId, nowIso } from "../utils.ts";
 import { builderPrompt, builderToolingPrompt, doctorPrompt, reviewerPrompt } from "./prompts.ts";
 import type { ModelGateway } from "./models.ts";
 import { loadLangGraphRuntime, type LangGraphRuntime } from "./langgraph-loader.ts";
+import { OpenCodeLaunchError, formatOpenCodeFailure } from "./opencode.ts";
+import { LifecycleService } from "./lifecycle.ts";
 
 type TicketLoopResult = {
   runId: string;
@@ -52,14 +55,17 @@ type TicketGraphState = {
 
 export class TicketRunner {
   readonly config = loadConfig();
+  private readonly heartbeatIntervalMs = 15_000;
   private readonly db: AppDatabase;
   private readonly bridge: WorkspaceBridge;
   private readonly gateway: ModelGateway;
+  private readonly lifecycle: LifecycleService;
 
-  constructor(db: AppDatabase, bridge: WorkspaceBridge, gateway: ModelGateway) {
+  constructor(db: AppDatabase, bridge: WorkspaceBridge, gateway: ModelGateway, lifecycle: LifecycleService) {
     this.db = db;
     this.bridge = bridge;
     this.gateway = gateway;
+    this.lifecycle = lifecycle;
   }
 
   async start(ticketId: string, epicId: string): Promise<string> {
@@ -106,6 +112,9 @@ export class TicketRunner {
     if (!run || !run.ticketId || !run.epicId) throw new Error(`Ticket run not found: ${runId}`);
     const ticket = this.db.getTicket(run.ticketId);
     if (!ticket) throw new Error(`Ticket not found: ${run.ticketId}`);
+    this.assertNotCancelled(ticket.id, ticket.epicId);
+
+    this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting LangGraph ticket: ${ticket.title}`, runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 0 });
 
     const { StateGraph, StateSchema, START, END, MemorySaver, z } = runtime;
     const TicketState = new StateSchema({
@@ -134,9 +143,11 @@ export class TicketRunner {
     });
 
     const prepareContext = async (_state: TicketGraphState) => {
+      this.assertNotCancelled(ticket.id, ticket.epicId);
       this.db.updateRun({ runId, status: "running", currentNode: "prepare_context", heartbeatAt: nowIso(), lastMessage: "Preparing workspace." });
       this.db.updateTicketRunState({ ticketId: ticket.id, status: "building", currentRunId: runId, currentNode: "prepare_context", lastHeartbeatAt: nowIso(), lastMessage: "Preparing workspace." });
-      const workspace = await this.bridge.createWorkspace({ ticketId: ticket.id, runId, owner: runId });
+      const epic = this.db.getEpic(ticket.epicId);
+      const workspace = await this.bridge.createWorkspace({ ticketId: ticket.id, runId, owner: runId, targetDir: epic?.targetDir || this.config.repoRoot });
       await this.bridge.acquireWorkspaceLease(workspace.id, runId);
       const packet: TicketContextPacket = {
         epicId: ticket.epicId,
@@ -166,6 +177,7 @@ export class TicketRunner {
     };
 
     const builderNode = async (state: TicketGraphState) => {
+      this.assertNotCancelled(ticket.id, ticket.epicId);
       const workspace = this.bridge.requireWorkspace(state.workspaceId);
       const buildAttempts = state.buildAttempts + 1;
       this.heartbeat(runId, ticket.id, "builder_plan", `Builder attempt ${buildAttempts}.`);
@@ -187,7 +199,9 @@ export class TicketRunner {
         attempt: buildAttempts
       };
       await this.bridge.saveContextPacket(packet);
-      const builderResult = await this.executeBuilder(workspace.id, runId, ticket.id, ticket.allowedPaths, ticket, packet, buildAttempts);
+      const builderResult = await this.withHeartbeat(runId, ticket.id, "builder_plan", `Builder attempt ${buildAttempts}.`, () =>
+        this.executeBuilder(workspace.id, runId, ticket.id, ticket.allowedPaths, ticket, packet, buildAttempts)
+      );
 
       return {
         buildAttempts,
@@ -204,8 +218,13 @@ export class TicketRunner {
     };
 
     const reviewerNode = async (state: TicketGraphState) => {
+      this.assertNotCancelled(ticket.id, ticket.epicId);
       this.heartbeat(runId, ticket.id, "reviewer", "Reviewing diff.");
-      const reviewVerdict = await this.gateway.getReviewerVerdict(reviewerPrompt(ticket, state.lastDiff));
+      this.recordAgentStream({ agentRole: "reviewer", source: "orchestrator", streamKind: "status", content: "Reviewing diff...", runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 0, done: false });
+      const reviewVerdict = await this.withHeartbeat(runId, ticket.id, "reviewer", "Reviewing diff.", () =>
+        this.gateway.getReviewerVerdict(reviewerPrompt(ticket, state.lastDiff))
+      );
+      this.recordAgentStream({ agentRole: "reviewer", source: "orchestrator", streamKind: "assistant", content: `Approved: ${reviewVerdict.approved}\nBlockers: ${reviewVerdict.blockers.join(", ") || "none"}\nSuggestions: ${reviewVerdict.suggestions.join(", ") || "none"}`, runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 1, done: true });
       await this.writeHandoff(state.workspaceId, runId, ticket.id, {
         role: "reviewer",
         state: reviewVerdict.approved ? "approved" : "rejected",
@@ -227,15 +246,20 @@ export class TicketRunner {
     };
 
     const testerNode = async (state: TicketGraphState) => {
+      this.assertNotCancelled(ticket.id, ticket.epicId);
       this.heartbeat(runId, ticket.id, "tester", "Running tests.");
-      const result = await this.bridge.runNamedCommand({
-        workspaceId: state.workspaceId,
-        runId,
-        ticketId: ticket.id,
-        nodeName: "tester",
-        commandName: "test"
-      });
+      this.recordAgentStream({ agentRole: "tester", source: "orchestrator", streamKind: "status", content: "Running tests...", runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 0, done: false });
+      const result = await this.withHeartbeat(runId, ticket.id, "tester", "Running tests.", () =>
+        this.bridge.runNamedCommand({
+          workspaceId: state.workspaceId,
+          runId,
+          ticketId: ticket.id,
+          nodeName: "tester",
+          commandName: "test"
+        })
+      );
       const testSummary = `${result.exitCode === 0 ? "PASS" : "FAIL"}\n${result.stdout}\n${result.stderr}`.trim();
+      this.recordAgentStream({ agentRole: "tester", source: "orchestrator", streamKind: "assistant", content: testSummary, runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 1, done: true });
       await this.writeHandoff(state.workspaceId, runId, ticket.id, {
         role: "tester",
         state: result.exitCode === 0 ? "approved" : "rejected",
@@ -255,7 +279,8 @@ export class TicketRunner {
     };
 
     const classifyNode = async (state: TicketGraphState) => {
-      const failure = await this.getFailureDecision(ticket, state.reviewApproved ? {
+      this.assertNotCancelled(ticket.id, ticket.epicId);
+      const failure = await this.getFailureDecision(runId, ticket, state.reviewApproved ? {
         approved: state.reviewApproved,
         blockers: state.reviewBlockers,
         suggestions: state.reviewSuggestions,
@@ -275,9 +300,35 @@ export class TicketRunner {
     };
 
     const finalizeSuccess = async (state: TicketGraphState) => {
+      this.assertNotCancelled(ticket.id, ticket.epicId);
       this.db.updateRun({ runId, status: "succeeded", currentNode: "complete", heartbeatAt: nowIso(), lastMessage: "Ticket approved." });
-      this.db.updateTicketRunState({ ticketId: ticket.id, status: "approved", currentNode: "complete", lastHeartbeatAt: nowIso(), lastMessage: "Ticket approved." });
-      await this.bridge.gitCommit({ workspaceId: state.workspaceId, message: `[${ticket.id}] automated ticket completion` });
+      
+      const diffStats = await this.bridge.getDiffStats(state.workspaceId);
+      const commitResult = await this.bridge.gitCommit({ workspaceId: state.workspaceId, message: `[${ticket.id}] automated ticket completion` });
+      
+      let prUrl: string | null = null;
+      if (!commitResult.startsWith("noop:")) {
+        try {
+          const remoteBranch = await this.bridge.gitPush({ workspaceId: state.workspaceId });
+          const remoteUrl = await this.bridge.gitRemoteUrl(state.workspaceId);
+          if (remoteUrl && (remoteUrl.includes("github.com") || remoteUrl.includes("gitlab.com"))) {
+            const baseUrl = remoteUrl.replace(/\.git$/, "").replace(/git@([^:]+):/, "https://$1/");
+            prUrl = `${baseUrl}/compare/${state.workspaceId.split("_")[1]}...${remoteBranch}`;
+          }
+        } catch (pushError) {
+          console.warn("Failed to push branch:", pushError);
+        }
+      }
+
+      this.db.updateTicketRunState({ 
+        ticketId: ticket.id, 
+        status: "approved", 
+        currentNode: "complete", 
+        lastHeartbeatAt: nowIso(), 
+        lastMessage: "Ticket approved.",
+        diffFiles: diffStats,
+        prUrl
+      });
       await this.bridge.archiveWorkspace(state.workspaceId);
       return { status: "approved", lastMessage: "Ticket approved." } satisfies Partial<TicketGraphState>;
     };
@@ -357,6 +408,11 @@ export class TicketRunner {
         testSummary: result.testSummary || null
       };
     } catch (error) {
+      if (error instanceof TicketCancelledError) {
+        const workspace = this.db.findWorkspaceByRun(runId);
+        if (workspace) await this.bridge.archiveWorkspace(workspace.id);
+        return { runId, workspaceId: workspace?.id ?? "", status: "failed", lastDiff: "", reviewVerdict: null, testSummary: error.message };
+      }
       this.db.updateRun({ runId, status: "failed", currentNode: "error", heartbeatAt: nowIso(), lastMessage: "Ticket crashed.", errorText: (error as Error).message });
       this.db.updateTicketRunState({ ticketId: ticket.id, status: "failed", currentNode: "error", lastHeartbeatAt: nowIso(), lastMessage: (error as Error).message });
       throw error;
@@ -371,11 +427,13 @@ export class TicketRunner {
     if (!run || !run.ticketId) throw new Error(`Ticket run not found: ${runId}`);
     const ticket = this.db.getTicket(run.ticketId);
     if (!ticket) throw new Error(`Ticket not found: ${run.ticketId}`);
+    this.assertNotCancelled(ticket.id, ticket.epicId);
 
     this.db.updateRun({ runId, status: "running", currentNode: "prepare_context", heartbeatAt: nowIso(), lastMessage: "Preparing workspace." });
     this.db.updateTicketRunState({ ticketId: ticket.id, status: "building", currentRunId: runId, currentNode: "prepare_context", lastHeartbeatAt: nowIso(), lastMessage: "Preparing workspace." });
 
-    const workspace = await this.bridge.createWorkspace({ ticketId: ticket.id, runId, owner: runId });
+    const epic = this.db.getEpic(ticket.epicId);
+    const workspace = await this.bridge.createWorkspace({ ticketId: ticket.id, runId, owner: runId, targetDir: epic?.targetDir || this.config.repoRoot });
     await this.bridge.acquireWorkspaceLease(workspace.id, runId);
 
     let reviewVerdict: ReviewerVerdict | null = null;
@@ -407,14 +465,17 @@ export class TicketRunner {
 
     try {
       while (buildAttempts < maxBuildAttempts) {
+        this.assertNotCancelled(ticket.id, ticket.epicId);
         buildAttempts += 1;
         packet.attempt = buildAttempts;
         this.heartbeat(runId, ticket.id, "builder_plan", `Builder attempt ${buildAttempts}.`);
 
-        const builderResult = await this.executeBuilder(workspace.id, runId, ticket.id, ticket.allowedPaths, ticket, packet, buildAttempts);
+      const builderResult = await this.withHeartbeat(runId, ticket.id, "builder_plan", `Builder attempt ${buildAttempts}.`, () =>
+        this.executeBuilder(workspace.id, runId, ticket.id, ticket.allowedPaths, ticket, packet, buildAttempts)
+      );
         lastDiff = builderResult.lastDiff;
         if (!lastDiff.trim()) {
-          const failure = await this.getFailureDecision(ticket, reviewVerdict, testSummary, {
+          const failure = await this.getFailureDecision(runId, ticket, reviewVerdict, testSummary, {
             repeatedBlockers: false,
             repeatedTestFailure: false,
             noDiff: true,
@@ -427,7 +488,9 @@ export class TicketRunner {
         }
 
         this.heartbeat(runId, ticket.id, "reviewer", "Reviewing diff.");
-        reviewVerdict = await this.gateway.getReviewerVerdict(reviewerPrompt(ticket, lastDiff));
+      reviewVerdict = await this.withHeartbeat(runId, ticket.id, "reviewer", "Reviewing diff.", () =>
+        this.gateway.getReviewerVerdict(reviewerPrompt(ticket, lastDiff))
+      );
         await this.writeHandoff(workspace.id, runId, ticket.id, {
           role: "reviewer",
           state: reviewVerdict.approved ? "approved" : "rejected",
@@ -437,11 +500,12 @@ export class TicketRunner {
         });
 
         if (!reviewVerdict.approved) {
+          this.assertNotCancelled(ticket.id, ticket.epicId);
           const blockerKey = reviewVerdict.blockers.join("|");
           const repeatedBlockers = blockerKey.length > 0 && blockHistory.includes(blockerKey);
           blockHistory.push(blockerKey);
           packet.reviewBlockers = reviewVerdict.blockers;
-          const failure = await this.getFailureDecision(ticket, reviewVerdict, testSummary, {
+          const failure = await this.getFailureDecision(runId, ticket, reviewVerdict, testSummary, {
             repeatedBlockers,
             repeatedTestFailure: false,
             noDiff: false,
@@ -454,13 +518,15 @@ export class TicketRunner {
         }
 
         this.heartbeat(runId, ticket.id, "tester", "Running tests.");
-        const result = await this.bridge.runNamedCommand({
+      const result = await this.withHeartbeat(runId, ticket.id, "tester", "Running tests.", () =>
+        this.bridge.runNamedCommand({
           workspaceId: workspace.id,
           runId,
           ticketId: ticket.id,
           nodeName: "tester",
           commandName: "test"
-        });
+        })
+      );
         testSummary = `${result.exitCode === 0 ? "PASS" : "FAIL"}\n${result.stdout}\n${result.stderr}`.trim();
         await this.writeHandoff(workspace.id, runId, ticket.id, {
           role: "tester",
@@ -471,9 +537,35 @@ export class TicketRunner {
         });
 
         if (result.exitCode === 0) {
+          this.assertNotCancelled(ticket.id, ticket.epicId);
           this.db.updateRun({ runId, status: "succeeded", currentNode: "complete", heartbeatAt: nowIso(), lastMessage: "Ticket approved." });
-          this.db.updateTicketRunState({ ticketId: ticket.id, status: "approved", currentNode: "complete", lastHeartbeatAt: nowIso(), lastMessage: "Ticket approved." });
-          await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] automated ticket completion` });
+          
+          const diffStats = await this.bridge.getDiffStats(workspace.id);
+          const commitResult = await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] automated ticket completion` });
+          
+          let prUrl: string | null = null;
+          if (!commitResult.startsWith("noop:")) {
+            try {
+              const remoteBranch = await this.bridge.gitPush({ workspaceId: workspace.id });
+              const remoteUrl = await this.bridge.gitRemoteUrl(workspace.id);
+              if (remoteUrl && (remoteUrl.includes("github.com") || remoteUrl.includes("gitlab.com"))) {
+                const baseUrl = remoteUrl.replace(/\.git$/, "").replace(/git@([^:]+):/, "https://$1/");
+                prUrl = `${baseUrl}/compare/${workspace.id.split("_")[1]}...${remoteBranch}`;
+              }
+            } catch (pushError) {
+              console.warn("Failed to push branch:", pushError);
+            }
+          }
+
+          this.db.updateTicketRunState({ 
+            ticketId: ticket.id, 
+            status: "approved", 
+            currentNode: "complete", 
+            lastHeartbeatAt: nowIso(), 
+            lastMessage: "Ticket approved.",
+            diffFiles: diffStats,
+            prUrl
+          });
           await this.bridge.archiveWorkspace(workspace.id);
           return { runId, workspaceId: workspace.id, status: "approved", lastDiff, reviewVerdict, testSummary };
         }
@@ -481,7 +573,7 @@ export class TicketRunner {
         const repeatedTestFailure = testSummary.length > 0 && testHistory.includes(testSummary);
         testHistory.push(testSummary);
         packet.priorTestFailures = [testSummary.slice(0, 500)];
-        const failure = await this.getFailureDecision(ticket, reviewVerdict, testSummary, {
+        const failure = await this.getFailureDecision(runId, ticket, reviewVerdict, testSummary, {
           repeatedBlockers: false,
           repeatedTestFailure,
           noDiff: false,
@@ -497,6 +589,10 @@ export class TicketRunner {
       await this.bridge.archiveWorkspace(workspace.id);
       return { runId, workspaceId: workspace.id, status: "failed", lastDiff, reviewVerdict, testSummary };
     } catch (error) {
+      if (error instanceof TicketCancelledError) {
+        await this.bridge.archiveWorkspace(workspace.id);
+        return { runId, workspaceId: workspace.id, status: "failed", lastDiff, reviewVerdict, testSummary: error.message };
+      }
       this.db.updateRun({ runId, status: "failed", currentNode: "error", heartbeatAt: nowIso(), lastMessage: "Ticket crashed.", errorText: (error as Error).message });
       this.db.updateTicketRunState({ ticketId: ticket.id, status: "failed", currentNode: "error", lastHeartbeatAt: nowIso(), lastMessage: (error as Error).message });
       await this.bridge.archiveWorkspace(workspace.id);
@@ -516,38 +612,129 @@ export class TicketRunner {
     buildAttempts: number
   ): Promise<{ intendedFiles: string[]; lastDiff: string; summary: string }> {
     const workspace = this.bridge.requireWorkspace(workspaceId);
-    if (this.gateway.runBuilderInWorkspace) {
-      const result = await this.gateway.runBuilderInWorkspace({
-        cwd: workspace.worktreePath,
-        prompt: builderToolingPrompt(ticket, packet),
-        runId,
-        ticketId,
-        epicId: ticket.epicId,
-        onStream: (event) => this.recordAgentStream(event)
-      });
-      const lastDiff = await this.bridge.gitDiff(workspace.id);
-      const intendedFiles = this.extractChangedFiles(lastDiff);
-      await this.bridge.saveArtifact({
-        runId,
-        ticketId,
-        kind: "diff",
-        name: `${ticket.id}-attempt-${buildAttempts}.diff`,
-        content: lastDiff,
-        metadata: { source: "opencode", sessionId: result.sessionId ?? null }
-      });
-      await this.bridge.saveArtifact({
-        runId,
-        ticketId,
-        kind: "agent_output",
-        name: `${ticket.id}-attempt-${buildAttempts}-builder-opencode.log`,
-        content: result.rawOutput,
-        metadata: { source: "opencode", sessionId: result.sessionId ?? null }
-      });
-      return {
-        intendedFiles,
-        lastDiff,
-        summary: result.summary
-      };
+
+    // Mediated harness builder
+    if (this.gateway.runBuilderInWorkspace && this.gateway.models.builder.startsWith("mediated:")) {
+      try {
+        this.recordAgentStream({
+          agentRole: "builder",
+          source: "orchestrator",
+          streamKind: "status",
+          content: "Building via mediated agent harness...",
+          runId,
+          ticketId,
+          epicId: ticket.epicId,
+          sequence: 0
+        });
+        const result = await this.gateway.runBuilderInWorkspace({
+          cwd: workspace.worktreePath,
+          prompt: builderToolingPrompt(ticket, packet),
+          runId,
+          ticketId,
+          epicId: ticket.epicId,
+          onStream: (event) => this.recordAgentStream(event)
+        });
+        const lastDiff = await this.bridge.gitDiff(workspace.id);
+        const intendedFiles = this.extractChangedFiles(lastDiff);
+        await this.bridge.saveArtifact({
+          runId,
+          ticketId,
+          kind: "diff",
+          name: `${ticket.id}-attempt-${buildAttempts}.diff`,
+          content: lastDiff,
+          metadata: { source: "mediated-harness", sessionId: null }
+        });
+        await this.bridge.saveArtifact({
+          runId,
+          ticketId,
+          kind: "agent_output",
+          name: `${ticket.id}-attempt-${buildAttempts}-builder-mediated.log`,
+          content: result.rawOutput,
+          metadata: { source: "mediated-harness", sessionId: null }
+        });
+        return {
+          intendedFiles,
+          lastDiff,
+          summary: result.summary
+        };
+      } catch (err) {
+        this.recordAgentStream({
+          agentRole: "builder",
+          source: "orchestrator",
+          streamKind: "stderr",
+          content: `Mediated harness failed: ${err instanceof Error ? err.message : String(err)}. Falling back to plan mode.`,
+          runId,
+          ticketId,
+          epicId: ticket.epicId,
+          sequence: 0
+        });
+      }
+    }
+
+    // OpenCode/Codex workspace builder
+    if (this.gateway.runBuilderInWorkspace && !this.gateway.models.builder.startsWith("mediated:")) {
+      try {
+        const result = await this.gateway.runBuilderInWorkspace({
+          cwd: workspace.worktreePath,
+          prompt: builderToolingPrompt(ticket, packet),
+          runId,
+          ticketId,
+          epicId: ticket.epicId,
+          onStream: (event) => this.recordAgentStream(event)
+        });
+        await this.saveOpenCodeLaunchArtifact({
+          workspaceId: workspace.id,
+          runId,
+          ticketId,
+          buildAttempts,
+          launchInfo: result.launchInfo ?? null,
+          status: "success"
+        });
+        const lastDiff = await this.bridge.gitDiff(workspace.id);
+        const intendedFiles = this.extractChangedFiles(lastDiff);
+        await this.bridge.saveArtifact({
+          runId,
+          ticketId,
+          kind: "diff",
+          name: `${ticket.id}-attempt-${buildAttempts}.diff`,
+          content: lastDiff,
+          metadata: { source: "opencode", sessionId: result.sessionId ?? null }
+        });
+        await this.bridge.saveArtifact({
+          runId,
+          ticketId,
+          kind: "agent_output",
+          name: `${ticket.id}-attempt-${buildAttempts}-builder-opencode.log`,
+          content: result.rawOutput,
+          metadata: { source: "opencode", sessionId: result.sessionId ?? null }
+        });
+        return {
+          intendedFiles,
+          lastDiff,
+          summary: result.summary
+        };
+      } catch (err) {
+        const launchInfo = err instanceof OpenCodeLaunchError ? err.launchInfo : null;
+        await this.saveOpenCodeLaunchArtifact({
+          workspaceId: workspace.id,
+          runId,
+          ticketId,
+          buildAttempts,
+          launchInfo,
+          status: "failure",
+          error: err
+        });
+        this.recordAgentStream({
+          agentRole: "builder",
+          source: "orchestrator",
+          streamKind: "stderr",
+          content: `${formatOpenCodeFailure(err)}. Falling back to plan mode.`,
+          runId,
+          ticketId,
+          epicId: ticket.epicId,
+          sequence: 0
+        });
+      }
     }
 
     this.recordAgentStream({ agentRole: "builder", source: "orchestrator", streamKind: "status", content: "Requesting builder plan...", runId, ticketId, epicId: ticket.epicId, sequence: 0 });
@@ -602,6 +789,51 @@ export class TicketRunner {
     return [...files];
   }
 
+  private async saveOpenCodeLaunchArtifact(input: {
+    workspaceId: string;
+    runId: string;
+    ticketId: string;
+    buildAttempts: number;
+    launchInfo: OpenCodeLaunchInfo | null;
+    status: "success" | "failure";
+    error?: unknown;
+  }): Promise<void> {
+    const workspace = this.bridge.requireWorkspace(input.workspaceId);
+    const payload = {
+      status: input.status,
+      runId: input.runId,
+      ticketId: input.ticketId,
+      workspaceId: input.workspaceId,
+      launch: input.launchInfo,
+      error: input.error instanceof OpenCodeLaunchError
+        ? {
+            kind: input.error.kind,
+            message: input.error.message,
+            exitCode: input.error.exitCode,
+            launchInfo: input.error.launchInfo
+          }
+        : input.error instanceof Error
+          ? { message: input.error.message, stack: input.error.stack ?? null }
+          : input.error ?? null
+    };
+    await this.bridge.saveArtifact({
+      runId: input.runId,
+      ticketId: input.ticketId,
+      kind: "launch",
+      name: `${input.ticketId}-attempt-${input.buildAttempts}-builder-opencode-launch.json`,
+      content: JSON.stringify(payload, null, 2),
+      metadata: {
+        workspacePath: workspace.worktreePath,
+        status: input.status,
+        launchKind: input.error instanceof OpenCodeLaunchError
+          ? input.error.kind
+          : input.status === "failure"
+            ? "unknown"
+            : "ok"
+      }
+    });
+  }
+
   private recordAgentStream(event: AgentStreamPayload): void {
     this.db.recordEvent({
       aggregateType: event.ticketId ? "ticket" : "epic",
@@ -615,9 +847,26 @@ export class TicketRunner {
   }
 
   private heartbeat(runId: string, ticketId: string, node: string, message: string): void {
+    const ticket = this.db.getTicket(ticketId);
+    this.assertNotCancelled(ticketId, ticket?.epicId ?? null);
     const timestamp = nowIso();
     this.db.updateRun({ runId, status: "running", currentNode: node, heartbeatAt: timestamp, lastMessage: message });
     this.db.updateTicketRunState({ ticketId, currentNode: node, lastHeartbeatAt: timestamp, lastMessage: message });
+  }
+
+  private async withHeartbeat<T>(runId: string, ticketId: string, node: string, message: string, task: () => Promise<T>): Promise<T> {
+    const timer = setInterval(() => {
+      try {
+        this.heartbeat(runId, ticketId, node, message);
+      } catch {
+        // Let the in-flight task surface the real failure.
+      }
+    }, this.heartbeatIntervalMs);
+    try {
+      return await task();
+    } finally {
+      clearInterval(timer);
+    }
   }
 
   private async writeHandoff(workspaceId: string, runId: string, ticketId: string, handoff: HandoffPacket): Promise<void> {
@@ -640,6 +889,7 @@ export class TicketRunner {
   }
 
   private async getFailureDecision(
+    runId: string | null,
     ticket: TicketRecord,
     reviewVerdict: ReviewerVerdict | null,
     testSummary: string | null,
@@ -650,13 +900,16 @@ export class TicketRunner {
       infraFailure: boolean;
     }
   ): Promise<FailureDecision> {
+    this.recordAgentStream({ agentRole: "doctor", source: "orchestrator", streamKind: "status", content: "Analyzing failure and determining recovery action...", runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 0, done: false });
     try {
-      return await this.gateway.getFailureDecision(doctorPrompt({
+      const decision = await this.gateway.getFailureDecision(doctorPrompt({
         ticket,
         reviewerVerdict: reviewVerdict,
         testSummary,
         ...flags
       }));
+      this.recordAgentStream({ agentRole: "doctor", source: "orchestrator", streamKind: "assistant", content: `Decision: ${decision.decision}\nReason: ${decision.reason}`, runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 1, done: true });
+      return decision;
     } catch {
       return deterministicDoctor(flags);
     }
@@ -675,4 +928,15 @@ export class TicketRunner {
     await this.bridge.archiveWorkspace(workspaceId);
     return { runId, workspaceId, status: "escalated", lastDiff: "", reviewVerdict: null, testSummary: reason };
   }
+
+  private assertNotCancelled(ticketId: string, epicId: string | null): void {
+    if (this.lifecycle.isTicketCancelled(ticketId)) {
+      throw new TicketCancelledError(`Ticket ${ticketId} cancelled by user.`);
+    }
+    if (epicId && this.lifecycle.isEpicCancelled(epicId)) {
+      throw new TicketCancelledError(`Epic ${epicId} cancelled by user.`);
+    }
+  }
 }
+
+class TicketCancelledError extends Error {}
