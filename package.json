@@ -6,14 +6,16 @@
   "description": "Production-oriented local-first orchestration starter with LangGraph, SQLite persistence, worktree isolation, typed bridge operations, recovery, tests, and a minimal React UI.",
   "scripts": {
     "test": "node --experimental-strip-types --test tests/**/*.test.ts",
-    "api": "node --experimental-strip-types src/apps/api.ts",
-    "worker": "node --experimental-strip-types src/apps/worker.ts",
+    "api": "nodemon --exec \"node --experimental-strip-types src/apps/api.ts\"",
+    "worker": "nodemon --exec \"node --experimental-strip-types src/apps/worker.ts\"",
     "seed": "node --experimental-strip-types src/apps/seed.ts",
     "demo": "node --experimental-strip-types src/apps/demo.ts",
+    "cleanup:workspaces": "node --experimental-strip-types src/apps/cleanup-workspaces.ts",
     "ui": "vite",
     "build:ui": "vite build",
     "preview:ui": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "dev": "concurrently \"npm run api\" \"npm run worker\" \"npm run ui\""
   },
   "engines": {
     "node": ">=22.0.0"
@@ -22,16 +24,19 @@
     "@langchain/core": "^1.1.38",
     "@langchain/langgraph": "^1.2.6",
     "@langchain/ollama": "^1.2.6",
+    "opencode-ai": "^1.1.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "zod": "^3.25.76",
-    "opencode-ai": "^1.1.1"
+    "sonner": "^2.0.7",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.15.30",
     "@types/react": "^19.1.2",
     "@types/react-dom": "^19.1.2",
     "@vitejs/plugin-react": "^4.5.1",
+    "concurrently": "^9.1.2",
+    "nodemon": "^3.1.9",
     "typescript": "^5.8.3",
     "vite": "^7.0.0"
   }
