@@ -257,7 +257,8 @@ export function doctorPrompt(input: {
 
 export function epicDecoderToolingPrompt(
   epic: EpicRecord,
-  ragContext?: { codeContext: string; docContext: string } | null
+  ragContext?: { codeContext: string; docContext: string } | null,
+  projectStructure?: string | null
 ): string {
   const sections: string[] = [
     "You are the Epic Decoder agent. Explore the repository using the OpenCode tools that are actually available in-session.",
@@ -268,6 +269,9 @@ export function epicDecoderToolingPrompt(
     `Goal: ${epic.goalText}`,
   ];
 
+  if (projectStructure) {
+    sections.push(`## Project Structure\n\`\`\`\n${projectStructure.slice(0, 6000)}\n\`\`\``);
+  }
   if (ragContext?.docContext) sections.push(ragContext.docContext);
   if (ragContext?.codeContext) sections.push(ragContext.codeContext);
 
@@ -298,7 +302,8 @@ export function epicDecoderToolingPrompt(
 export function epicReviewerCodexPrompt(
   epic: EpicRecord,
   tickets: TicketRecord[],
-  ragContext?: { codeContext: string; docContext: string } | null
+  ragContext?: { codeContext: string; docContext: string } | null,
+  projectStructure?: string | null
 ): string {
   // Build structured ticket listing with ALL tickets (regardless of PR status)
   const ticketListing = tickets
@@ -324,6 +329,9 @@ export function epicReviewerCodexPrompt(
     "IMPORTANT: Be concise. Check git log and diffs for the ticket changes, verify they look safe, then output FINAL_JSON. Do NOT explore the entire repo.",
   ];
 
+  if (projectStructure) {
+    sections.push(`## Project Structure\n\`\`\`\n${projectStructure.slice(0, 6000)}\n\`\`\``);
+  }
   if (ragContext?.docContext) sections.push(ragContext.docContext);
   if (ragContext?.codeContext) sections.push(ragContext.codeContext);
 
@@ -358,6 +366,55 @@ export function epicReviewerCodexPrompt(
     "",
     "After you finish, output exactly one FINAL_JSON block and nothing after it.",
     '<FINAL_JSON>{"verdict":"approved|needs_followups|failed","summary":"brief summary","followupTickets":[]}</FINAL_JSON>'
+  );
+
+  return sections.join("\n\n");
+}
+
+export function epicDecoderPlanModePrompt(
+  epicTitle: string,
+  epicDescription: string,
+  userMessages: string[],
+  projectStructure?: string | null
+): string {
+  const sections: string[] = [
+    "You are the Epic Planner agent. Your job is to collaboratively explore the repository and produce a thorough, well-scoped implementation plan.",
+    "Use read, glob, grep, and any available tools to understand the codebase before committing to a plan.",
+    "Do not try to call bash, ls, find, run, or any other unavailable shell tool.",
+    `Epic Title: ${epicTitle}`,
+    `Epic Description: ${epicDescription}`,
+  ];
+
+  if (projectStructure) {
+    sections.push(`## Project Structure\n\`\`\`\n${projectStructure.slice(0, 6000)}\n\`\`\``);
+  }
+
+  if (userMessages.length > 0) {
+    const msgBlock = userMessages.map((m, i) => `${i + 1}. ${m}`).join("\n");
+    sections.push(`## Additional Context from User\n\n${msgBlock}`);
+  }
+
+  sections.push(
+    "## Your Planning Approach",
+    "1. Explore the repo structure — read key files, understand existing patterns and architecture",
+    "2. Identify what is already implemented vs what needs to be built",
+    "3. Note ambiguities, risks, or things you are unsure about",
+    "4. Decompose the epic into well-scoped, independently executable tickets",
+    "5. Each ticket must have clear acceptance criteria, file scope (allowedPaths), dependencies, and priority",
+    "Think carefully. Be specific about what each ticket changes and why.",
+    "When you are satisfied with the plan, output exactly one FINAL_JSON block:",
+    `<FINAL_JSON>${JSON.stringify({
+      summary: "brief summary of overall plan",
+      tickets: [{
+        id: "string",
+        title: "string",
+        description: "string",
+        acceptanceCriteria: ["string"],
+        dependencies: ["string"],
+        allowedPaths: ["string"],
+        priority: "high|medium|low"
+      }]
+    })}</FINAL_JSON>`
   );
 
   return sections.join("\n\n");

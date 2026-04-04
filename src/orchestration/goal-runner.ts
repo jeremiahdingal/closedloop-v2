@@ -15,6 +15,7 @@ import { LifecycleService } from "./lifecycle.ts";
 import { WorkspaceBridge } from "../bridge/workspace-bridge.ts";
 import { buildContextForQuery } from "../rag/context-builder.ts";
 import { git } from "../bridge/git.ts";
+import { ensureProjectStructureFile } from "./project-structure.ts";
 
 type GoalGraphState = {
   runId: string;
@@ -603,6 +604,7 @@ export class GoalRunner {
 
   private async runEpicDecoder(epic: EpicRecord, runId: string): Promise<GoalDecomposition> {
     const ragCtx = await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`);
+    const projectStructure = await ensureProjectStructureFile(epic.targetDir).catch(() => null);
 
     if (this.gateway.runEpicDecoderInWorkspace && (this.gateway.models.epicDecoder === "codex-cli" || this.gateway.models.epicDecoder === "qwen-cli")) {
       try {
@@ -610,7 +612,7 @@ export class GoalRunner {
         this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "status", content: `Decomposing via ${via}...`, runId, epicId: epic.id, sequence: 0 });
         const result = await this.gateway.runEpicDecoderInWorkspace({
           cwd: epic.targetDir,
-          prompt: epicDecoderToolingPrompt(epic, ragCtx),
+          prompt: epicDecoderToolingPrompt(epic, ragCtx, projectStructure),
           runId,
           epicId: epic.id,
           onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
@@ -627,7 +629,7 @@ export class GoalRunner {
         this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "status", content: "Decomposing via OpenCode...", runId, epicId: epic.id, sequence: 0 });
         const result = await this.gateway.runEpicDecoderOpenCode({
           cwd: epic.targetDir,
-          prompt: epicDecoderToolingPrompt(epic, ragCtx),
+          prompt: epicDecoderToolingPrompt(epic, ragCtx, projectStructure),
           runId,
           epicId: epic.id,
           onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
@@ -643,7 +645,7 @@ export class GoalRunner {
         this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "status", content: "Decomposing via mediated agent harness...", runId, epicId: epic.id, sequence: 0 });
         const result = await this.gateway.runEpicDecoderInWorkspace({
           cwd: epic.targetDir,
-          prompt: epicDecoderToolingPrompt(epic, ragCtx),
+          prompt: epicDecoderToolingPrompt(epic, ragCtx, projectStructure),
           runId,
           epicId: epic.id,
           ragIndexId: ragCtx?.indexId ?? undefined,
@@ -672,6 +674,7 @@ export class GoalRunner {
     await this.bridge.acquireWorkspaceLease(reviewWorkspace.id, runId);
     const reviewEpic: EpicRecord = { ...epic, targetDir: reviewWorkspace.worktreePath };
     const ragCtx = await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`);
+    const projectStructure = await ensureProjectStructureFile(epic.targetDir).catch(() => null);
     let cleaned = false;
     const cleanupWorkspace = async () => {
       if (cleaned) return;
@@ -717,7 +720,7 @@ export class GoalRunner {
         const review = await this.withTimeout(
           this.gateway.runEpicReviewerCodex({
             cwd: reviewEpic.targetDir,
-            prompt: epicReviewerCodexPrompt(reviewEpic, tickets, ragCtx),
+            prompt: epicReviewerCodexPrompt(reviewEpic, tickets, ragCtx, projectStructure),
             runId,
             epicId: epic.id,
             onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
@@ -757,7 +760,7 @@ export class GoalRunner {
         const review = await this.withTimeout(
           this.gateway.runEpicReviewerCodex({
             cwd: reviewEpic.targetDir,
-            prompt: epicReviewerCodexPrompt(reviewEpic, tickets, ragCtx),
+            prompt: epicReviewerCodexPrompt(reviewEpic, tickets, ragCtx, projectStructure),
             runId,
             epicId: epic.id,
             onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
@@ -838,6 +841,16 @@ export class GoalRunner {
       message: `${event.agentRole}:${event.streamKind}`,
       payload: event as any
     });
+  }
+
+  /**
+   * Approve a plan from Plan Mode: materialize tickets and enqueue the goal run.
+   * Used by the plan session approve route — does NOT re-run the decoder.
+   */
+  async approveFromPlan(epicId: string, plan: GoalDecomposition): Promise<string> {
+    const normalized = normalizeGoalTicketPlans(epicId, plan.tickets);
+    this.db.transaction(() => this.materializeTickets(epicId, normalized));
+    return this.enqueueGoal(epicId);
   }
 
   static createEpic(db: AppDatabase, input: { id?: string; title: string; goalText: string; targetDir: string; targetBranch?: string }): EpicRecord {

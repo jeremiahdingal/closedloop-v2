@@ -2199,3 +2199,112 @@ body::after {
 [data-sonner-toast][data-type="loading"].win98-toast {
   border-left: 6px solid #0066cc !important;
 }
+
+/* =========================================================
+   Plan Mode — Planning Modal styles
+   ========================================================= */
+
+.planning-modal {
+  max-width: 860px;
+  width: 95vw;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.planning-modal .modal-stream-list {
+  flex: 1;
+  min-height: 200px;
+  max-height: 420px;
+}
+
+.plan-preview {
+  background: #000;
+  color: var(--arcade-cyan);
+  border: 2px solid var(--arcade-cyan);
+  padding: 0.75rem 1rem;
+  font-size: 0.85rem;
+  font-family: 'Fira Code', monospace;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.plan-preview strong {
+  display: block;
+  margin-bottom: 0.4rem;
+  color: var(--arcade-yellow);
+}
+
+.plan-preview ul {
+  list-style: disc;
+  padding-left: 1.25rem;
+  line-height: 1.6;
+}
+
+.planning-modal-input-bar {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--win-gray);
+  border-top: 2px solid var(--win-gray-dark);
+}
+
+.planning-modal-input {
+  flex: 1;
+  background: #fff;
+  border: 2px inset var(--win-gray-dark);
+  padding: 0.35rem 0.5rem;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.85rem;
+  outline: none;
+}
+
+.planning-modal-input:focus {
+  border-color: var(--win-blue);
+}
+
+.plan-approve-btn {
+  background: #006400;
+  color: var(--arcade-green);
+  border: 2px outset #009900;
+  font-weight: bold;
+  letter-spacing: 0.04em;
+}
+
+.plan-approve-btn:hover:not(:disabled) {
+  background: #008000;
+}
+
+.plan-approve-btn:disabled {
+  background: var(--win-gray-dark);
+  color: var(--win-gray);
+  border-color: var(--win-gray-dark);
+}
+
+.plan-status-badge {
+  font-size: 0.7rem;
+  padding: 0.15rem 0.45rem;
+  border: 1px solid var(--win-gray-dark);
+  background: #000;
+  margin-left: 0.5rem;
+}
+
+.plan-status-badge.status-running  { color: var(--arcade-yellow); border-color: var(--arcade-yellow); }
+.plan-status-badge.status-idle     { color: var(--arcade-green);  border-color: var(--arcade-green); }
+.plan-status-badge.status-error    { color: var(--arcade-red);    border-color: var(--arcade-red); }
+
+/* Mode select in new epic form */
+.mode-select {
+  background: #fff;
+  border: 2px inset var(--win-gray-dark);
+  padding: 0.25rem 0.4rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.mode-hint {
+  font-size: 0.75rem;
+  color: var(--win-blue);
+  margin-left: 0.4rem;
+  font-style: italic;
+}

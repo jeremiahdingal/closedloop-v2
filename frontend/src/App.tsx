@@ -125,6 +125,132 @@ function ticketStatusScore(status: string): number {
   return 0;
 }
 
+type GoalDecomposition = { summary: string; tickets: Array<{ id: string; title: string; description: string; acceptanceCriteria: string[]; dependencies: string[]; allowedPaths: string[]; priority: string }> };
+
+function PlanningModal(props: { sessionId: string; epicTitle: string; open: boolean; onClose: () => void; onApproved: (epicId: string) => void }) {
+  const [streamItems, setStreamItems] = useState<Array<{ id: number; agentRole: string; streamKind: string; content: string; source: string }>>([]);
+  const [sessionStatus, setSessionStatus] = useState<"running" | "idle" | "error">("running");
+  const [latestPlan, setLatestPlan] = useState<GoalDecomposition | null>(null);
+  const [messageInput, setMessageInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [approving, setApproving] = useState(false);
+  const streamEndRef = useRef<HTMLDivElement>(null);
+  const afterIndexRef = useRef(0);
+  const esRef = useRef<EventSource | null>(null);
+
+  useEffect(() => {
+    if (!props.open) return;
+    const es = new EventSource(`/api/plan-session/${encodeURIComponent(props.sessionId)}/stream`);
+    esRef.current = es;
+    es.addEventListener("agent", (e) => {
+      const data = JSON.parse(e.data);
+      afterIndexRef.current = data.id + 1;
+      setStreamItems((prev) => [...prev, data]);
+      setTimeout(() => streamEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+    });
+    es.addEventListener("session_status", (e) => {
+      const data = JSON.parse(e.data);
+      setSessionStatus(data.status);
+    });
+    es.addEventListener("plan_ready", (e) => {
+      setLatestPlan(JSON.parse(e.data));
+    });
+    return () => { es.close(); esRef.current = null; };
+  }, [props.open, props.sessionId]);
+
+  async function sendMessage() {
+    if (!messageInput.trim()) return;
+    setSending(true);
+    try {
+      await fetchJson(`/api/plan-session/${encodeURIComponent(props.sessionId)}/message`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: messageInput.trim() })
+      });
+      setMessageInput("");
+      setSessionStatus("running");
+    } catch (err) {
+      toast.error(`Failed to send: ${(err as Error).message}`);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function approvePlan() {
+    setApproving(true);
+    try {
+      const result = await fetchJson<{ epicId: string; runId: string }>(`/api/plan-session/${encodeURIComponent(props.sessionId)}/approve`, { method: "POST" });
+      toast.success(`Epic created and queued: ${result.epicId}`);
+      props.onApproved(result.epicId);
+    } catch (err) {
+      toast.error(`Approval failed: ${(err as Error).message}`);
+    } finally {
+      setApproving(false);
+    }
+  }
+
+  if (!props.open) return null;
+  const canApprove = latestPlan !== null && sessionStatus !== "running";
+
+  return (
+    <div className="modal-backdrop" onClick={props.onClose}>
+      <div className="modal planning-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <div className="modal-header-left">
+            <span>📐</span>
+            <div className="modal-header-title-wrap">
+              <h2>Plan Mode — {props.epicTitle}</h2>
+              <span className={`plan-status-badge status-${sessionStatus}`}>
+                {sessionStatus === "running" ? "⏳ planning..." : sessionStatus === "idle" ? (latestPlan ? "✅ plan ready" : "💬 awaiting input") : "⚠️ error"}
+              </span>
+            </div>
+          </div>
+          <div className="win-titlebar-buttons">
+            <button className="win-btn-box" onClick={props.onClose}>×</button>
+          </div>
+        </div>
+        <div className="modal-stream-list">
+          {streamItems.length ? streamItems.map((item) => (
+            <div className="modal-stream-item" key={item.id}>
+              <div className="modal-stream-meta">
+                <span className={`pill pill-${item.streamKind || "raw"}`}>{item.streamKind || "raw"}</span>
+                <span className="modal-stream-time">{item.source}</span>
+              </div>
+              <pre>{item.content}</pre>
+            </div>
+          )) : <p className="modal-empty">Planner is exploring the repository...</p>}
+          <div ref={streamEndRef} />
+        </div>
+        {latestPlan && (
+          <div className="plan-preview">
+            <strong>Plan: {latestPlan.summary}</strong>
+            <ul>{latestPlan.tickets.map((t) => <li key={t.id}><strong>{t.title}</strong> — {t.description.slice(0, 80)}{t.description.length > 80 ? "…" : ""}</li>)}</ul>
+          </div>
+        )}
+        <div className="planning-modal-input-bar">
+          <input
+            className="planning-modal-input"
+            value={messageInput}
+            onChange={(e) => setMessageInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendMessage(); } }}
+            placeholder="Add context or answer questions from the planner..."
+            disabled={sending}
+          />
+          <button className="btn" onClick={() => void sendMessage()} disabled={sending || !messageInput.trim()}>
+            {sending ? "⏳" : "Send"}
+          </button>
+        </div>
+        <div className="modal-footer">
+          <button className="btn plan-approve-btn" onClick={() => void approvePlan()} disabled={!canApprove || approving}>
+            {approving ? "⏳ Creating epic..." : "✅ Approve Plan"}
+          </button>
+          <button className="btn" onClick={props.onClose}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AgentModal(props: { role: string; items: AgentEvent[]; open: boolean; onClose: () => void; modelInfo?: AgentModelInfo; onModelChange?: (adapterId: string) => void; status?: AgentStreamStatus }) {
   if (!props.open) return null;
   const info = props.modelInfo;
@@ -400,6 +526,8 @@ export function App() {
   const [targetDir, setTargetDir] = useState("");
   const [targetDirEditing, setTargetDirEditing] = useState(false);
   const [targetBranch, setTargetBranch] = useState("");
+  const [epicMode, setEpicMode] = useState<"build" | "plan">("build");
+  const [planSessionId, setPlanSessionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -637,6 +765,22 @@ export function App() {
   const activeCount = dedupedTickets.filter((t) => t.status === "building" || t.status === "reviewing" || t.status === "testing").length;
 
   async function createEpic() {
+    if (epicMode === "plan") {
+      try {
+        setSubmitting(true);
+        const result = await fetchJson<{ sessionId: string }>("/api/plan-session", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ epicTitle: title, epicDescription: goalText, targetDir })
+        });
+        setPlanSessionId(result.sessionId);
+      } catch (err) {
+        setError((err as Error).message);
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
     try {
       setSubmitting(true);
       await fetchJson("/api/epics", {
@@ -1055,14 +1199,24 @@ export function App() {
                   <textarea value={goalText} onChange={(e) => setGoalText(e.target.value)} rows={4} placeholder="Describe the goal" />
                 </label>
                 <div className="target-dir-row">
+                  <label className="target-dir-label">Mode:</label>
+                  <select className="mode-select" value={epicMode} onChange={(e) => setEpicMode(e.target.value as "build" | "plan")}>
+                    <option value="build">🚀 Build</option>
+                    <option value="plan">📐 Plan</option>
+                  </select>
+                  {epicMode === "plan" && <span className="mode-hint">Explore &amp; plan before building</span>}
+                </div>
+                {epicMode === "build" && (
+                <div className="target-dir-row">
                   <label className="target-dir-label">Target Branch:</label>
-                  <input 
+                  <input
                     className="target-dir-input"
-                    value={targetBranch} 
-                    onChange={(e) => setTargetBranch(e.target.value)} 
-                    placeholder="feature/my-branch (optional)" 
+                    value={targetBranch}
+                    onChange={(e) => setTargetBranch(e.target.value)}
+                    placeholder="feature/my-branch (optional)"
                   />
                 </div>
+                )}
                 <div className="target-dir-row">
                   <label className="target-dir-label">Target Dir:</label>
                   <input 
@@ -1091,7 +1245,7 @@ export function App() {
                   </button>
                 </div>
                 <button className="btn btn-primary" onClick={() => void createEpic()} disabled={submitting || !title || !goalText}>
-                  {submitting ? "⏳ Queuing..." : "🚀 Create and Queue"}
+                  {submitting ? "⏳..." : epicMode === "plan" ? "📐 Start Planning" : "🚀 Create and Queue"}
                 </button>
                 {error ? <p className="error-msg">⚠️ {error}</p> : null}
               </div>
@@ -1272,6 +1426,20 @@ export function App() {
         onDelete={() => { if (selectedEpicDetails) void deleteEpic(selectedEpicDetails.id); }}
         actionBusy={actionBusy !== null}
       />
+      {planSessionId && (
+        <PlanningModal
+          sessionId={planSessionId}
+          epicTitle={title || "Plan Mode"}
+          open={true}
+          onClose={() => setPlanSessionId(null)}
+          onApproved={async (_epicId) => {
+            setPlanSessionId(null);
+            setTitle("");
+            setGoalText("");
+            await refresh();
+          }}
+        />
+      )}
     </div>
   );
 }

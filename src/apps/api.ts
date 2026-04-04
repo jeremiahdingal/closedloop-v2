@@ -5,7 +5,27 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { bootstrap } from "./bootstrap.ts";
 import { loadConfig, updateAgentModel } from "../config.ts";
-import type { AgentRole } from "../types.ts";
+import type { AgentRole, AgentStreamPayload, GoalDecomposition } from "../types.ts";
+import { runPlanDecoder, extractPlanFromStream } from "../orchestration/plan-runner.ts";
+import { randomId } from "../utils.ts";
+
+// ---------------------------------------------------------------------------
+// In-memory plan session store (ephemeral — lost on server restart, by design)
+// ---------------------------------------------------------------------------
+type PlanSession = {
+  id: string;
+  epicTitle: string;
+  epicDescription: string;
+  targetDir: string;
+  userMessages: string[];
+  latestPlan: GoalDecomposition | null;
+  status: "running" | "idle" | "error";
+  streamChunks: AgentStreamPayload[];
+  textChunks: string[];       // raw assistant text for FINAL_JSON detection
+  pendingMessages: string[];  // queued while decoder is running
+};
+
+const planSessions = new Map<string, PlanSession>();
 
 type ModelAdapterOption = {
   id: string;
@@ -447,6 +467,188 @@ async function main() {
         Object.assign(content, body);
         await writeFile(configPath, JSON.stringify(content, null, 2));
         return json(res, 200, content);
+      }
+
+      // -----------------------------------------------------------------------
+      // Plan Session routes (detached from main build pipeline)
+      // -----------------------------------------------------------------------
+      if (url.pathname === "/api/plan-session" && req.method === "POST") {
+        const body = await readBody(req);
+        const epicTitle = String(body.epicTitle || "Untitled Plan");
+        const epicDescription = String(body.epicDescription || "");
+        const targetDir = String(body.targetDir || process.cwd());
+
+        const sessionId = randomId("plan");
+        const session: PlanSession = {
+          id: sessionId,
+          epicTitle,
+          epicDescription,
+          targetDir,
+          userMessages: [],
+          latestPlan: null,
+          status: "running",
+          streamChunks: [],
+          textChunks: [],
+          pendingMessages: [],
+        };
+        planSessions.set(sessionId, session);
+
+        // Fire off plan decoder asynchronously — never awaited here
+        const runSession = async (sess: PlanSession) => {
+          try {
+            const gateway = (goalRunner as any).gateway;
+            await runPlanDecoder({
+              cwd: sess.targetDir,
+              epicTitle: sess.epicTitle,
+              epicDescription: sess.epicDescription,
+              userMessages: sess.userMessages,
+              sessionId: sess.id,
+              gateway,
+              onStream: (event: AgentStreamPayload) => {
+                sess.streamChunks.push(event);
+                if (event.streamKind === "assistant" && event.content) {
+                  sess.textChunks.push(event.content);
+                  const plan = extractPlanFromStream(sess.textChunks);
+                  if (plan) sess.latestPlan = plan;
+                }
+              },
+            });
+          } catch (err) {
+            sess.streamChunks.push({
+              agentRole: "epicDecoder",
+              source: "orchestrator",
+              streamKind: "stderr",
+              content: `Plan decoder error: ${err instanceof Error ? err.message : String(err)}`,
+              sequence: sess.streamChunks.length,
+            });
+            sess.status = "error";
+            return;
+          }
+          // Drain any pending user messages as a re-run
+          sess.status = "idle";
+          if (sess.pendingMessages.length > 0) {
+            sess.userMessages.push(...sess.pendingMessages);
+            sess.pendingMessages = [];
+            sess.textChunks = [];
+            sess.status = "running";
+            void runSession(sess);
+          }
+        };
+        void runSession(session);
+
+        return json(res, 201, { sessionId });
+      }
+
+      const planStreamMatch = /^\/api\/plan-session\/([^/]+)\/stream$/.exec(url.pathname);
+      if (planStreamMatch && req.method === "GET") {
+        const sessionId = decodeURIComponent(planStreamMatch[1]);
+        const session = planSessions.get(sessionId);
+        if (!session) return json(res, 404, { error: "plan_session_not_found" });
+
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache, no-transform",
+          connection: "keep-alive"
+        });
+        let afterIndex = Number(url.searchParams.get("afterIndex") || 0);
+        let closed = false;
+        req.on("close", () => { closed = true; });
+        writeSseEvent(res, "ready", { ok: true, afterIndex, status: session.status });
+        const pump = () => {
+          if (closed) return;
+          const chunks = session.streamChunks;
+          while (afterIndex < chunks.length) {
+            const chunk = chunks[afterIndex];
+            writeSseEvent(res, "agent", { ...chunk, id: afterIndex }, afterIndex);
+            afterIndex++;
+          }
+          writeSseEvent(res, "session_status", { status: session.status, hasPlan: session.latestPlan !== null });
+          if (session.latestPlan) {
+            writeSseEvent(res, "plan_ready", session.latestPlan);
+          }
+          res.write(`: heartbeat ${Date.now()}\n\n`);
+          setTimeout(pump, 800);
+        };
+        pump();
+        return;
+      }
+
+      const planMessageMatch = /^\/api\/plan-session\/([^/]+)\/message$/.exec(url.pathname);
+      if (planMessageMatch && req.method === "POST") {
+        const sessionId = decodeURIComponent(planMessageMatch[1]);
+        const session = planSessions.get(sessionId);
+        if (!session) return json(res, 404, { error: "plan_session_not_found" });
+        const body = await readBody(req);
+        const message = String(body.message || "").trim();
+        if (!message) return json(res, 400, { error: "empty_message" });
+
+        if (session.status === "running") {
+          session.pendingMessages.push(message);
+          return json(res, 200, { ok: true, queued: true });
+        }
+        // Re-run with new message
+        session.userMessages.push(message);
+        session.textChunks = [];
+        session.latestPlan = null;
+        session.status = "running";
+        const gateway = (goalRunner as any).gateway;
+        const runSession = async (sess: PlanSession) => {
+          try {
+            await runPlanDecoder({
+              cwd: sess.targetDir,
+              epicTitle: sess.epicTitle,
+              epicDescription: sess.epicDescription,
+              userMessages: sess.userMessages,
+              sessionId: sess.id,
+              gateway,
+              onStream: (event: AgentStreamPayload) => {
+                sess.streamChunks.push(event);
+                if (event.streamKind === "assistant" && event.content) {
+                  sess.textChunks.push(event.content);
+                  const plan = extractPlanFromStream(sess.textChunks);
+                  if (plan) sess.latestPlan = plan;
+                }
+              },
+            });
+          } catch (err) {
+            sess.streamChunks.push({
+              agentRole: "epicDecoder",
+              source: "orchestrator",
+              streamKind: "stderr",
+              content: `Plan decoder error: ${err instanceof Error ? err.message : String(err)}`,
+              sequence: sess.streamChunks.length,
+            });
+            sess.status = "error";
+            return;
+          }
+          sess.status = "idle";
+          if (sess.pendingMessages.length > 0) {
+            sess.userMessages.push(...sess.pendingMessages);
+            sess.pendingMessages = [];
+            sess.textChunks = [];
+            sess.status = "running";
+            void runSession(sess);
+          }
+        };
+        void runSession(session);
+        return json(res, 200, { ok: true, restarted: true });
+      }
+
+      const planApproveMatch = /^\/api\/plan-session\/([^/]+)\/approve$/.exec(url.pathname);
+      if (planApproveMatch && req.method === "POST") {
+        const sessionId = decodeURIComponent(planApproveMatch[1]);
+        const session = planSessions.get(sessionId);
+        if (!session) return json(res, 404, { error: "plan_session_not_found" });
+        if (!session.latestPlan) return json(res, 409, { error: "no_plan_ready", message: "The planner has not produced a plan yet." });
+
+        const epic = GoalRunner.createEpic(db, {
+          title: session.epicTitle,
+          goalText: session.epicDescription,
+          targetDir: session.targetDir,
+        });
+        const runId = await goalRunner.approveFromPlan(epic.id, session.latestPlan);
+        planSessions.delete(sessionId);
+        return json(res, 201, { epicId: epic.id, runId });
       }
 
       const builtIndex = path.join(config.uiDistDir, "index.html");
