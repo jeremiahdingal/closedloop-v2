@@ -159,7 +159,8 @@ export class TicketRunner {
       this.db.updateRun({ runId, status: "running", currentNode: "prepare_context", heartbeatAt: nowIso(), lastMessage: "Preparing workspace." });
       this.db.updateTicketRunState({ ticketId: ticket.id, status: "building", currentRunId: runId, currentNode: "prepare_context", lastHeartbeatAt: nowIso(), lastMessage: "Preparing workspace." });
       const epic = this.db.getEpic(ticket.epicId);
-      const workspace = await this.bridge.createWorkspace({ ticketId: ticket.id, runId, owner: runId, targetDir: epic?.targetDir || this.config.repoRoot });
+      const baseRef = epic?.targetBranch ?? undefined;
+      const workspace = await this.bridge.createWorkspace({ ticketId: ticket.id, runId, owner: runId, targetDir: epic?.targetDir || this.config.repoRoot, baseRef });
       await this.bridge.acquireWorkspaceLease(workspace.id, runId);
       const packet: TicketContextPacket = {
         epicId: ticket.epicId,
@@ -512,6 +513,9 @@ export class TicketRunner {
       const diffStats = await this.bridge.getDiffStats(state.workspaceId);
       const commitResult = await this.bridge.gitCommit({ workspaceId: state.workspaceId, message: `[${ticket.id}] automated ticket completion` });
       
+      const epic = this.db.getEpic(ticket.epicId);
+      const prBase = epic?.targetBranch ?? this.compareBaseRef.replace("origin/", "");
+      
       let prUrl: string | null = null;
       if (!commitResult.startsWith("noop:")) {
         for (let attempt = 1; attempt <= 2; attempt++) {
@@ -523,7 +527,7 @@ export class TicketRunner {
               workspaceId: state.workspaceId,
               title,
               body,
-              base: this.compareBaseRef.replace("origin/", "")
+              base: prBase
             });
             break;
           } catch (pushError) {
@@ -649,7 +653,8 @@ export class TicketRunner {
     this.db.updateTicketRunState({ ticketId: ticket.id, status: "building", currentRunId: runId, currentNode: "prepare_context", lastHeartbeatAt: nowIso(), lastMessage: "Preparing workspace." });
 
     const epic = this.db.getEpic(ticket.epicId);
-    const workspace = await this.bridge.createWorkspace({ ticketId: ticket.id, runId, owner: runId, targetDir: epic?.targetDir || this.config.repoRoot });
+    const baseRef = epic?.targetBranch ?? undefined;
+    const workspace = await this.bridge.createWorkspace({ ticketId: ticket.id, runId, owner: runId, targetDir: epic?.targetDir || this.config.repoRoot, baseRef });
     await this.bridge.acquireWorkspaceLease(workspace.id, runId);
 
     let reviewVerdict: ReviewerVerdict | null = null;
@@ -809,6 +814,9 @@ export class TicketRunner {
             const diffStats = await this.bridge.getDiffStats(workspace.id);
             const commitResult = await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] automated ticket completion` });
 
+            const epic = this.db.getEpic(ticket.epicId);
+            const prBase = epic?.targetBranch ?? this.compareBaseRef.replace("origin/", "");
+            
             let prUrl: string | null = null;
             if (!commitResult.startsWith("noop:")) {
               for (let attempt = 1; attempt <= 2; attempt++) {
@@ -820,7 +828,7 @@ export class TicketRunner {
                     workspaceId: workspace.id,
                     title,
                     body,
-                    base: this.compareBaseRef.replace("origin/", "")
+                    base: prBase
                   });
                   break;
                 } catch (pushError) {

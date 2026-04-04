@@ -4,9 +4,10 @@
  */
 
 import { readdir, readFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { join, relative, posix } from "node:path";
 import { AppDatabase } from "../db/database.ts";
 import { embedTexts, isEmbeddingModelAvailable, serializeEmbedding } from "./embeddings.ts";
+import { parseAst } from "./ast-parser.ts";
 
 const DEFAULT_EMBEDDING_MODEL = "nomic-embed-text";
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
@@ -103,7 +104,77 @@ export async function indexWorkspace(options: IndexOptions): Promise<{ indexId: 
 
   options.db.insertRagChunks(indexId, chunksWithEmbeddings);
 
+  // AST pass: extract dependency graph from TypeScript files
+  try {
+    await buildAndStoreAst(options.repoRoot, indexId, options.db, options.scopePaths);
+  } catch (err) {
+    console.warn(`[RAG] AST pass failed: ${err}`);
+  }
+
   return { indexId, chunkCount: chunks.length };
+}
+
+/**
+ * Walk TypeScript/TSX files, parse AST, and store nodes + edges
+ */
+async function buildAndStoreAst(
+  repoRoot: string,
+  indexId: number,
+  db: AppDatabase,
+  scopePaths?: string[]
+): Promise<void> {
+  const files = await walkDir(repoRoot, scopePaths);
+  const tsFiles = files.filter((f) => /\.(ts|tsx)$/.test(f));
+
+  const nodes: Parameters<AppDatabase["insertAstNodes"]>[1] = [];
+  const edges: Parameters<AppDatabase["insertAstEdges"]>[1] = [];
+
+  for (const file of tsFiles) {
+    try {
+      const source = await readFile(file, "utf-8");
+      const relPath = relative(repoRoot, file).replace(/\\/g, "/");
+      const result = parseAst(relPath, source);
+
+      // Collect nodes (exported symbols)
+      for (const exp of result.exports) {
+        nodes.push({
+          filePath: relPath,
+          symbolName: exp.name,
+          symbolKind: exp.kind,
+          startLine: 1,
+        });
+      }
+      for (const sig of result.signatures) {
+        // Update startLine for matching nodes or add signature text
+        const existing = nodes.find((n) => n.filePath === relPath && n.symbolName === sig.name);
+        if (existing) {
+          existing.startLine = sig.line;
+          existing.signatureText = sig.text;
+        }
+      }
+
+      // Collect edges (import relationships)
+      const dirPath = posix.dirname(relPath);
+      for (const imp of result.imports) {
+        // Only resolve relative imports (skip npm packages)
+        if (!imp.from.startsWith(".")) continue;
+
+        let resolved = posix.normalize(posix.join(dirPath, imp.from));
+        // Try to resolve with .ts extension if no extension present
+        if (!/\.(ts|tsx|js|jsx)$/.test(resolved)) {
+          resolved = resolved + ".ts";
+        }
+
+        const depType = imp.isTypeOnly ? "type-import" : "import";
+        edges.push({ sourceFile: relPath, targetFile: resolved, depType });
+      }
+    } catch {
+      // Skip unparseable files
+    }
+  }
+
+  if (nodes.length > 0) db.insertAstNodes(indexId, nodes);
+  if (edges.length > 0) db.insertAstEdges(indexId, edges);
 }
 
 interface Chunk {

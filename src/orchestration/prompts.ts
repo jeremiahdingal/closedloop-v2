@@ -169,7 +169,11 @@ export function epicReviewerPrompt(epic: EpicRecord, tickets: TicketRecord[]): s
   ].join("\n\n");
 }
 
-export function epicReviewerToolingPrompt(epic: EpicRecord, tickets: TicketRecord[]): string {
+export function epicReviewerToolingPrompt(
+  epic: EpicRecord,
+  tickets: TicketRecord[],
+  ragContext?: { codeContext: string; docContext: string } | null
+): string {
   // Build structured ticket listing with ALL tickets
   const ticketListing = tickets
     .map(t => {
@@ -187,10 +191,16 @@ export function epicReviewerToolingPrompt(epic: EpicRecord, tickets: TicketRecor
     })
     .join("\n\n");
 
-  return [
+  const sections: string[] = [
     "Review the overall epic result using the repository, ticket information, and any available artifacts.",
     "CRITICAL: All tickets in this epic have been reviewed and approved. Proceed confidently to check integration.",
     "Your role is to check for destructive changes and cross-ticket integration issues.",
+  ];
+
+  if (ragContext?.docContext) sections.push(ragContext.docContext);
+  if (ragContext?.codeContext) sections.push(ragContext.codeContext);
+
+  sections.push(
     "",
     "Destructive patterns to check for:",
     "- Large file deletions (>10 files or >1000 lines)",
@@ -217,7 +227,9 @@ export function epicReviewerToolingPrompt(epic: EpicRecord, tickets: TicketRecor
     "",
     "Return exactly one FINAL_JSON block and nothing after it.",
     '<FINAL_JSON>{"verdict":"approved|needs_followups|failed","summary":"brief summary","followupTickets":[]}</FINAL_JSON>'
-  ].join("\n\n");
+  );
+
+  return sections.join("\n\n");
 }
 
 export function doctorPrompt(input: {
@@ -243,14 +255,23 @@ export function doctorPrompt(input: {
   ].join("\n\n");
 }
 
-export function epicDecoderToolingPrompt(epic: EpicRecord): string {
-  return [
+export function epicDecoderToolingPrompt(
+  epic: EpicRecord,
+  ragContext?: { codeContext: string; docContext: string } | null
+): string {
+  const sections: string[] = [
     "You are the Epic Decoder agent. Explore the repository using the OpenCode tools that are actually available in-session.",
     "Use read, glob, grep, edit, write, task, todowrite, and skill.",
     "Do not try to call bash, ls, find, run, or any other unavailable shell tool.",
     "Understand the codebase structure, existing patterns, and conventions before decomposing the epic.",
     `Epic: ${epic.title}`,
     `Goal: ${epic.goalText}`,
+  ];
+
+  if (ragContext?.docContext) sections.push(ragContext.docContext);
+  if (ragContext?.codeContext) sections.push(ragContext.codeContext);
+
+  sections.push(
     "Steps:",
     "1. Explore the repo structure with glob/grep and read key files",
     "2. Understand existing code patterns and architecture",
@@ -269,10 +290,16 @@ export function epicDecoderToolingPrompt(epic: EpicRecord): string {
         priority: "high|medium|low"
       }]
     })}</FINAL_JSON>`
-  ].join("\n\n");
+  );
+
+  return sections.join("\n\n");
 }
 
-export function epicReviewerCodexPrompt(epic: EpicRecord, tickets: TicketRecord[]): string {
+export function epicReviewerCodexPrompt(
+  epic: EpicRecord,
+  tickets: TicketRecord[],
+  ragContext?: { codeContext: string; docContext: string } | null
+): string {
   // Build structured ticket listing with ALL tickets (regardless of PR status)
   const ticketListing = tickets
     .map(t => {
@@ -290,11 +317,17 @@ export function epicReviewerCodexPrompt(epic: EpicRecord, tickets: TicketRecord[
     })
     .join("\n\n");
 
-  return [
+  const sections: string[] = [
     "You are the Epic Reviewer agent. Review the overall epic result quickly and efficiently.",
     "CRITICAL: All tickets in this epic have been reviewed and approved. Proceed confidently.",
     "Your role is to check for cross-ticket integration issues and fix any destructive or risky changes.",
     "IMPORTANT: Be concise. Check git log and diffs for the ticket changes, verify they look safe, then output FINAL_JSON. Do NOT explore the entire repo.",
+  ];
+
+  if (ragContext?.docContext) sections.push(ragContext.docContext);
+  if (ragContext?.codeContext) sections.push(ragContext.codeContext);
+
+  sections.push(
     "",
     "Destructive patterns to check for:",
     "- Large file deletions (>10 files or >1000 lines)",
@@ -325,5 +358,7 @@ export function epicReviewerCodexPrompt(epic: EpicRecord, tickets: TicketRecord[
     "",
     "After you finish, output exactly one FINAL_JSON block and nothing after it.",
     '<FINAL_JSON>{"verdict":"approved|needs_followups|failed","summary":"brief summary","followupTickets":[]}</FINAL_JSON>'
-  ].join("\n\n");
+  );
+
+  return sections.join("\n\n");
 }

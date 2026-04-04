@@ -24,6 +24,7 @@ export type EpicRecord = {
   title: string;
   goalText: string;
   targetDir: string;
+  targetBranch: string | null;
   status: EpicStatus;
   createdAt: string;
   updatedAt: string;

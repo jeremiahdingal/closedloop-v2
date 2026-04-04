@@ -48,123 +48,32 @@ export class AppDatabase {
         title TEXT NOT NULL,
         goal_text TEXT NOT NULL,
         target_dir TEXT NOT NULL,
+        target_branch TEXT,
         status TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+    `);
+    
+    try {
+      this.db.exec(`ALTER TABLE epics ADD COLUMN target_branch TEXT`);
+    } catch {
+      // Column may already exist
+    }
 
-      CREATE TABLE IF NOT EXISTS tickets (
-        id TEXT PRIMARY KEY,
-        epic_id TEXT NOT NULL REFERENCES epics(id) ON DELETE CASCADE,
-        title TEXT NOT NULL,
-        description TEXT NOT NULL,
-        acceptance_criteria_json TEXT NOT NULL,
-        dependencies_json TEXT NOT NULL,
-        allowed_paths_json TEXT NOT NULL,
-        priority TEXT NOT NULL,
-        status TEXT NOT NULL,
-        current_run_id TEXT,
-        current_node TEXT,
-        last_heartbeat_at TEXT,
-        last_message TEXT,
-        diff_files_json TEXT,
-        pr_url TEXT,
-        metadata_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
+    try {
+      this.db.exec(`ALTER TABLE tickets ADD COLUMN diff_files_json TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE tickets ADD COLUMN pr_url TEXT`);
+    } catch {
+      // Column already exists
+    }
 
-      CREATE TABLE IF NOT EXISTS runs (
-        id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL,
-        epic_id TEXT,
-        ticket_id TEXT,
-        status TEXT NOT NULL,
-        current_node TEXT,
-        attempt INTEGER NOT NULL,
-        heartbeat_at TEXT,
-        last_message TEXT,
-        error_text TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS workspaces (
-        id TEXT PRIMARY KEY,
-        ticket_id TEXT NOT NULL,
-        run_id TEXT NOT NULL,
-        repo_root TEXT NOT NULL,
-        worktree_path TEXT NOT NULL,
-        branch_name TEXT NOT NULL,
-        base_commit TEXT NOT NULL,
-        head_commit TEXT,
-        status TEXT NOT NULL,
-        lease_owner TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS jobs (
-        id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        status TEXT NOT NULL,
-        available_at TEXT NOT NULL,
-        attempts INTEGER NOT NULL,
-        last_error TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        aggregate_type TEXT NOT NULL,
-        aggregate_id TEXT NOT NULL,
-        run_id TEXT,
-        ticket_id TEXT,
-        kind TEXT NOT NULL,
-        message TEXT NOT NULL,
-        payload_json TEXT,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS leases (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        resource_type TEXT NOT NULL,
-        resource_id TEXT NOT NULL,
-        owner TEXT NOT NULL,
-        heartbeat_at TEXT NOT NULL,
-        expires_at TEXT NOT NULL,
-        UNIQUE(resource_type, resource_id)
-      );
-
-      CREATE TABLE IF NOT EXISTS artifacts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id TEXT,
-        ticket_id TEXT,
-        kind TEXT NOT NULL,
-        name TEXT NOT NULL,
-        path TEXT NOT NULL,
-        checksum TEXT NOT NULL,
-        bytes INTEGER NOT NULL,
-        metadata_json TEXT,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS tool_invocations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id TEXT,
-        ticket_id TEXT,
-        node_name TEXT NOT NULL,
-        tool_name TEXT NOT NULL,
-        input_json TEXT NOT NULL,
-        exit_code INTEGER NOT NULL,
-        duration_ms INTEGER NOT NULL,
-        stdout_path TEXT,
-        stderr_path TEXT,
-        created_at TEXT NOT NULL
-      );
-
+    // RAG tables
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS rag_index_meta (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         repo_root TEXT NOT NULL,
@@ -188,24 +97,31 @@ export class AppDatabase {
         created_at TEXT NOT NULL
       );
 
-      CREATE INDEX IF NOT EXISTS idx_jobs_status_available ON jobs(status, available_at);
-      CREATE INDEX IF NOT EXISTS idx_runs_ticket_status ON runs(ticket_id, status);
-      CREATE INDEX IF NOT EXISTS idx_events_aggregate ON events(aggregate_type, aggregate_id);
+      CREATE TABLE IF NOT EXISTS ast_nodes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        index_id INTEGER NOT NULL REFERENCES rag_index_meta(id) ON DELETE CASCADE,
+        file_path TEXT NOT NULL,
+        symbol_name TEXT NOT NULL,
+        symbol_kind TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        signature_text TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS ast_edges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        index_id INTEGER NOT NULL REFERENCES rag_index_meta(id) ON DELETE CASCADE,
+        source_file TEXT NOT NULL,
+        target_file TEXT NOT NULL,
+        dep_type TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_rag_chunks_index_id ON rag_chunks(index_id);
       CREATE INDEX IF NOT EXISTS idx_rag_chunks_file_path ON rag_chunks(index_id, file_path);
+      CREATE INDEX IF NOT EXISTS idx_ast_edges_index_id ON ast_edges(index_id);
+      CREATE INDEX IF NOT EXISTS idx_ast_edges_source ON ast_edges(index_id, source_file);
     `);
-
-    // Migration: add diff_files_json and pr_url columns to tickets table
-    try {
-      this.db.exec(`ALTER TABLE tickets ADD COLUMN diff_files_json TEXT`);
-    } catch {
-      // Column already exists
-    }
-    try {
-      this.db.exec(`ALTER TABLE tickets ADD COLUMN pr_url TEXT`);
-    } catch {
-      // Column already exists
-    }
   }
 
   close(): void {
@@ -227,9 +143,9 @@ export class AppDatabase {
   createEpic(epic: Omit<EpicRecord, "createdAt" | "updatedAt">): EpicRecord {
     const now = nowIso();
     this.db.prepare(`
-      INSERT INTO epics (id, title, goal_text, target_dir, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(epic.id, epic.title, epic.goalText, epic.targetDir, epic.status, now, now);
+      INSERT INTO epics (id, title, goal_text, target_dir, target_branch, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(epic.id, epic.title, epic.goalText, epic.targetDir, epic.targetBranch, epic.status, now, now);
     return { ...epic, createdAt: now, updatedAt: now };
   }
 
@@ -241,6 +157,7 @@ export class AppDatabase {
       title: row.title,
       goalText: row.goal_text,
       targetDir: row.target_dir,
+      targetBranch: row.target_branch || null,
       status: row.status,
       createdAt: row.created_at,
       updatedAt: row.updated_at
@@ -253,6 +170,7 @@ export class AppDatabase {
       title: row.title,
       goalText: row.goal_text,
       targetDir: row.target_dir,
+      targetBranch: row.target_branch || null,
       status: row.status,
       createdAt: row.created_at,
       updatedAt: row.updated_at
@@ -941,5 +859,65 @@ export class AppDatabase {
 
   deleteRagIndex(indexId: number): void {
     this.db.prepare(`DELETE FROM rag_index_meta WHERE id = ?`).run(indexId);
+  }
+
+  // AST Graph Methods
+  insertAstNodes(
+    indexId: number,
+    nodes: Array<{
+      filePath: string;
+      symbolName: string;
+      symbolKind: string;
+      startLine: number;
+      signatureText?: string;
+    }>
+  ): void {
+    const stmt = this.db.prepare(
+      `INSERT INTO ast_nodes (index_id, file_path, symbol_name, symbol_kind, start_line, signature_text, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    );
+    const now = nowIso();
+    for (const node of nodes) {
+      stmt.run(indexId, node.filePath, node.symbolName, node.symbolKind, node.startLine, node.signatureText ?? null, now);
+    }
+  }
+
+  insertAstEdges(
+    indexId: number,
+    edges: Array<{
+      sourceFile: string;
+      targetFile: string;
+      depType: string;
+    }>
+  ): void {
+    const stmt = this.db.prepare(
+      `INSERT INTO ast_edges (index_id, source_file, target_file, dep_type, created_at) VALUES (?, ?, ?, ?, ?)`
+    );
+    const now = nowIso();
+    for (const edge of edges) {
+      stmt.run(indexId, edge.sourceFile, edge.targetFile, edge.depType, now);
+    }
+  }
+
+  loadAstEdgesForFile(
+    indexId: number,
+    filePath: string
+  ): Array<{ sourceFile: string; targetFile: string; depType: string }> {
+    return (
+      this.db.prepare(
+        `SELECT source_file, target_file, dep_type FROM ast_edges
+         WHERE index_id = ? AND (source_file = ? OR target_file = ?)`
+      ).all(indexId, filePath, filePath) as any[]
+    ).map((r) => ({ sourceFile: r.source_file, targetFile: r.target_file, depType: r.dep_type }));
+  }
+
+  loadAstEdgesForIndex(
+    indexId: number
+  ): Array<{ sourceFile: string; targetFile: string; depType: string }> {
+    return (
+      this.db.prepare(
+        `SELECT source_file, target_file, dep_type FROM ast_edges WHERE index_id = ?`
+      ).all(indexId) as any[]
+    ).map((r) => ({ sourceFile: r.source_file, targetFile: r.target_file, depType: r.dep_type }));
   }
 }

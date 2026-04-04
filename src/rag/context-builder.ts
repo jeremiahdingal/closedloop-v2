@@ -134,6 +134,87 @@ export async function buildContextForTicket(options: ContextBuildOptions): Promi
   }
 }
 
+export interface QueryContextBuildOptions {
+  query: string;
+  db: AppDatabase;
+  repoRoot: string;
+  commitHash: string;
+  model?: string;
+  baseUrl?: string;
+  maxTokens?: number;
+  scopePaths?: string[];
+}
+
+/**
+ * Build pre-computed context from a plain query string (for epic decoder/reviewer)
+ */
+export async function buildContextForQuery(
+  options: QueryContextBuildOptions
+): Promise<BuiltContext & { indexId: number | null }> {
+  const maxTokens = options.maxTokens || 8000;
+
+  try {
+    const indexResult = await getOrCreateIndex({
+      repoRoot: options.repoRoot,
+      commitHash: options.commitHash,
+      db: options.db,
+      model: options.model,
+      baseUrl: options.baseUrl,
+      scopePaths: options.scopePaths,
+    });
+
+    if (indexResult.chunkCount === 0) {
+      return {
+        codeContext: "",
+        docContext: "",
+        totalTokenEstimate: 0,
+        retrievalMode: "keyword",
+        chunkCount: 0,
+        indexId: indexResult.id,
+      };
+    }
+
+    const query = options.query.slice(0, 1000);
+
+    const chunks = await retrieveChunks({
+      query,
+      db: options.db,
+      indexId: indexResult.id!,
+      topK: 20,
+      scopePaths: options.scopePaths,
+      maxTokens,
+      model: options.model,
+      baseUrl: options.baseUrl,
+    });
+
+    const codeChunks = chunks.filter((c) =>
+      ["imports", "signature", "full_file", "config"].includes(c.chunkType)
+    );
+    const docChunks = chunks.filter((c) =>
+      ["doc_section", "doc"].includes(c.chunkType)
+    );
+
+    return {
+      codeContext: formatCodeContext(codeChunks),
+      docContext: formatDocContext(docChunks),
+      totalTokenEstimate: chunks.reduce((sum, c) => sum + c.tokenEstimate, 0),
+      retrievalMode: indexResult.cached ? "semantic" : "keyword",
+      chunkCount: chunks.length,
+      indexId: indexResult.id,
+    };
+  } catch (err) {
+    console.error(`[RAG] Query context build error: ${err}`);
+    return {
+      codeContext: "",
+      docContext: "",
+      totalTokenEstimate: 0,
+      retrievalMode: "keyword",
+      chunkCount: 0,
+      indexId: null,
+    };
+  }
+}
+
 function formatCodeContext(chunks: Array<{
   filePath: string;
   chunkType: string;

@@ -13,6 +13,8 @@ import { formatCodexFailure } from "./codex.ts";
 import { formatQwenFailure } from "./qwen.ts";
 import { LifecycleService } from "./lifecycle.ts";
 import { WorkspaceBridge } from "../bridge/workspace-bridge.ts";
+import { buildContextForQuery } from "../rag/context-builder.ts";
+import { git } from "../bridge/git.ts";
 
 type GoalGraphState = {
   runId: string;
@@ -95,11 +97,11 @@ export class GoalRunner {
 
   private materializeTickets(epicId: string, plans: GoalTicketPlan[]) {
     const existing = this.db.listTickets(epicId);
-    const byId = new Map(existing.map((ticket) => [ticket.id, ticket]));
-    const bySourceId = new Map(
-      existing.map((ticket) => [String((ticket.metadata as any)?.sourceTicketId || ""), ticket]).filter(([key]) => Boolean(key))
+    const byId = new Map(existing.map((ticket) => [ticket.id, ticket] as const));
+    const bySourceId = new Map<string, TicketRecord>(
+      (existing.map((ticket) => [String((ticket.metadata as any)?.sourceTicketId || ""), ticket] as const) as [string, TicketRecord][]).filter(([key]) => Boolean(key))
     );
-    const byTitle = new Map<string, typeof existing>();
+    const byTitle = new Map<string, TicketRecord[]>();
     for (const ticket of existing) {
       const key = normalizeTicketTitleKey(ticket.title);
       const bucket = byTitle.get(key) ?? [];
@@ -147,7 +149,7 @@ export class GoalRunner {
     }));
 
     const allIds = Array.from(new Set(plans.map((plan) => planIdToTicketId.get(plan.id) || plan.id)));
-    const allTickets = allIds.map((ticketId) => this.db.getTicket(ticketId)).filter(Boolean);
+    const allTickets = allIds.map((ticketId) => this.db.getTicket(ticketId)).filter((t): t is TicketRecord => t !== null);
 
     return {
       tickets: allTickets,
@@ -370,7 +372,7 @@ export class GoalRunner {
       this.assertNotCancelled(epic.id);
       this.db.updateRun({ runId, status: "running", currentNode: "execute_tickets", heartbeatAt: nowIso(), lastMessage: "Executing tickets." });
       this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Found ${state.ticketIds.length} tickets to execute`, runId, epicId: epic.id, sequence: 0 });
-      const createdTickets = state.ticketIds.map((ticketId) => this.db.getTicket(ticketId)).filter(Boolean) as any[];
+      const createdTickets = state.ticketIds.map((ticketId) => this.db.getTicket(ticketId)).filter((t): t is TicketRecord => t !== null);
       const summaries: string[] = [];
       for (const ticket of createdTickets.filter((item) => item.dependencies.length === 0)) {
         this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting ticket: ${ticket.id}`, runId, epicId: epic.id, ticketId: ticket.id, sequence: 1 });
@@ -511,7 +513,7 @@ export class GoalRunner {
       });
     }
 
-    for (const ticket of createdTickets.filter((item) => item.dependencies.length === 0)) {
+    for (const ticket of createdTickets.filter((item): item is TicketRecord => item.dependencies.length === 0)) {
       this.assertNotCancelled(epic.id);
       await this.ticketRunner.start(ticket.id, epic.id);
     }
@@ -521,7 +523,7 @@ export class GoalRunner {
       let current = this.db.getTicket(ticket.id);
       while (current && (current.status === "queued" || current.status === "building" || current.status === "reviewing" || current.status === "testing")) {
         const queuedRun = this.db.listRuns().find((record) => record.ticketId === ticket.id && (record.status === "queued" || record.status === "running"));
-        if (!queuedRun) break; // no run started yet and none running — ticket is waiting on deps that won't be satisfied
+        if (!queuedRun) break;
         if (queuedRun.status === "queued") {
           try {
             await this.ticketRunner.runExisting(queuedRun.id);
@@ -531,9 +533,12 @@ export class GoalRunner {
         }
         current = this.db.getTicket(ticket.id);
       }
-      for (const dependent of createdTickets.filter((candidate) => candidate.dependencies.includes(ticket.id))) {
+      for (const dependent of createdTickets.filter((candidate): candidate is TicketRecord => candidate.dependencies.includes(ticket.id))) {
         const depCurrent = this.db.getTicket(dependent.id);
-        const depsReady = dependent.dependencies.every((dependencyId) => this.db.getTicket(dependencyId)?.status === "approved");
+        const depsReady = dependent.dependencies.every((dependencyId) => {
+          const depTicket = this.db.getTicket(dependencyId);
+          return depTicket?.status === "approved";
+        });
         if (depCurrent?.status === "queued" && depsReady && !depCurrent.currentRunId) {
           await this.ticketRunner.start(depCurrent.id, epic.id);
           const depRun = this.db.listRuns().find((record) => record.ticketId === depCurrent.id && record.status === "queued");
@@ -597,13 +602,15 @@ export class GoalRunner {
   }
 
   private async runEpicDecoder(epic: EpicRecord, runId: string): Promise<GoalDecomposition> {
+    const ragCtx = await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`);
+
     if (this.gateway.runEpicDecoderInWorkspace && (this.gateway.models.epicDecoder === "codex-cli" || this.gateway.models.epicDecoder === "qwen-cli")) {
       try {
         const via = this.gateway.models.epicDecoder === "qwen-cli" ? "Qwen CLI" : "Codex";
         this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "status", content: `Decomposing via ${via}...`, runId, epicId: epic.id, sequence: 0 });
         const result = await this.gateway.runEpicDecoderInWorkspace({
           cwd: epic.targetDir,
-          prompt: epicDecoderToolingPrompt(epic),
+          prompt: epicDecoderToolingPrompt(epic, ragCtx),
           runId,
           epicId: epic.id,
           onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
@@ -620,7 +627,7 @@ export class GoalRunner {
         this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "status", content: "Decomposing via OpenCode...", runId, epicId: epic.id, sequence: 0 });
         const result = await this.gateway.runEpicDecoderOpenCode({
           cwd: epic.targetDir,
-          prompt: epicDecoderToolingPrompt(epic),
+          prompt: epicDecoderToolingPrompt(epic, ragCtx),
           runId,
           epicId: epic.id,
           onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
@@ -636,9 +643,11 @@ export class GoalRunner {
         this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "status", content: "Decomposing via mediated agent harness...", runId, epicId: epic.id, sequence: 0 });
         const result = await this.gateway.runEpicDecoderInWorkspace({
           cwd: epic.targetDir,
-          prompt: epicDecoderToolingPrompt(epic),
+          prompt: epicDecoderToolingPrompt(epic, ragCtx),
           runId,
           epicId: epic.id,
+          ragIndexId: ragCtx?.indexId ?? undefined,
+          db: this.db,
           onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
         });
         this.recordAgentStream({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "assistant", content: `Decomposed into ${result.tickets.length} tickets.\nSummary: ${result.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
@@ -662,6 +671,7 @@ export class GoalRunner {
     });
     await this.bridge.acquireWorkspaceLease(reviewWorkspace.id, runId);
     const reviewEpic: EpicRecord = { ...epic, targetDir: reviewWorkspace.worktreePath };
+    const ragCtx = await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`);
     let cleaned = false;
     const cleanupWorkspace = async () => {
       if (cleaned) return;
@@ -707,7 +717,7 @@ export class GoalRunner {
         const review = await this.withTimeout(
           this.gateway.runEpicReviewerCodex({
             cwd: reviewEpic.targetDir,
-            prompt: epicReviewerCodexPrompt(reviewEpic, tickets),
+            prompt: epicReviewerCodexPrompt(reviewEpic, tickets, ragCtx),
             runId,
             epicId: epic.id,
             onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
@@ -747,7 +757,7 @@ export class GoalRunner {
         const review = await this.withTimeout(
           this.gateway.runEpicReviewerCodex({
             cwd: reviewEpic.targetDir,
-            prompt: epicReviewerCodexPrompt(reviewEpic, tickets),
+            prompt: epicReviewerCodexPrompt(reviewEpic, tickets, ragCtx),
             runId,
             epicId: epic.id,
             onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
@@ -768,7 +778,7 @@ export class GoalRunner {
         const review = await this.withTimeout(
           this.gateway.runGoalReviewInWorkspace({
             cwd: reviewEpic.targetDir,
-            prompt: epicReviewerToolingPrompt(reviewEpic, tickets),
+            prompt: epicReviewerToolingPrompt(reviewEpic, tickets, ragCtx),
             runId,
             epicId: epic.id,
             onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
@@ -788,9 +798,11 @@ export class GoalRunner {
         const review = await this.withTimeout(
           this.gateway.runGoalReviewInWorkspace({
             cwd: reviewEpic.targetDir,
-            prompt: epicReviewerToolingPrompt(reviewEpic, tickets),
+            prompt: epicReviewerToolingPrompt(reviewEpic, tickets, ragCtx),
             runId,
             epicId: epic.id,
+            ragIndexId: ragCtx?.indexId ?? undefined,
+            db: this.db,
             onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
           }),
           this.epicReviewTimeoutMs,
@@ -828,12 +840,13 @@ export class GoalRunner {
     });
   }
 
-  static createEpic(db: AppDatabase, input: { id?: string; title: string; goalText: string; targetDir: string }): EpicRecord {
+  static createEpic(db: AppDatabase, input: { id?: string; title: string; goalText: string; targetDir: string; targetBranch?: string }): EpicRecord {
     return db.createEpic({
       id: input.id ?? randomId("epic"),
       title: input.title,
       goalText: input.goalText,
       targetDir: input.targetDir,
+      targetBranch: input.targetBranch ?? null,
       status: "planning"
     });
   }
@@ -847,6 +860,26 @@ export class GoalRunner {
   private epicHeartbeat(runId: string, epicId: string, node: string, message: string): void {
     this.assertNotCancelled(epicId);
     this.db.updateRun({ runId, status: "running", currentNode: node, heartbeatAt: nowIso(), lastMessage: message });
+  }
+
+  private async buildRagContext(
+    repoPath: string,
+    query: string
+  ): Promise<{ codeContext: string; docContext: string; indexId: number | null } | null> {
+    try {
+      const headResult = await git(repoPath, ["rev-parse", "HEAD"]);
+      const commitHash = headResult.stdout.trim();
+      const ctx = await buildContextForQuery({
+        query: query.slice(0, 1000),
+        db: this.db,
+        repoRoot: repoPath,
+        commitHash,
+      });
+      return { codeContext: ctx.codeContext, docContext: ctx.docContext, indexId: ctx.indexId };
+    } catch (err) {
+      console.warn(`[RAG] buildRagContext failed: ${err}`);
+      return null;
+    }
   }
 
   private async withEpicHeartbeat<T>(runId: string, epicId: string, node: string, message: string, task: () => Promise<T>): Promise<T> {

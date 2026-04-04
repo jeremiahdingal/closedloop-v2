@@ -7,6 +7,7 @@ import { loadConfig } from "../config.ts";
 import { appendAuditLine } from "./audit.ts";
 import { PathPolicy, getCommand } from "./policies.ts";
 import { git } from "./git.ts";
+import { gh } from "./gh.ts";
 import { ensureDir, nowIso, randomId, safeJoin, sha256, sleep, truncate } from "../utils.ts";
 import type {
   CommandName,
@@ -48,7 +49,26 @@ export class WorkspaceBridge {
     let baseCommit = "";
     if (isGitRepo) {
       const baseRef = input.baseRef ?? "HEAD";
-      baseCommit = await this.resolveBaseCommit(input.targetDir, baseRef);
+      try {
+        baseCommit = await this.resolveBaseCommit(input.targetDir, baseRef);
+      } catch (resolveError) {
+        const errMsg = resolveError instanceof Error ? resolveError.message : String(resolveError);
+        if (baseRef !== "HEAD" && (errMsg.includes("could not resolve") || errMsg.includes("fatal: ambiguous"))) {
+          console.warn(`Branch '${baseRef}' not found, attempting to create from origin/${baseRef} or main`);
+          try {
+            baseCommit = await this.resolveBaseCommit(input.targetDir, `origin/${baseRef}`);
+          } catch {
+            try {
+              baseCommit = await this.resolveBaseCommit(input.targetDir, "origin/main");
+            } catch {
+              console.warn(`Could not resolve origin/main either, falling back to HEAD`);
+              baseCommit = await this.resolveBaseCommit(input.targetDir, "HEAD");
+            }
+          }
+        } else {
+          throw resolveError;
+        }
+      }
       await git(input.targetDir, ["worktree", "add", "-b", branchName, worktreePath, baseCommit]);
     } else {
       await cp(input.targetDir, worktreePath, { recursive: true });
@@ -240,19 +260,30 @@ export class WorkspaceBridge {
     const workspace = this.requireWorkspace(input.workspaceId);
     const base = input.base ?? "main";
     try {
-      const result = await git(workspace.worktreePath, [
+      const result = await gh(workspace.worktreePath, [
         "pr", "create",
         "--title", input.title,
         "--body", input.body ?? "",
-        "--base", base
+        "--base", base,
+        "--head", workspace.branchName
       ]);
       const output = result.stdout.trim();
-      if (output.includes("github.com")) {
+      if (output.includes("github.com") || output.includes("pull/")) {
+        const match = output.match(/pull\/\d+/);
+        if (match) return `https://github.com/${match[0]}`;
         return output;
       }
-      const prMatch = output.match(/https?:\/\/[^\s]+/);
-      return prMatch ? prMatch[0] : null;
+      if (output.includes("already exists")) {
+        const existingMatch = output.match(/pull\/(\d+)/);
+        if (existingMatch) return `https://github.com/pull/${existingMatch[1]}`;
+      }
+      return null;
     } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      if (errMsg.includes("already exists")) {
+        const match = errMsg.match(/pull\/(\d+)/);
+        if (match) return `https://github.com/pull/${match[1]}`;
+      }
       console.warn("Failed to create PR:", error);
       return null;
     }

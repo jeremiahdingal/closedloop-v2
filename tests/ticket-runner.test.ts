@@ -420,7 +420,7 @@ test("ticket runner retries transient reviewer infrastructure failures", async (
           approved: true,
           blockers: [],
           suggestions: [],
-          riskLevel: "low"
+          riskLevel: "low" as const
         };
       }
     }
@@ -482,7 +482,7 @@ test("ticket runner surfaces clearer reviewer infrastructure errors", async () =
     });
 
     class FailingReviewerGateway extends MockGateway {
-      override async getReviewerVerdict(_prompt: string) {
+      override async getReviewerVerdict(_prompt: string): Promise<never> {
         throw new Error("fetch failed");
       }
     }

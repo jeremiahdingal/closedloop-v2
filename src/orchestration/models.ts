@@ -36,8 +36,8 @@ export interface ModelGateway {
   getFailureDecision(prompt: string): Promise<FailureDecision>;
   runBuilderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<OpenCodeBuilderResult>;
   runTesterInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<TesterResult>;
-  runGoalReviewInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview>;
-  runEpicDecoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition>;
+  runGoalReviewInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any }): Promise<GoalReview>;
+  runEpicDecoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any }): Promise<GoalDecomposition>;
   runEpicDecoderOpenCode?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition>;
   runEpicReviewerCodex?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview>;
 }
@@ -455,6 +455,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     runId?: string | null;
     epicId?: string | null;
     onStream?: StreamHook;
+    ragIndexId?: number;
+    db?: any;
   }): Promise<GoalDecomposition> {
     const configuredModel = this.models.epicDecoder;
 
@@ -480,7 +482,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, "epicDecoder");
+    const toolContext = this.buildToolContext(input.cwd, "epicDecoder", { ragIndexId: input.ragIndexId, db: input.db });
 
     const harness = new MediatedAgentHarness({
       baseURL: `${this.ollamaBaseURL}/v1`,
@@ -539,6 +541,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     runId?: string | null;
     epicId?: string | null;
     onStream?: StreamHook;
+    ragIndexId?: number;
+    db?: any;
   }): Promise<GoalReview> {
     const configuredModel = this.models.epicReviewer;
     if (configuredModel === "qwen-cli") {
@@ -559,7 +563,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, "epicReviewer");
+    const toolContext = this.buildToolContext(input.cwd, "epicReviewer", { ragIndexId: input.ragIndexId, db: input.db });
 
     const harness = new MediatedAgentHarness({
       baseURL: `${this.ollamaBaseURL}/v1`,
@@ -830,10 +834,16 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     };
   }
 
-  private buildToolContext(cwd: string, workspaceId: string): ToolExecutionContext {
+  private buildToolContext(
+    cwd: string,
+    workspaceId: string,
+    ragOptions?: { ragIndexId?: number; db?: any }
+  ): ToolExecutionContext {
     return {
       cwd,
       workspaceId,
+      ragIndexId: ragOptions?.ragIndexId,
+      db: ragOptions?.db,
       allowedPaths: ["*"],
       braveApiKey: this.braveApiKey,
       readFiles: async (paths) => {

@@ -63,6 +63,14 @@ export async function retrieveChunks(options: RetrievalOptions): Promise<Retriev
 
       scored.sort((a, b) => b.score - a.score);
 
+      // Apply AST dependency boost if available
+      try {
+        await applyAstBoost(scored, options.db, options.indexId);
+        scored.sort((a, b) => b.score - a.score);
+      } catch {
+        // skip boost on error
+      }
+
       return deduplicateAndBudget(scored, topK, maxTokens);
     } catch (err) {
       console.warn(`[RAG] Semantic search failed: ${err}. Falling back to keyword search.`);
@@ -107,6 +115,61 @@ export function keywordRetrieve(
   scored.sort((a, b) => b.score - a.score);
 
   return deduplicateAndBudget(scored, topK, maxTokens);
+}
+
+/**
+ * Boost scores based on AST import relationships
+ * Direct neighbor (file imported by/from top-k file) → +0.15
+ * 2-hop transitive neighbor → +0.05
+ */
+async function applyAstBoost(
+  scored: Array<{ filePath: string; score: number }>,
+  db: AppDatabase,
+  indexId: number
+): Promise<void> {
+  const edges = db.loadAstEdgesForIndex(indexId);
+  if (edges.length === 0) return;
+
+  // Build adjacency map: file → set of direct neighbors
+  const adj = new Map<string, Set<string>>();
+  for (const edge of edges) {
+    if (!adj.has(edge.sourceFile)) adj.set(edge.sourceFile, new Set());
+    if (!adj.has(edge.targetFile)) adj.set(edge.targetFile, new Set());
+    adj.get(edge.sourceFile)!.add(edge.targetFile);
+    adj.get(edge.targetFile)!.add(edge.sourceFile);
+  }
+
+  // Collect file paths of top-K chunks (first 15 or all if fewer)
+  const topFiles = new Set(scored.slice(0, 15).map((c) => c.filePath));
+
+  // Build 2-hop set from top files
+  const twoHopFiles = new Set<string>();
+  for (const f of topFiles) {
+    const neighbors = adj.get(f);
+    if (!neighbors) continue;
+    for (const n of neighbors) {
+      if (!topFiles.has(n)) {
+        twoHopFiles.add(n);
+        const secondNeighbors = adj.get(n);
+        if (secondNeighbors) {
+          for (const nn of secondNeighbors) {
+            if (!topFiles.has(nn)) twoHopFiles.add(nn);
+          }
+        }
+      }
+    }
+  }
+
+  // Apply boosts
+  for (const chunk of scored) {
+    if (topFiles.has(chunk.filePath)) continue; // already in top
+    const neighbors = adj.get(chunk.filePath);
+    if (neighbors && [...neighbors].some((n) => topFiles.has(n))) {
+      chunk.score += 0.15;
+    } else if (twoHopFiles.has(chunk.filePath)) {
+      chunk.score += 0.05;
+    }
+  }
 }
 
 /**

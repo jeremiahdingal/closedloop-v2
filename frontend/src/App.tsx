@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
+import ReactMarkdown from "react-markdown";
 import "./styles.css";
 
-type Epic = { id: string; title: string; goalText: string; targetDir: string; status: string; createdAt: string; updatedAt: string };
+type Epic = { id: string; title: string; goalText: string; targetDir: string; targetBranch: string | null; status: string; createdAt: string; updatedAt: string };
 type Ticket = { id: string; epicId: string; title: string; description: string; status: string; currentNode: string | null; lastMessage: string | null; priority: string; dependencies: string[]; currentRunId: string | null; diffFiles?: { path: string; additions: number; deletions: number }[]; prUrl?: string | null };
 type Run = { id: string; kind: string; status: string; currentNode: string | null; ticketId: string | null; epicId: string | null; lastMessage: string | null; heartbeatAt: string | null };
 type AgentEvent = { id: number; created_at: string; message: string; run_id: string | null; ticket_id: string | null; payload: { agentRole: string; streamKind: string; content: string; source: string; done?: boolean; runId?: string | null; ticketId?: string | null; epicId?: string | null } | null };
@@ -333,6 +334,63 @@ function TicketModal(props: { ticket: Ticket; events: AgentEvent[]; runs: Run[];
   );
 }
 
+function EpicModal(props: { epic: Epic; open: boolean; onClose: () => void; onReview: () => void; onCancel: () => void; onDelete: () => void; actionBusy: boolean }) {
+  if (!props.open) return null;
+  
+  return (
+    <div className="modal-backdrop" onClick={props.onClose}>
+      <div className="modal epic-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <div className="modal-header-left">
+            <span>📂</span>
+            <h2>Epic Details</h2>
+          </div>
+          <div className="win-titlebar-buttons">
+            <button className="win-btn-box" onClick={props.onClose}>×</button>
+          </div>
+        </div>
+        <div className="modal-body">
+          <div className="epic-detail-header">
+            <span className="epic-detail-id">{props.epic.id}</span>
+            <span className={`pill pill-${props.epic.status}`}>{props.epic.status}</span>
+          </div>
+          <h3 className="epic-detail-title">{props.epic.title}</h3>
+          
+          <div className="epic-detail-section">
+            <span className="detail-label">Description</span>
+            <div className="epic-description"><ReactMarkdown>{props.epic.goalText}</ReactMarkdown></div>
+          </div>
+          
+          <div className="epic-detail-grid">
+            <div className="detail-section">
+              <span className="detail-label">Target Dir</span>
+              <span className="detail-value">{props.epic.targetDir}</span>
+            </div>
+            <div className="detail-section">
+              <span className="detail-label">Target Branch</span>
+              <span className="detail-value">{props.epic.targetBranch || "—"}</span>
+            </div>
+            <div className="detail-section">
+              <span className="detail-label">Created</span>
+              <span className="detail-value">{new Date(props.epic.createdAt).toLocaleString()}</span>
+            </div>
+            <div className="detail-section">
+              <span className="detail-label">Updated</span>
+              <span className="detail-value">{new Date(props.epic.updatedAt).toLocaleString()}</span>
+            </div>
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn" onClick={props.onReview} disabled={props.actionBusy}>Review</button>
+          <button className="btn" onClick={props.onCancel} disabled={props.actionBusy}>Cancel</button>
+          <button className="btn mini-btn mini-btn-danger" onClick={props.onDelete} disabled={props.actionBusy}>Delete</button>
+          <button className="btn" onClick={props.onClose}>OK</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function App() {
   const [data, setData] = useState<Dashboard>({ epics: [], tickets: [], runs: [], agentEvents: [] });
   const [modelsConfig, setModelsConfig] = useState<AgentModelsConfig>({});
@@ -341,6 +399,7 @@ export function App() {
   const [goalText, setGoalText] = useState("");
   const [targetDir, setTargetDir] = useState("");
   const [targetDirEditing, setTargetDirEditing] = useState(false);
+  const [targetBranch, setTargetBranch] = useState("");
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -348,6 +407,7 @@ export function App() {
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [openRole, setOpenRole] = useState<string | null>(null);
   const [selectedEpic, setSelectedEpic] = useState<string | null>(null);
+  const [selectedEpicDetails, setSelectedEpicDetails] = useState<Epic | null>(null);
   const [selectedTicket, setSelectedTicket] = useState<Ticket | null>(null);
   const [selectedTicketEvents, setSelectedTicketEvents] = useState<AgentEvent[]>([]);
   const selectedTicketRef = useRef<Ticket | null>(null);
@@ -582,11 +642,12 @@ export function App() {
       await fetchJson("/api/epics", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title, goalText, targetDir })
+        body: JSON.stringify({ title, goalText, targetDir, targetBranch: targetBranch || undefined })
       });
       await refresh();
       setTitle("");
       setGoalText("");
+      setTargetBranch("");
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -607,6 +668,7 @@ export function App() {
       await fetchJson(`/api/epics/${encodeURIComponent(epicId)}/cancel`, { method: "POST" });
       if (selectedEpic === epicId) setSelectedEpic(null);
       if (selectedTicket?.epicId === epicId) setSelectedTicket(null);
+      setSelectedEpicDetails(null);
       await refresh();
       toast.success("Epic cancelled.", { id: toastId });
     } catch (err) {
@@ -630,6 +692,7 @@ export function App() {
       await fetchJson(`/api/epics/${encodeURIComponent(epicId)}`, { method: "DELETE" });
       if (selectedEpic === epicId) setSelectedEpic(null);
       if (selectedTicket?.epicId === epicId) setSelectedTicket(null);
+      setSelectedEpicDetails(null);
       await refresh();
       toast.success("Epic deleted.", { id: toastId });
     } catch (err) {
@@ -992,6 +1055,15 @@ export function App() {
                   <textarea value={goalText} onChange={(e) => setGoalText(e.target.value)} rows={4} placeholder="Describe the goal" />
                 </label>
                 <div className="target-dir-row">
+                  <label className="target-dir-label">Target Branch:</label>
+                  <input 
+                    className="target-dir-input"
+                    value={targetBranch} 
+                    onChange={(e) => setTargetBranch(e.target.value)} 
+                    placeholder="feature/my-branch (optional)" 
+                  />
+                </div>
+                <div className="target-dir-row">
                   <label className="target-dir-label">Target Dir:</label>
                   <input 
                     className="target-dir-input"
@@ -1053,18 +1125,12 @@ export function App() {
                       </div>
                       <div className="item-actions">
                         <span className={`pill pill-${epic.status}`}>{epic.status}</span>
-                        <button className="mini-btn" onClick={(e) => { e.stopPropagation(); void reviewEpic(epic.id); }} disabled={actionBusy !== null}>
-                          {actionBusy === `review-epic-${epic.id}` ? "..." : "Review"}
-                        </button>
-                        <button className="mini-btn" onClick={(e) => { e.stopPropagation(); void cancelEpic(epic.id); }} disabled={actionBusy !== null}>
-                          {actionBusy === `cancel-epic-${epic.id}` ? "..." : "Cancel"}
-                        </button>
-                        <button className="mini-btn mini-btn-danger" onClick={(e) => { e.stopPropagation(); void deleteEpic(epic.id); }} disabled={actionBusy !== null}>
-                          {actionBusy === `delete-epic-${epic.id}` ? "..." : "Delete"}
+                        <button className="mini-btn" onClick={(e) => { e.stopPropagation(); setSelectedEpicDetails(epic); }} disabled={actionBusy !== null}>
+                          View
                         </button>
                       </div>
                     </div>
-                    <p className="epic-goal">{epic.goalText}</p>
+                    <p className="epic-goal">{epic.goalText.length > 100 ? epic.goalText.slice(0, 100) + "…" : epic.goalText}</p>
                     <p className="epic-meta">Updated: {formatTime(epic.updatedAt)}</p>
                   </div>
                 )) : <p className="epic-empty">📭 Create your first epic to kick off the workflow.</p>}
@@ -1195,6 +1261,15 @@ export function App() {
         onForceRerunInPlace={() => selectedTicket && void forceRerunTicketInPlace(selectedTicket.id)}
         onForceRescue={() => selectedTicket && void forceRescueTicket(selectedTicket.id)}
         onDelete={() => selectedTicket && void deleteTicket(selectedTicket.id)}
+        actionBusy={actionBusy !== null}
+      />
+      <EpicModal
+        epic={selectedEpicDetails!}
+        open={Boolean(selectedEpicDetails)}
+        onClose={() => setSelectedEpicDetails(null)}
+        onReview={() => { if (selectedEpicDetails) void reviewEpic(selectedEpicDetails.id); }}
+        onCancel={() => { if (selectedEpicDetails) void cancelEpic(selectedEpicDetails.id); }}
+        onDelete={() => { if (selectedEpicDetails) void deleteEpic(selectedEpicDetails.id); }}
         actionBusy={actionBusy !== null}
       />
     </div>

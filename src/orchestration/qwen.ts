@@ -62,10 +62,9 @@ type QwenRunnerOptions = {
 };
 
 function buildArgs(prompt: string): string[] {
-  const args = ["--approval-mode", "yolo", "--output-format", "text"];
+  const args = ["--approval-mode", "yolo", "--output-format", "text", "-i"];
   const model = process.env.QWEN_CLI_MODEL?.trim();
   if (model) args.push("--model", model);
-  args.push(buildStrictJsonPrompt(prompt));
   return args;
 }
 
@@ -295,7 +294,7 @@ export class QwenRunner {
         cwd: launch.info.cwd,
         env: { ...process.env },
         shell: true,
-        stdio: ["ignore", "pipe", "pipe"]
+        stdio: ["pipe", "pipe", "pipe"]
       });
 
       child.stdout?.setEncoding("utf8");
@@ -320,6 +319,9 @@ export class QwenRunner {
         }
         reject(new QwenLaunchError("exit_error", `Qwen exited with code ${code ?? 1}`, launch.info, { exitCode: code ?? 1 }));
       });
+
+      child.stdin?.write(buildStrictJsonPrompt(input.prompt));
+      child.stdin?.end();
     });
 
     return { combined: chunks.join(""), launchInfo: launch.info };

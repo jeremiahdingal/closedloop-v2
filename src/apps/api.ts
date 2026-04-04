@@ -190,7 +190,8 @@ async function main() {
         const epic = GoalRunner.createEpic(db, {
           title: String(body.title || "Untitled epic"),
           goalText: String(body.goalText || ""),
-          targetDir: String(body.targetDir || process.cwd())
+          targetDir: String(body.targetDir || process.cwd()),
+          targetBranch: body.targetBranch ? String(body.targetBranch) : undefined
         });
         const runId = await goalRunner.enqueueGoal(epic.id);
         return json(res, 201, { epic, runId });
