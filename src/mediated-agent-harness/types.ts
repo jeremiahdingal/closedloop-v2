@@ -72,10 +72,13 @@ export interface MediatedHarnessConfig {
   apiKey?: string;
   model: string;
   cwd: string;
+  toolMode?: "native" | "xml";
   allowedPaths?: string[];
   maxIterations?: number;
   timeoutMs?: number;
   temperature?: number;
+  topP?: number;
+  topK?: number;
   braveApiKey?: string;
   onEvent?: (event: MediatedHarnessEvent) => void;
 }
@@ -85,6 +88,10 @@ export interface ToolExecutionContext {
   workspaceId: string;
   allowedPaths: string[];
   braveApiKey?: string;
+  ragIndexId?: number;
+  db?: any; // AppDatabase - optional to avoid circular deps
+  embeddingModel?: string;
+  embeddingBaseUrl?: string;
   readFiles(paths: string[]): Promise<Record<string, string>>;
   writeFiles(files: { path: string; content: string }[]): Promise<void>;
   gitDiff(): Promise<string>;

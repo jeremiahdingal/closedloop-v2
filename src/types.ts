@@ -7,21 +7,23 @@ export type Json =
   | { [key: string]: Json };
 
 export type RunStatus = "queued" | "running" | "waiting" | "succeeded" | "failed" | "escalated" | "cancelled";
-export type TicketStatus = "queued" | "building" | "reviewing" | "testing" | "approved" | "escalated" | "failed";
-export type EpicStatus = "planning" | "executing" | "reviewing" | "done" | "failed";
+export type TicketStatus = "queued" | "building" | "reviewing" | "testing" | "approved" | "escalated" | "failed" | "cancelled";
+export type EpicStatus = "planning" | "executing" | "reviewing" | "done" | "failed" | "cancelled";
 
 export type AgentRole =
-  | "goalDecomposer"
+  | "epicDecoder"
   | "builder"
   | "reviewer"
   | "tester"
-  | "goalReviewer"
-  | "doctor";
+  | "epicReviewer"
+  | "doctor"
+  | "system";
 
 export type EpicRecord = {
   id: string;
   title: string;
   goalText: string;
+  targetDir: string;
   status: EpicStatus;
   createdAt: string;
   updatedAt: string;
@@ -41,6 +43,8 @@ export type TicketRecord = {
   currentNode: string | null;
   lastHeartbeatAt: string | null;
   lastMessage: string | null;
+  diffFiles: { path: string; additions: number; deletions: number }[] | null;
+  prUrl: string | null;
   metadata: Record<string, Json>;
   createdAt: string;
   updatedAt: string;
@@ -119,6 +123,20 @@ export type FailureDecision = {
   reason: string;
 };
 
+export type OpenCodeLaunchInfo = {
+  cwd: string;
+  repoRoot: string;
+  model: string;
+  promptLength: number;
+  command: string;
+  args: string[];
+  shell: boolean;
+  binaryPath: string;
+  binarySource: "package-entrypoint" | "override-path" | "override-command";
+  cwdExists: boolean;
+  cwdIsDirectory: boolean;
+};
+
 export type TicketContextPacket = {
   epicId: string;
   ticketId: string;
@@ -135,6 +153,12 @@ export type TicketContextPacket = {
   workspacePath: string;
   branchName: string;
   attempt: number;
+  retrievedContext?: {
+    codeContext: string;
+    docContext: string;
+    retrievalMode: "semantic" | "keyword";
+    chunkCount: number;
+  } | null;
 };
 
 export type CommandName = "test" | "lint" | "typecheck" | "status";
@@ -157,7 +181,7 @@ export type WriteFileInput = {
 
 export type AgentStreamPayload = {
   agentRole: AgentRole;
-  source: "opencode" | "orchestrator";
+  source: "opencode" | "orchestrator" | "mediated-harness";
   streamKind: "stdout" | "stderr" | "thinking" | "assistant" | "system" | "status" | "raw";
   content: string;
   runId?: string | null;
@@ -173,6 +197,7 @@ export type OpenCodeBuilderResult = {
   summary: string;
   sessionId?: string | null;
   rawOutput: string;
+  launchInfo?: OpenCodeLaunchInfo | null;
 };
 
 export type HandoffPacket = {
@@ -182,4 +207,14 @@ export type HandoffPacket = {
   files: string[];
   reason?: string;
   payload?: Json;
+};
+
+export type TesterResult = {
+  testNecessityScore: number;
+  testNecessityReason: string;
+  testsWritten: boolean;
+  testFiles: string[];
+  testResults: "PASS" | "FAIL" | "SKIPPED";
+  testOutput: string;
+  testsRun: number;
 };

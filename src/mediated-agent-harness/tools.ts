@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ToolDef, ToolExecutionContext, ToolCall, ToolResult } from "./types.ts";
 import { ToolExecutionError } from "./errors.ts";
+import { retrieveChunks } from "../rag/retriever.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -328,6 +329,28 @@ export const WORKSPACE_TOOLS: ToolDef[] = [
         additionalProperties: false
       }
     }
+  },
+  {
+    type: "function",
+    function: {
+      name: "semantic_search",
+      description: "Search the codebase using semantic similarity. Finds conceptually related code and documentation beyond simple text matching. Use when grep doesn't find what you need.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Natural language description of what you're looking for"
+          },
+          scope: {
+            type: "string",
+            description: "Optional subdirectory to scope search to"
+          }
+        },
+        required: ["query"],
+        additionalProperties: false
+      }
+    }
   }
 ];
 
@@ -426,6 +449,8 @@ export async function executeToolCall(
         return await execSaveArtifact(call.id, args, ctx);
       case "web_search":
         return await execWebSearch(call.id, args, ctx);
+      case "semantic_search":
+        return await execSemanticSearch(call.id, args, ctx);
       case "finish":
         // finish is handled by the loop, not here
         return { callId: call.id, name, output: JSON.stringify(args), isError: false };
@@ -978,6 +1003,73 @@ async function execWebSearch(
       callId,
       name: "web_search",
       output: `Error: ${err.message}`,
+      isError: true
+    };
+  }
+}
+
+async function execSemanticSearch(
+  callId: string,
+  args: Record<string, unknown>,
+  ctx: ToolExecutionContext
+): Promise<ToolResult> {
+  const query = String(args.query ?? "");
+  const scope = args.scope ? String(args.scope) : undefined;
+
+  if (!query) {
+    return {
+      callId,
+      name: "semantic_search",
+      output: "Error: query is required",
+      isError: true
+    };
+  }
+
+  // If no RAG index available, fall back to grep
+  if (!ctx.ragIndexId || !ctx.db) {
+    return await execGrepFiles(callId, { pattern: query.split(/\s+/).slice(0, 3).join("|"), scope }, ctx);
+  }
+
+  try {
+    const chunks = await retrieveChunks({
+      query,
+      db: ctx.db,
+      indexId: ctx.ragIndexId,
+      topK: 10,
+      scopePaths: scope ? [scope] : undefined,
+      maxTokens: 6000,
+      model: ctx.embeddingModel,
+      baseUrl: ctx.embeddingBaseUrl
+    });
+
+    if (chunks.length === 0) {
+      return {
+        callId,
+        name: "semantic_search",
+        output: "No semantically similar code found.",
+        isError: false
+      };
+    }
+
+    const formatted = chunks
+      .map(
+        (c, i) =>
+          `${i + 1}. ${c.filePath}${c.startLine ? `:${c.startLine}` : ""} [${c.chunkType}] (score: ${c.score.toFixed(3)})\n${c.content.slice(0, 2000)}`
+      )
+      .join("\n\n");
+
+    return {
+      callId,
+      name: "semantic_search",
+      output: formatted,
+      isError: false
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      callId,
+      name: "semantic_search",
+      output: `Error: ${msg}. Falling back to text search.`,
       isError: true
     };
   }

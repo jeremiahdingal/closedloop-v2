@@ -25,7 +25,18 @@ export class AppDatabase {
     this.filePath = filePath;
     mkdirSync(dirname(filePath), { recursive: true });
     this.db = new DatabaseSync(filePath);
-    this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA busy_timeout = 5000;");
+    const journalModeRow = this.db.prepare("PRAGMA journal_mode;").get() as { journal_mode?: string } | undefined;
+    if (String(journalModeRow?.journal_mode || "").toLowerCase() !== "wal") {
+      try {
+        this.db.exec("PRAGMA journal_mode = WAL;");
+      } catch (error) {
+        const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+        if (!message.includes("database is locked")) {
+          throw error;
+        }
+      }
+    }
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.ensureSchema();
   }
@@ -36,6 +47,7 @@ export class AppDatabase {
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
         goal_text TEXT NOT NULL,
+        target_dir TEXT NOT NULL,
         status TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -55,6 +67,8 @@ export class AppDatabase {
         current_node TEXT,
         last_heartbeat_at TEXT,
         last_message TEXT,
+        diff_files_json TEXT,
+        pr_url TEXT,
         metadata_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -151,10 +165,47 @@ export class AppDatabase {
         created_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS rag_index_meta (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_root TEXT NOT NULL,
+        commit_hash TEXT NOT NULL,
+        chunk_count INTEGER NOT NULL,
+        model_name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(repo_root, commit_hash, model_name)
+      );
+
+      CREATE TABLE IF NOT EXISTS rag_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        index_id INTEGER NOT NULL REFERENCES rag_index_meta(id) ON DELETE CASCADE,
+        file_path TEXT NOT NULL,
+        chunk_type TEXT NOT NULL,
+        start_line INTEGER,
+        end_line INTEGER,
+        content TEXT NOT NULL,
+        embedding BLOB NOT NULL,
+        token_estimate INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_jobs_status_available ON jobs(status, available_at);
       CREATE INDEX IF NOT EXISTS idx_runs_ticket_status ON runs(ticket_id, status);
       CREATE INDEX IF NOT EXISTS idx_events_aggregate ON events(aggregate_type, aggregate_id);
+      CREATE INDEX IF NOT EXISTS idx_rag_chunks_index_id ON rag_chunks(index_id);
+      CREATE INDEX IF NOT EXISTS idx_rag_chunks_file_path ON rag_chunks(index_id, file_path);
     `);
+
+    // Migration: add diff_files_json and pr_url columns to tickets table
+    try {
+      this.db.exec(`ALTER TABLE tickets ADD COLUMN diff_files_json TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE tickets ADD COLUMN pr_url TEXT`);
+    } catch {
+      // Column already exists
+    }
   }
 
   close(): void {
@@ -176,9 +227,9 @@ export class AppDatabase {
   createEpic(epic: Omit<EpicRecord, "createdAt" | "updatedAt">): EpicRecord {
     const now = nowIso();
     this.db.prepare(`
-      INSERT INTO epics (id, title, goal_text, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(epic.id, epic.title, epic.goalText, epic.status, now, now);
+      INSERT INTO epics (id, title, goal_text, target_dir, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(epic.id, epic.title, epic.goalText, epic.targetDir, epic.status, now, now);
     return { ...epic, createdAt: now, updatedAt: now };
   }
 
@@ -189,6 +240,7 @@ export class AppDatabase {
       id: row.id,
       title: row.title,
       goalText: row.goal_text,
+      targetDir: row.target_dir,
       status: row.status,
       createdAt: row.created_at,
       updatedAt: row.updated_at
@@ -200,6 +252,7 @@ export class AppDatabase {
       id: row.id,
       title: row.title,
       goalText: row.goal_text,
+      targetDir: row.target_dir,
       status: row.status,
       createdAt: row.created_at,
       updatedAt: row.updated_at
@@ -210,19 +263,25 @@ export class AppDatabase {
     this.db.prepare(`UPDATE epics SET status = ?, updated_at = ? WHERE id = ?`).run(status, nowIso(), id);
   }
 
-  createTicket(ticket: Omit<TicketRecord, "createdAt" | "updatedAt" | "currentRunId" | "currentNode" | "lastHeartbeatAt" | "lastMessage"> & {
+  deleteEpic(id: string): void {
+    this.db.prepare(`DELETE FROM epics WHERE id = ?`).run(id);
+  }
+
+  createTicket(ticket: Omit<TicketRecord, "createdAt" | "updatedAt" | "currentRunId" | "currentNode" | "lastHeartbeatAt" | "lastMessage" | "diffFiles" | "prUrl"> & {
     currentRunId?: string | null;
     currentNode?: string | null;
     lastHeartbeatAt?: string | null;
     lastMessage?: string | null;
+    diffFiles?: { path: string; additions: number; deletions: number }[];
+    prUrl?: string | null;
   }): TicketRecord {
     const now = nowIso();
     this.db.prepare(`
       INSERT INTO tickets (
         id, epic_id, title, description, acceptance_criteria_json, dependencies_json, allowed_paths_json,
-        priority, status, current_run_id, current_node, last_heartbeat_at, last_message, metadata_json,
+        priority, status, current_run_id, current_node, last_heartbeat_at, last_message, diff_files_json, pr_url, metadata_json,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       ticket.id,
       ticket.epicId,
@@ -237,6 +296,8 @@ export class AppDatabase {
       ticket.currentNode ?? null,
       ticket.lastHeartbeatAt ?? null,
       ticket.lastMessage ?? null,
+      ticket.diffFiles ? JSON.stringify(ticket.diffFiles) : null,
+      ticket.prUrl ?? null,
       JSON.stringify(ticket.metadata),
       now,
       now
@@ -247,6 +308,8 @@ export class AppDatabase {
       currentNode: ticket.currentNode ?? null,
       lastHeartbeatAt: ticket.lastHeartbeatAt ?? null,
       lastMessage: ticket.lastMessage ?? null,
+      diffFiles: ticket.diffFiles ?? null,
+      prUrl: ticket.prUrl ?? null,
       createdAt: now,
       updatedAt: now
     };
@@ -271,12 +334,14 @@ export class AppDatabase {
     currentNode?: string | null;
     lastHeartbeatAt?: string | null;
     lastMessage?: string | null;
+    diffFiles?: { path: string; additions: number; deletions: number }[] | null;
+    prUrl?: string | null;
   }): void {
     const current = this.getTicket(input.ticketId);
     if (!current) throw new Error(`Ticket not found: ${input.ticketId}`);
     this.db.prepare(`
       UPDATE tickets
-      SET status = ?, current_run_id = ?, current_node = ?, last_heartbeat_at = ?, last_message = ?, updated_at = ?
+      SET status = ?, current_run_id = ?, current_node = ?, last_heartbeat_at = ?, last_message = ?, diff_files_json = ?, pr_url = ?, updated_at = ?
       WHERE id = ?
     `).run(
       input.status ?? current.status,
@@ -284,9 +349,15 @@ export class AppDatabase {
       input.currentNode ?? current.currentNode,
       input.lastHeartbeatAt ?? current.lastHeartbeatAt,
       input.lastMessage ?? current.lastMessage,
+      input.diffFiles !== undefined ? JSON.stringify(input.diffFiles) : current.diffFiles ? JSON.stringify(current.diffFiles) : null,
+      input.prUrl !== undefined ? input.prUrl : current.prUrl,
       nowIso(),
       input.ticketId
     );
+  }
+
+  deleteTicket(id: string): void {
+    this.db.prepare(`DELETE FROM tickets WHERE id = ?`).run(id);
   }
 
   createRun(run: Omit<RunRecord, "createdAt" | "updatedAt">): RunRecord {
@@ -324,6 +395,14 @@ export class AppDatabase {
     return rows.map((row) => this.mapRun(row));
   }
 
+  listRunsForTicket(ticketId: string): RunRecord[] {
+    return (this.db.prepare(`SELECT * FROM runs WHERE ticket_id = ? ORDER BY created_at DESC`).all(ticketId) as any[]).map((row) => this.mapRun(row));
+  }
+
+  listRunsForEpic(epicId: string): RunRecord[] {
+    return (this.db.prepare(`SELECT * FROM runs WHERE epic_id = ? ORDER BY created_at DESC`).all(epicId) as any[]).map((row) => this.mapRun(row));
+  }
+
   updateRun(input: {
     runId: string;
     status?: RunStatus;
@@ -349,6 +428,10 @@ export class AppDatabase {
       nowIso(),
       input.runId
     );
+  }
+
+  deleteRun(runId: string): void {
+    this.db.prepare(`DELETE FROM runs WHERE id = ?`).run(runId);
   }
 
   createWorkspace(workspace: Omit<WorkspaceRecord, "createdAt" | "updatedAt">): WorkspaceRecord {
@@ -383,6 +466,31 @@ export class AppDatabase {
     return row ? this.mapWorkspace(row) : null;
   }
 
+  findWorkspaceByWorktreePath(worktreePath: string): WorkspaceRecord | null {
+    const row = this.db.prepare(`SELECT * FROM workspaces WHERE worktree_path = ? ORDER BY created_at DESC LIMIT 1`).get(worktreePath) as any;
+    return row ? this.mapWorkspace(row) : null;
+  }
+
+  listArchivedWorkspacesOlderThan(cutoffIso: string): WorkspaceRecord[] {
+    return (this.db.prepare(`
+      SELECT * FROM workspaces
+      WHERE status = 'archived' AND updated_at < ?
+      ORDER BY updated_at ASC
+    `).all(cutoffIso) as any[]).map((row) => this.mapWorkspace(row));
+  }
+
+  listWorkspacesForTicket(ticketId: string): WorkspaceRecord[] {
+    return (this.db.prepare(`
+      SELECT * FROM workspaces
+      WHERE ticket_id = ?
+      ORDER BY created_at DESC
+    `).all(ticketId) as any[]).map((row) => this.mapWorkspace(row));
+  }
+
+  deleteWorkspace(workspaceId: string): void {
+    this.db.prepare(`DELETE FROM workspaces WHERE id = ?`).run(workspaceId);
+  }
+
   updateWorkspace(input: {
     workspaceId: string;
     headCommit?: string | null;
@@ -405,6 +513,19 @@ export class AppDatabase {
   }
 
   enqueueJob(kind: string, payload: Json, availableAt = nowIso()): string {
+    const payloadRecord = payload && typeof payload === "object" ? payload as Record<string, unknown> : null;
+    const runId = typeof payloadRecord?.runId === "string" ? payloadRecord.runId : null;
+    if (runId) {
+      const existing = this.db.prepare(`
+        SELECT id FROM jobs
+        WHERE kind = ?
+          AND json_extract(payload_json, '$.runId') = ?
+          AND status IN ('queued', 'running')
+        ORDER BY created_at ASC
+        LIMIT 1
+      `).get(kind, runId) as { id?: string } | undefined;
+      if (existing?.id) return existing.id;
+    }
     const id = `job_${Math.random().toString(36).slice(2, 10)}`;
     const now = nowIso();
     this.db.prepare(`
@@ -449,6 +570,20 @@ export class AppDatabase {
     }));
   }
 
+  listJobRecords(): Array<{ id: string; kind: string; status: string; attempts: number; payload: Json }> {
+    return (this.db.prepare(`SELECT id, kind, status, attempts, payload_json FROM jobs ORDER BY created_at DESC`).all() as any[]).map((row) => ({
+      id: row.id,
+      kind: row.kind,
+      status: row.status,
+      attempts: row.attempts,
+      payload: JSON.parse(row.payload_json)
+    }));
+  }
+
+  deleteJob(id: string): void {
+    this.db.prepare(`DELETE FROM jobs WHERE id = ?`).run(id);
+  }
+
   recordEvent(input: {
     aggregateType: string;
     aggregateId: string;
@@ -481,7 +616,7 @@ export class AppDatabase {
     }));
   }
 
-  listEventsAfterId(afterId = 0, options?: { kind?: string; runId?: string; ticketId?: string; limit?: number }): Array<Record<string, unknown>> {
+  listEventsAfterId(afterId = 0, options?: { kind?: string; runId?: string; ticketId?: string; limit?: number; newest?: boolean }): Array<Record<string, unknown>> {
     const limit = options?.limit ?? 200;
     const clauses = ['id > ?'];
     const params: any[] = [afterId];
@@ -498,8 +633,22 @@ export class AppDatabase {
       params.push(options.ticketId);
     }
     params.push(limit);
-    const sql = `SELECT * FROM events WHERE ${clauses.join(' AND ')} ORDER BY id ASC LIMIT ?`;
+    let sql: string;
+    if (options?.newest) {
+      // Return the newest N events (subquery to reverse order)
+      sql = `SELECT * FROM (SELECT * FROM events WHERE ${clauses.join(' AND ')} ORDER BY id DESC LIMIT ?) ORDER BY id ASC`;
+    } else {
+      sql = `SELECT * FROM events WHERE ${clauses.join(' AND ')} ORDER BY id ASC LIMIT ?`;
+    }
     return (this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>).map((row: any) => ({
+      ...row,
+      payload_json: row.payload_json,
+      payload: row.payload_json ? JSON.parse(String(row.payload_json)) : null
+    }));
+  }
+
+  listEventsForRun(runId: string, limit = 200): Array<Record<string, unknown>> {
+    return (this.db.prepare(`SELECT * FROM events WHERE run_id = ? ORDER BY id DESC LIMIT ?`).all(runId, limit) as Array<Record<string, unknown>>).map((row: any) => ({
       ...row,
       payload_json: row.payload_json,
       payload: row.payload_json ? JSON.parse(String(row.payload_json)) : null
@@ -578,6 +727,18 @@ export class AppDatabase {
     return rows;
   }
 
+  listArtifactsForRun(runId: string): Array<Record<string, unknown>> {
+    return this.db.prepare(`SELECT * FROM artifacts WHERE run_id = ? ORDER BY id DESC`).all(runId) as any[];
+  }
+
+  deleteArtifactsForTicket(ticketId: string): void {
+    this.db.prepare(`DELETE FROM artifacts WHERE ticket_id = ?`).run(ticketId);
+  }
+
+  deleteArtifactsForRun(runId: string): void {
+    this.db.prepare(`DELETE FROM artifacts WHERE run_id = ?`).run(runId);
+  }
+
   addToolInvocation(input: {
     runId?: string | null;
     ticketId?: string | null;
@@ -606,6 +767,26 @@ export class AppDatabase {
     );
   }
 
+  deleteEventsForTicket(ticketId: string): void {
+    this.db.prepare(`DELETE FROM events WHERE ticket_id = ? OR aggregate_id = ?`).run(ticketId, ticketId);
+  }
+
+  deleteEventsForEpic(epicId: string): void {
+    this.db.prepare(`DELETE FROM events WHERE aggregate_id = ? OR (ticket_id IN (SELECT id FROM tickets WHERE epic_id = ?)) OR (run_id IN (SELECT id FROM runs WHERE epic_id = ?))`).run(epicId, epicId, epicId);
+  }
+
+  deleteEventsForRun(runId: string): void {
+    this.db.prepare(`DELETE FROM events WHERE run_id = ?`).run(runId);
+  }
+
+  deleteToolInvocationsForTicket(ticketId: string): void {
+    this.db.prepare(`DELETE FROM tool_invocations WHERE ticket_id = ?`).run(ticketId);
+  }
+
+  deleteToolInvocationsForRun(runId: string): void {
+    this.db.prepare(`DELETE FROM tool_invocations WHERE run_id = ?`).run(runId);
+  }
+
   mapTicket(row: any): TicketRecord {
     return {
       id: row.id,
@@ -621,6 +802,8 @@ export class AppDatabase {
       currentNode: row.current_node,
       lastHeartbeatAt: row.last_heartbeat_at,
       lastMessage: row.last_message,
+      diffFiles: parseJson(row.diff_files_json, null),
+      prUrl: row.pr_url || null,
       metadata: parseJson(row.metadata_json, {}),
       createdAt: row.created_at,
       updatedAt: row.updated_at
@@ -659,5 +842,104 @@ export class AppDatabase {
       createdAt: row.created_at,
       updatedAt: row.updated_at
     };
+  }
+
+  // RAG Index Methods
+  findRagIndex(
+    repoRoot: string,
+    commitHash: string,
+    modelName: string
+  ): { id: number; chunkCount: number } | null {
+    const row = this.db.prepare(
+      `SELECT id, chunk_count FROM rag_index_meta WHERE repo_root = ? AND commit_hash = ? AND model_name = ?`
+    ).get(repoRoot, commitHash, modelName) as any;
+    return row ? { id: row.id, chunkCount: row.chunk_count } : null;
+  }
+
+  createRagIndex(input: {
+    repoRoot: string;
+    commitHash: string;
+    chunkCount: number;
+    modelName: string;
+  }): number {
+    const result = this.db.prepare(
+      `INSERT INTO rag_index_meta (repo_root, commit_hash, chunk_count, model_name, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(input.repoRoot, input.commitHash, input.chunkCount, input.modelName, nowIso()) as any;
+    return result.lastInsertRowid as number;
+  }
+
+  insertRagChunks(
+    indexId: number,
+    chunks: Array<{
+      filePath: string;
+      chunkType: string;
+      startLine?: number;
+      endLine?: number;
+      content: string;
+      embedding: Buffer;
+      tokenEstimate: number;
+    }>
+  ): void {
+    const stmt = this.db.prepare(
+      `INSERT INTO rag_chunks (index_id, file_path, chunk_type, start_line, end_line, content, embedding, token_estimate, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    const now = nowIso();
+    for (const chunk of chunks) {
+      stmt.run(
+        indexId,
+        chunk.filePath,
+        chunk.chunkType,
+        chunk.startLine ?? null,
+        chunk.endLine ?? null,
+        chunk.content,
+        chunk.embedding,
+        chunk.tokenEstimate,
+        now
+      );
+    }
+  }
+
+  loadRagChunks(
+    indexId: number,
+    scopePaths?: string[]
+  ): Array<{
+    id: number;
+    filePath: string;
+    chunkType: string;
+    content: string;
+    embedding: Buffer;
+    startLine?: number;
+    endLine?: number;
+    tokenEstimate: number;
+  }> {
+    const rows = this.db.prepare(
+      `SELECT id, file_path, chunk_type, content, embedding, start_line, end_line, token_estimate
+       FROM rag_chunks WHERE index_id = ?`
+    ).all(indexId) as any[];
+
+    let filtered = rows;
+    if (scopePaths && scopePaths.length > 0) {
+      filtered = rows.filter((row) =>
+        scopePaths.some((p) => row.file_path.startsWith(p))
+      );
+    }
+
+    return filtered.map((row) => ({
+      id: row.id,
+      filePath: row.file_path,
+      chunkType: row.chunk_type,
+      content: row.content,
+      embedding: row.embedding,
+      startLine: row.start_line,
+      endLine: row.end_line,
+      tokenEstimate: row.token_estimate,
+    }));
+  }
+
+  deleteRagIndex(indexId: number): void {
+    this.db.prepare(`DELETE FROM rag_index_meta WHERE id = ?`).run(indexId);
   }
 }

@@ -11,11 +11,14 @@
     "seed": "node --experimental-strip-types src/apps/seed.ts",
     "demo": "node --experimental-strip-types src/apps/demo.ts",
     "cleanup:workspaces": "node --experimental-strip-types src/apps/cleanup-workspaces.ts",
+    "harness:gemma": "node --experimental-strip-types src/apps/gemma-harness-smoke.ts",
+    "harness:gemma:tools": "node --experimental-strip-types src/apps/gemma-tool-dictionary.ts",
     "ui": "vite",
     "build:ui": "vite build",
     "preview:ui": "vite preview",
     "typecheck": "tsc --noEmit",
-    "dev": "concurrently \"npm run api\" \"npm run worker\" \"npm run ui\""
+    "ollama-server": "ollama serve",
+    "dev": "concurrently \"npm run api\" \"npm run worker\" \"npm run ui\" \"npm run ollama-server\""
   },
   "engines": {
     "node": ">=22.0.0"

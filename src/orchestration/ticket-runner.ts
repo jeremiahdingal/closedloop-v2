@@ -12,12 +12,14 @@ import { AppDatabase } from "../db/database.ts";
 import { WorkspaceBridge } from "../bridge/workspace-bridge.ts";
 import { deterministicDoctor } from "../bridge/doctor.ts";
 import { loadConfig } from "../config.ts";
-import { randomId, nowIso } from "../utils.ts";
+import { randomId, nowIso, sleep } from "../utils.ts";
 import { builderPrompt, builderToolingPrompt, doctorPrompt, reviewerPrompt } from "./prompts.ts";
 import type { ModelGateway } from "./models.ts";
 import { loadLangGraphRuntime, type LangGraphRuntime } from "./langgraph-loader.ts";
 import { OpenCodeLaunchError, formatOpenCodeFailure } from "./opencode.ts";
 import { LifecycleService } from "./lifecycle.ts";
+import { buildContextForTicket } from "../rag/context-builder.ts";
+import { git } from "../bridge/git.ts";
 
 type TicketLoopResult = {
   runId: string;
@@ -56,6 +58,9 @@ type TicketGraphState = {
 export class TicketRunner {
   readonly config = loadConfig();
   private readonly heartbeatIntervalMs = 15_000;
+  private readonly builderPlanTimeoutMs = Number(process.env.BUILDER_PLAN_TIMEOUT_MS || 180_000);
+  private readonly reviewerTimeoutMs = Number(process.env.REVIEWER_TIMEOUT_MS || 240_000);
+  private readonly compareBaseRef = this.normalizeCompareRef(process.env.PR_COMPARE_BASE || "origin/main");
   private readonly db: AppDatabase;
   private readonly bridge: WorkspaceBridge;
   private readonly gateway: ModelGateway;
@@ -66,6 +71,11 @@ export class TicketRunner {
     this.bridge = bridge;
     this.gateway = gateway;
     this.lifecycle = lifecycle;
+  }
+
+  private shouldSkipTester(): boolean {
+    const raw = (this.gateway.models.tester || "").trim().toLowerCase();
+    return raw === "skip" || raw === "disabled" || raw === "off";
   }
 
   async start(ticketId: string, epicId: string): Promise<string> {
@@ -84,8 +94,10 @@ export class TicketRunner {
     });
     this.db.updateTicketRunState({
       ticketId,
+      status: "queued",
       currentRunId: runId,
       currentNode: "queued",
+      lastHeartbeatAt: null,
       lastMessage: "Queued for execution."
     });
     this.db.enqueueJob("run_ticket", { ticketId, epicId, runId });
@@ -182,6 +194,30 @@ export class TicketRunner {
       const buildAttempts = state.buildAttempts + 1;
       console.log(`[TICKET ${ticket.id}] Builder attempt ${buildAttempts} starting`);
       this.heartbeat(runId, ticket.id, "builder_plan", `Builder attempt ${buildAttempts}.`);
+      // Build RAG context if available
+      let retrievedContext = null;
+      try {
+        const commitResult = await git(workspace.worktreePath, ["rev-parse", "HEAD"]);
+        const commitHash = commitResult.stdout.trim();
+
+        const ragResult = await buildContextForTicket({
+          ticket,
+          packet: {} as TicketContextPacket, // temp packet, only need ticket and options
+          db: this.db,
+          repoRoot: workspace.worktreePath,
+          commitHash,
+        });
+
+        retrievedContext = {
+          codeContext: ragResult.codeContext,
+          docContext: ragResult.docContext,
+          retrievalMode: ragResult.retrievalMode,
+          chunkCount: ragResult.chunkCount,
+        };
+      } catch (err) {
+        console.warn(`[RAG] Context build failed for ticket ${ticket.id}: ${err}. Continuing without context.`);
+      }
+
       const packet: TicketContextPacket = {
         epicId: ticket.epicId,
         ticketId: ticket.id,
@@ -197,7 +233,8 @@ export class TicketRunner {
         workspaceId: workspace.id,
         workspacePath: workspace.worktreePath,
         branchName: workspace.branchName,
-        attempt: buildAttempts
+        attempt: buildAttempts,
+        retrievedContext
       };
       await this.bridge.saveContextPacket(packet);
       const builderResult = await this.withHeartbeat(runId, ticket.id, "builder_plan", `Builder attempt ${buildAttempts}.`, () =>
@@ -230,9 +267,7 @@ export class TicketRunner {
       console.log(`[TICKET ${ticket.id}] Reviewer starting`);
       this.heartbeat(runId, ticket.id, "reviewer", "Reviewing diff.");
       this.recordAgentStream({ agentRole: "reviewer", source: "orchestrator", streamKind: "status", content: "Reviewing diff...", runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 0, done: false });
-      const reviewVerdict = await this.withHeartbeat(runId, ticket.id, "reviewer", "Reviewing diff.", () =>
-        this.gateway.getReviewerVerdict(reviewerPrompt(ticket, state.lastDiff))
-      );
+      const reviewVerdict = await this.getReviewerVerdictWithRetry(runId, ticket, state.lastDiff);
       console.log(`[TICKET ${ticket.id}] Reviewer verdict: ${reviewVerdict.approved ? 'APPROVED' : 'REJECTED'} - ${reviewVerdict.blockers.join('; ') || 'no blockers'}`);
       this.recordAgentStream({ agentRole: "reviewer", source: "orchestrator", streamKind: "assistant", content: `Approved: ${reviewVerdict.approved}\nBlockers: ${reviewVerdict.blockers.join(", ") || "none"}\nSuggestions: ${reviewVerdict.suggestions.join(", ") || "none"}`, runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 1, done: true });
       await this.writeHandoff(state.workspaceId, runId, ticket.id, {
@@ -257,9 +292,59 @@ export class TicketRunner {
 
     const testerNode = async (state: TicketGraphState) => {
       this.assertNotCancelled(ticket.id, ticket.epicId);
+
+      if (this.shouldSkipTester()) {
+        const testSummary = "SKIPPED (score: 0/100)\nTester disabled by configuration.";
+        this.heartbeat(runId, ticket.id, "tester", "Tester skipped by config.");
+        this.recordAgentStream({
+          agentRole: "tester",
+          source: "orchestrator",
+          streamKind: "status",
+          content: "Tester skipped (configured).",
+          runId,
+          ticketId: ticket.id,
+          epicId: ticket.epicId,
+          sequence: 0,
+          done: false
+        });
+        this.recordAgentStream({
+          agentRole: "tester",
+          source: "orchestrator",
+          streamKind: "assistant",
+          content: testSummary,
+          runId,
+          ticketId: ticket.id,
+          epicId: ticket.epicId,
+          sequence: 1,
+          done: true
+        });
+        await this.writeHandoff(state.workspaceId, runId, ticket.id, {
+          role: "tester",
+          state: "approved",
+          summary: "Tests skipped by configuration.",
+          files: state.intendedFiles,
+          payload: {
+            testNecessityScore: 0,
+            testNecessityReason: "Tester disabled by model config",
+            testsWritten: false,
+            testFiles: [],
+            testResults: "SKIPPED",
+            testsRun: 0
+          } as any
+        });
+        return {
+          testPassed: true,
+          testSummary,
+          testHistory: state.testHistory,
+          repeatedTestFailure: false,
+          lastMessage: "Tests skipped by configuration.",
+          status: "approved"
+        } satisfies Partial<TicketGraphState>;
+      }
       
       // Use mediated harness for tester if configured
       if (this.gateway.runTesterInWorkspace && this.gateway.models.tester.startsWith("mediated:")) {
+        const workspace = this.bridge.requireWorkspace(state.workspaceId);
         this.heartbeat(runId, ticket.id, "tester", "Analyzing test necessity...");
         this.recordAgentStream({
           agentRole: "tester",
@@ -277,10 +362,26 @@ export class TicketRunner {
         const buildDiffDesc = state.lastDiff?.slice(0, 2000) || "No diff available";
 
         // HARD TIMEOUT: 5 minutes max for tester
+        let timeoutHandle: NodeJS.Timeout | null = null;
+        const timeoutFallback = new Promise<any>((resolve) => {
+          timeoutHandle = setTimeout(() => {
+            console.warn(`[TESTER TIMEOUT] Ticket ${ticket.id} - forcing SKIP after timeout`);
+            resolve({
+              testNecessityScore: 50,
+              testNecessityReason: "Timeout - forcing decision",
+              testsExisted: false,
+              testsWritten: false,
+              testFiles: [],
+              testResults: "SKIPPED",
+              testOutput: "Tester timed out after 5 minutes. Forcing SKIP to avoid stall.",
+              testsRun: 0
+            });
+          }, 300_000);
+        });
         const result = await Promise.race([
           this.withHeartbeat(runId, ticket.id, "tester", "Running tests.", () =>
             this.gateway.runTesterInWorkspace!({
-              cwd: state.workspaceId,
+              cwd: workspace.worktreePath,
               prompt: `Test the following changes:\n\nChanged files:\n${changedFilesDesc}\n\nBuild diff:\n${buildDiffDesc}`,
               runId,
               ticketId: ticket.id,
@@ -288,23 +389,11 @@ export class TicketRunner {
               onStream: (payload) => this.recordAgentStream(payload)
             })
           ),
-          // Force outcome after timeout
-          new Promise<any>((resolve) => {
-            setTimeout(() => {
-              console.warn(`[TESTER TIMEOUT] Ticket ${ticket.id} - forcing SKIP after timeout`);
-              resolve({
-                testNecessityScore: 50,
-                testNecessityReason: "Timeout - forcing decision",
-                testsExisted: false,
-                testsWritten: false,
-                testFiles: [],
-                testResults: "SKIPPED",
-                testOutput: "Tester timed out after 5 minutes. Forcing SKIP to avoid stall.",
-                testsRun: 0
-              });
-            }, 300_000); // 5 minutes
-          })
+          timeoutFallback
         ]);
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+        }
 
         // FORCE OUTCOME: If result is invalid or incomplete, default to SKIP
         if (!result || !result.testResults || !result.testNecessityScore) {
@@ -425,15 +514,25 @@ export class TicketRunner {
       
       let prUrl: string | null = null;
       if (!commitResult.startsWith("noop:")) {
-        try {
-          const remoteBranch = await this.bridge.gitPush({ workspaceId: state.workspaceId });
-          const remoteUrl = await this.bridge.gitRemoteUrl(state.workspaceId);
-          if (remoteUrl && (remoteUrl.includes("github.com") || remoteUrl.includes("gitlab.com"))) {
-            const baseUrl = remoteUrl.replace(/\.git$/, "").replace(/git@([^:]+):/, "https://$1/");
-            prUrl = `${baseUrl}/compare/${state.workspaceId.split("_")[1]}...${remoteBranch}`;
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            await this.bridge.gitPush({ workspaceId: state.workspaceId });
+            const title = `${ticket.title} (${ticket.id})`;
+            const body = `Automated ticket completion.\n\n**Description:** ${ticket.description}\n\n**Acceptance Criteria:**\n${ticket.acceptanceCriteria.map((c) => `- ${c}`).join("\n")}`;
+            prUrl = await this.bridge.gitCreatePr({
+              workspaceId: state.workspaceId,
+              title,
+              body,
+              base: this.compareBaseRef.replace("origin/", "")
+            });
+            break;
+          } catch (pushError) {
+            const msg = pushError instanceof Error ? pushError.message : String(pushError);
+            console.error(`[${ticket.id}] Push/PR creation failed (attempt ${attempt}/2):`, msg);
+            if (attempt === 2) {
+              console.error(`[${ticket.id}] All push/PR attempts exhausted. Ticket approved but PR not created.`);
+            }
           }
-        } catch (pushError) {
-          console.warn("Failed to push branch:", pushError);
         }
       }
 
@@ -485,7 +584,8 @@ export class TicketRunner {
       .addEdge(START, "prepare_context")
       .addEdge("prepare_context", "builder")
       .addConditionalEdges("builder", (state: TicketGraphState) => state.noDiff ? "classify" : "reviewer", ["classify", "reviewer"])
-      .addConditionalEdges("reviewer", (state: TicketGraphState) => state.reviewApproved ? "finalize_success" : "classify", ["finalize_success", "classify"])
+      .addConditionalEdges("reviewer", (state: TicketGraphState) => state.reviewApproved ? "tester" : "classify", ["tester", "classify"])
+      .addConditionalEdges("tester", (state: TicketGraphState) => state.testPassed ? "finalize_success" : "classify", ["finalize_success", "classify"])
       .addConditionalEdges(
         "classify",
         (state: TicketGraphState) => {
@@ -604,9 +704,7 @@ export class TicketRunner {
         }
 
         this.heartbeat(runId, ticket.id, "reviewer", "Reviewing diff.");
-      reviewVerdict = await this.withHeartbeat(runId, ticket.id, "reviewer", "Reviewing diff.", () =>
-        this.gateway.getReviewerVerdict(reviewerPrompt(ticket, lastDiff))
-      );
+      reviewVerdict = await this.getReviewerVerdictWithRetry(runId, ticket, lastDiff);
         await this.writeHandoff(workspace.id, runId, ticket.id, {
           role: "reviewer",
           state: reviewVerdict.approved ? "approved" : "rejected",
@@ -634,6 +732,38 @@ export class TicketRunner {
         }
 
         this.heartbeat(runId, ticket.id, "tester", "Running tests.");
+
+        if (this.shouldSkipTester()) {
+          testSummary = "SKIPPED (score: 0/100)\nTester disabled by configuration.";
+          await this.writeHandoff(workspace.id, runId, ticket.id, {
+            role: "tester",
+            state: "approved",
+            summary: "Tests skipped by configuration.",
+            files: builderResult.intendedFiles,
+            payload: {
+              testNecessityScore: 0,
+              testNecessityReason: "Tester disabled by model config",
+              testsWritten: false,
+              testFiles: [],
+              testResults: "SKIPPED",
+              testsRun: 0
+            } as any
+          });
+          this.assertNotCancelled(ticket.id, ticket.epicId);
+          this.db.updateRun({ runId, status: "succeeded", currentNode: "complete", heartbeatAt: nowIso(), lastMessage: "Ticket approved." });
+          const diffStats = await this.bridge.getDiffStats(workspace.id);
+          this.db.updateTicketRunState({
+            ticketId: ticket.id,
+            status: "approved",
+            currentNode: "complete",
+            lastHeartbeatAt: nowIso(),
+            lastMessage: "Ticket approved.",
+            diffFiles: diffStats,
+            prUrl: null
+          });
+          await this.bridge.archiveWorkspace(workspace.id);
+          return { runId, workspaceId: workspace.id, status: "approved", lastDiff, reviewVerdict, testSummary };
+        }
         
         // Use mediated harness for tester if configured
         if (this.gateway.runTesterInWorkspace && this.gateway.models.tester.startsWith("mediated:")) {
@@ -642,7 +772,7 @@ export class TicketRunner {
           
           const testerResult = await this.withHeartbeat(runId, ticket.id, "tester", "Running tests.", () =>
             this.gateway.runTesterInWorkspace!({
-              cwd: workspace.id,
+              cwd: workspace.worktreePath,
               prompt: `Test the following changes:\n\nChanged files:\n${changedFilesDesc}\n\nBuild diff:\n${buildDiffDesc}\n\nScore test necessity and write/run tests if needed.`,
               runId,
               ticketId: ticket.id,
@@ -681,15 +811,25 @@ export class TicketRunner {
 
             let prUrl: string | null = null;
             if (!commitResult.startsWith("noop:")) {
-              try {
-                const remoteBranch = await this.bridge.gitPush({ workspaceId: workspace.id });
-                const remoteUrl = await this.bridge.gitRemoteUrl(workspace.id);
-                if (remoteUrl && (remoteUrl.includes("github.com") || remoteUrl.includes("gitlab.com"))) {
-                  const baseUrl = remoteUrl.replace(/\.git$/, "").replace(/git@([^:]+):/, "https://$1/");
-                  prUrl = `${baseUrl}/compare/${workspace.id.split("_")[1]}...${remoteBranch}`;
+              for (let attempt = 1; attempt <= 2; attempt++) {
+                try {
+                  await this.bridge.gitPush({ workspaceId: workspace.id });
+                  const title = `${ticket.title} (${ticket.id})`;
+                  const body = `Automated ticket completion.\n\n**Description:** ${ticket.description}\n\n**Acceptance Criteria:**\n${ticket.acceptanceCriteria.map((c) => `- ${c}`).join("\n")}`;
+                  prUrl = await this.bridge.gitCreatePr({
+                    workspaceId: workspace.id,
+                    title,
+                    body,
+                    base: this.compareBaseRef.replace("origin/", "")
+                  });
+                  break;
+                } catch (pushError) {
+                  const msg = pushError instanceof Error ? pushError.message : String(pushError);
+                  console.error(`[${ticket.id}] Push/PR creation failed (attempt ${attempt}/2):`, msg);
+                  if (attempt === 2) {
+                    console.error(`[${ticket.id}] All push/PR attempts exhausted. Ticket approved but PR not created.`);
+                  }
                 }
-              } catch (pushError) {
-                console.warn("Failed to push branch:", pushError);
               }
             }
 
@@ -749,15 +889,25 @@ export class TicketRunner {
 
             let prUrl: string | null = null;
             if (!commitResult.startsWith("noop:")) {
-              try {
-                const remoteBranch = await this.bridge.gitPush({ workspaceId: workspace.id });
-                const remoteUrl = await this.bridge.gitRemoteUrl(workspace.id);
-                if (remoteUrl && (remoteUrl.includes("github.com") || remoteUrl.includes("gitlab.com"))) {
-                  const baseUrl = remoteUrl.replace(/\.git$/, "").replace(/git@([^:]+):/, "https://$1/");
-                  prUrl = `${baseUrl}/compare/${workspace.id.split("_")[1]}...${remoteBranch}`;
+              for (let attempt = 1; attempt <= 2; attempt++) {
+                try {
+                  await this.bridge.gitPush({ workspaceId: workspace.id });
+                  const title = `${ticket.title} (${ticket.id})`;
+                  const body = `Automated ticket completion.\n\n**Description:** ${ticket.description}\n\n**Acceptance Criteria:**\n${ticket.acceptanceCriteria.map((c) => `- ${c}`).join("\n")}`;
+                  prUrl = await this.bridge.gitCreatePr({
+                    workspaceId: workspace.id,
+                    title,
+                    body,
+                    base: this.compareBaseRef.replace("origin/", "")
+                  });
+                  break;
+                } catch (pushError) {
+                  const msg = pushError instanceof Error ? pushError.message : String(pushError);
+                  console.error(`[${ticket.id}] Push/PR creation failed (attempt ${attempt}/2):`, msg);
+                  if (attempt === 2) {
+                    console.error(`[${ticket.id}] All push/PR attempts exhausted. Ticket approved but PR not created.`);
+                  }
                 }
-              } catch (pushError) {
-                console.warn("Failed to push branch:", pushError);
               }
             }
 
@@ -866,11 +1016,24 @@ export class TicketRunner {
           summary: result.summary
         };
       } catch (err) {
+        if (err instanceof OpenCodeLaunchError) {
+          await this.saveOpenCodeLaunchArtifact({
+            workspaceId: workspace.id,
+            runId,
+            ticketId,
+            buildAttempts,
+            launchInfo: err.launchInfo,
+            status: "failure",
+            error: err
+          });
+        }
         this.recordAgentStream({
           agentRole: "builder",
           source: "orchestrator",
           streamKind: "stderr",
-          content: `Mediated harness failed: ${err instanceof Error ? err.message : String(err)}. Falling back to plan mode.`,
+          content: err instanceof OpenCodeLaunchError
+            ? `${formatOpenCodeFailure(err)}. Falling back to plan mode.`
+            : `Mediated harness failed: ${err instanceof Error ? err.message : String(err)}. Falling back to plan mode.`,
           runId,
           ticketId,
           epicId: ticket.epicId,
@@ -946,7 +1109,7 @@ export class TicketRunner {
     }
 
     this.recordAgentStream({ agentRole: "builder", source: "orchestrator", streamKind: "status", content: "Requesting builder plan...", runId, ticketId, epicId: ticket.epicId, sequence: 0 });
-    const plan = await this.gateway.getBuilderPlan(builderPrompt(ticket, packet));
+    const plan = await this.getBuilderPlanWithTimeout(ticket, packet);
     this.recordAgentStream({ agentRole: "builder", source: "orchestrator", streamKind: "assistant", content: plan.summary, runId, ticketId, epicId: ticket.epicId, sequence: 1 });
     const intended = new Set(plan.intendedFiles);
     const files = await Promise.all(plan.operations.map(async (operation) => ({
@@ -995,6 +1158,11 @@ export class TicketRunner {
       if (match?.[1]) files.add(match[1]);
     }
     return [...files];
+  }
+
+  private normalizeCompareRef(remoteBranch: string): string {
+    // git push returns "<remote>/<branch>", while GitHub compare expects "<branch>".
+    return remoteBranch.replace(/^[^/]+\//, "");
   }
 
   private async saveOpenCodeLaunchArtifact(input: {
@@ -1094,6 +1262,156 @@ export class TicketRunner {
     } catch {
       return "";
     }
+  }
+
+  private async getBuilderPlanWithTimeout(ticket: TicketRecord, packet: TicketContextPacket) {
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    try {
+      return await Promise.race([
+        this.gateway.getBuilderPlan(builderPrompt(ticket, packet)),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            reject(new Error(`Builder planner timed out after ${this.builderPlanTimeoutMs}ms`));
+          }, this.builderPlanTimeoutMs);
+        })
+      ]);
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+  }
+
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => reject(new Error(message)), timeoutMs);
+        })
+      ]);
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+  }
+
+  private async getReviewerVerdictWithRetry(runId: string, ticket: TicketRecord, diff: string): Promise<ReviewerVerdict> {
+    const maxAttempts = 2;
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const verdict = await this.withHeartbeat(runId, ticket.id, "reviewer", "Reviewing diff.", () =>
+          this.withTimeout(
+            this.gateway.getReviewerVerdict(reviewerPrompt(ticket, diff)),
+            this.reviewerTimeoutMs,
+            `Reviewer timed out after ${this.reviewerTimeoutMs}ms`
+          )
+        );
+        const destructiveBlockers = this.getDestructiveDiffBlockers(diff);
+        if (!destructiveBlockers.length) return verdict;
+        const blockers = [...new Set([...verdict.blockers, ...destructiveBlockers])];
+        const suggestions = [...new Set([
+          ...verdict.suggestions,
+          "Destructive diff guard triggered: split risky changes into explicit, approved steps."
+        ])];
+        const guardMessage = `Destructive diff guard triggered: ${destructiveBlockers.join(" | ")}`;
+        this.recordAgentStream({
+          agentRole: "reviewer",
+          source: "orchestrator",
+          streamKind: "stderr",
+          content: guardMessage,
+          runId,
+          ticketId: ticket.id,
+          epicId: ticket.epicId,
+          sequence: attempt
+        });
+        return {
+          approved: false,
+          blockers,
+          suggestions,
+          riskLevel: "high"
+        };
+      } catch (error) {
+        lastError = error;
+        const isRetryable = this.isReviewerInfraError(error);
+        const message = this.formatReviewerError(error);
+        this.recordAgentStream({
+          agentRole: "reviewer",
+          source: "orchestrator",
+          streamKind: "stderr",
+          content: attempt < maxAttempts && isRetryable
+            ? `${message}. Retrying reviewer (${attempt + 1}/${maxAttempts})...`
+            : message,
+          runId,
+          ticketId: ticket.id,
+          epicId: ticket.epicId,
+          sequence: attempt
+        });
+        if (!isRetryable || attempt >= maxAttempts) {
+          throw new Error(message);
+        }
+        await sleep(1000);
+      }
+    }
+    throw new Error(this.formatReviewerError(lastError));
+  }
+
+  private isReviewerInfraError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    const normalized = message.toLowerCase();
+    return normalized.includes("fetch failed")
+      || normalized.includes("ollama request failed")
+      || normalized.includes("timed out")
+      || normalized.includes("econnrefused")
+      || normalized.includes("socket hang up")
+      || normalized.includes("connect")
+      || normalized.includes("network");
+  }
+
+  private formatReviewerError(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+    if (this.isReviewerInfraError(error)) {
+      return `Reviewer/Ollama unavailable: ${message}`;
+    }
+    return message;
+  }
+
+  private getDestructiveDiffBlockers(diff: string): string[] {
+    if (!diff.trim()) return [];
+    const blockers: string[] = [];
+    if (/^deleted file mode\s+/m.test(diff) || /^---\s+a\/.+\r?\n\+\+\+\s+\/dev\/null/m.test(diff)) {
+      blockers.push("Diff deletes one or more files.");
+    }
+
+    const addedLines = diff
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+      .map((line) => line.slice(1));
+    const removedLineCount = diff
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("-") && !line.startsWith("---")).length;
+    const addedLineCount = addedLines.length;
+
+    const dangerousPatterns: Array<{ pattern: RegExp; reason: string }> = [
+      { pattern: /\brm\s+-rf\b/i, reason: "Introduces recursive force delete command (`rm -rf`)." },
+      { pattern: /\bgit\s+reset\s+--hard\b/i, reason: "Introduces destructive git reset (`git reset --hard`)." },
+      { pattern: /\bgit\s+clean\s+-f[dDxX]*\b/i, reason: "Introduces destructive git clean command." },
+      { pattern: /\bdrop\s+database\b/i, reason: "Introduces `DROP DATABASE` SQL operation." },
+      { pattern: /\btruncate\s+table\b/i, reason: "Introduces `TRUNCATE TABLE` SQL operation." },
+      { pattern: /\bdelete\s+from\b(?!.*\bwhere\b)/i, reason: "Introduces `DELETE FROM` without `WHERE`." },
+      { pattern: /\.deleteMany\(\s*\)/i, reason: "Introduces unbounded `.deleteMany()` call." },
+      { pattern: /\.deleteMany\(\s*\{\s*\}\s*\)/i, reason: "Introduces `.deleteMany({})` (delete all records)." }
+    ];
+
+    for (const addedLine of addedLines) {
+      for (const { pattern, reason } of dangerousPatterns) {
+        if (pattern.test(addedLine)) blockers.push(reason);
+      }
+    }
+
+    if (removedLineCount >= 300 && addedLineCount <= Math.max(20, Math.floor(removedLineCount * 0.2))) {
+      blockers.push(`Large destructive churn detected (${removedLineCount} deletions vs ${addedLineCount} additions).`);
+    }
+    return [...new Set(blockers)];
   }
 
   private async getFailureDecision(
