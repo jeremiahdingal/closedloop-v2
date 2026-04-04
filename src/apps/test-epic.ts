@@ -1,4 +1,3 @@
-
 import { mkdtemp, writeFile, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -22,6 +21,7 @@ async function ensureDemoRepo(repoRoot: string): Promise<void> {
     await writeFile(path.join(tempRepo, "README.md"), "# Demo Repo\n", "utf8");
     await execFileAsync("git", ["add", "."], { cwd: tempRepo });
     await execFileAsync("git", ["commit", "-m", "init"], { cwd: tempRepo });
+    console.log(`Created temp repo at: ${tempRepo}`);
   }
 }
 
@@ -31,21 +31,32 @@ async function main() {
   process.env.LINT_COMMAND ||= "node --eval \"process.exit(0)\"";
   process.env.TYPECHECK_COMMAND ||= "node --eval \"process.exit(0)\"";
 
-  const { db, goalRunner } = await bootstrap({ dryRun: true });
+  const { db, goalRunner } = await bootstrap({ dryRun: false });
+  
   const epic = GoalRunner.createEpic(db, {
-    title: "Demo epic",
-    goalText: "Create a dry-run decomposition and queue the work.",
-    targetDir: process.cwd()
+    title: "Hello JSON File Creation",
+    goalText: "Create a simple hello.json file in the workspace root and write the contents of package.json into it. This is a straightforward file copy operation - read package.json and write its contents to hello.json.",
+    targetDir: process.env.REPO_ROOT || process.cwd()
   });
+  
   const runId = await goalRunner.enqueueGoal(epic.id);
 
+  console.log("\n" + "=".repeat(60));
+  console.log("TEST EPIC CREATED");
+  console.log("=".repeat(60));
   console.log(JSON.stringify({
-    message: "Demo epic queued. Start the worker to execute it.",
     epicId: epic.id,
     runId,
-    epics: db.listEpics(),
-    jobs: db.listJobs()
+    title: epic.title,
+    goalText: epic.goalText,
+    targetDir: epic.targetDir
   }, null, 2));
+  console.log("=".repeat(60));
+  console.log("\nTo run the epic:");
+  console.log(`  npm run worker`);
+  console.log("\nMonitor progress:");
+  console.log(`  Check data/ directory for artifacts and logs`);
+  console.log("=".repeat(60) + "\n");
 
   db.close();
   process.exit(0);

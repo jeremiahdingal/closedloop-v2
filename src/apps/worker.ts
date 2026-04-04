@@ -2,11 +2,13 @@ import { bootstrap } from "./bootstrap.ts";
 import { sleep } from "../utils.ts";
 
 async function main() {
-  const { config, db, recovery } = await bootstrap();
+  const { config, db, bridge, recovery } = await bootstrap();
   console.log(`Worker started. dryRun=${config.dryRun} useLangGraph=${config.useLangGraph}`);
   for (;;) {
     recovery.recoverExpiredLeases();
-    await recovery.rerunStaleRuns();
+    recovery.healQueueState();
+    await recovery.rerunStaleRuns(config.staleRunAfterMs, config.staleRunMaxRecoveries);
+    await bridge.cleanupArchivedWorkspaces();
 
     const job = db.nextQueuedJob();
     if (!job) {

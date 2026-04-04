@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClosedLoop Mascot</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      background: #5C94FC;
+    }
+    svg {
+      width: 400px;
+      height: 400px;
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+  <svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges">
+    <style>
+      @keyframes breathe {
+        0%, 100% { transform: translateY(0); }
+        50% { transform: translateY(0.15px); }
+      }
+      @keyframes blink {
+        0%, 92%, 100% { transform: scaleY(1); }
+        95% { transform: scaleY(0.1); }
+      }
+      @keyframes earWiggle {
+        0%, 100% { transform: rotate(0deg); }
+        25% { transform: rotate(-5deg); }
+        75% { transform: rotate(5deg); }
+      }
+      @keyframes tailWag {
+        0%, 100% { transform: translateX(0); }
+        50% { transform: translateX(0.2px); }
+      }
+      .body { animation: breathe 2.5s ease-in-out infinite; }
+      .eye { 
+        animation: blink 4s ease-in-out infinite; 
+        transform-origin: center;
+      }
+      .eye-left { transform-origin: 7.5px 7.5px; }
+      .eye-right { transform-origin: 12.5px 7.5px; }
+      .ear-left { animation: earWiggle 3s ease-in-out infinite; transform-origin: 5.5px 3px; }
+      .ear-right { animation: earWiggle 3s ease-in-out infinite 0.5s; transform-origin: 14.5px 3px; }
+      .arm-left { animation: breathe 2.5s ease-in-out infinite 0.1s; }
+      .arm-right { animation: breathe 2.5s ease-in-out infinite 0.2s; }
+      .foot-left { animation: tailWag 2s ease-in-out infinite; }
+      .foot-right { animation: tailWag 2s ease-in-out infinite 0.3s; }
+    </style>
+
+    <!-- Ears -->
+    <g class="ear-left">
+      <rect x="4" y="3" width="3" height="3" fill="#5D4037" />
+      <rect x="5" y="4" width="1" height="1" fill="#8D6E63" />
+    </g>
+    <g class="ear-right">
+      <rect x="13" y="3" width="3" height="3" fill="#5D4037" />
+      <rect x="14" y="4" width="1" height="1" fill="#8D6E63" />
+    </g>
+
+    <!-- Head -->
+    <g class="body">
+      <rect x="5" y="5" width="10" height="7" fill="#795548" />
+      <rect x="4" y="7" width="1" height="3" fill="#795548" />
+      <rect x="15" y="7" width="1" height="3" fill="#795548" />
+    </g>
+
+    <!-- Eyes -->
+    <g class="eye eye-left">
+      <rect x="7" y="7" width="1" height="1" fill="#212121" />
+    </g>
+    <g class="eye eye-right">
+      <rect x="12" y="7" width="1" height="1" fill="#212121" />
+    </g>
+
+    <!-- Snout -->
+    <g class="body">
+      <rect x="8" y="8" width="4" height="3" fill="#D7CCC8" />
+      <rect x="9" y="9" width="2" height="1" fill="#212121" />
+    </g>
+
+    <!-- Body -->
+    <g class="body">
+      <rect x="5" y="12" width="10" height="6" fill="#795548" />
+      <rect x="4" y="13" width="12" height="4" fill="#795548" />
+      <rect x="8" y="13" width="4" height="4" fill="#8D6E63" />
+    </g>
+
+    <!-- Arms -->
+    <g class="arm-left">
+      <rect x="2" y="12" width="3" height="3" fill="#795548" />
+    </g>
+    <g class="arm-right">
+      <rect x="15" y="12" width="3" height="3" fill="#795548" />
+    </g>
+
+    <!-- Feet -->
+    <g class="foot-left">
+      <rect x="5" y="18" width="3" height="2" fill="#5D4037" />
+    </g>
+    <g class="foot-right">
+      <rect x="12" y="18" width="3" height="2" fill="#5D4037" />
+    </g>
+  </svg>
+</body>
+</html>

@@ -7,7 +7,7 @@ import { loadConfig } from "../config.ts";
 import { appendAuditLine } from "./audit.ts";
 import { PathPolicy, getCommand } from "./policies.ts";
 import { git } from "./git.ts";
-import { ensureDir, nowIso, randomId, safeJoin, sha256, truncate } from "../utils.ts";
+import { ensureDir, nowIso, randomId, safeJoin, sha256, sleep, truncate } from "../utils.ts";
 import type {
   CommandName,
   TicketContextPacket,
@@ -48,8 +48,7 @@ export class WorkspaceBridge {
     let baseCommit = "";
     if (isGitRepo) {
       const baseRef = input.baseRef ?? "HEAD";
-      const base = await git(input.targetDir, ["rev-parse", baseRef]);
-      baseCommit = base.stdout.trim();
+      baseCommit = await this.resolveBaseCommit(input.targetDir, baseRef);
       await git(input.targetDir, ["worktree", "add", "-b", branchName, worktreePath, baseCommit]);
     } else {
       await cp(input.targetDir, worktreePath, { recursive: true });
@@ -74,6 +73,30 @@ export class WorkspaceBridge {
 
     await this.logAudit("workspace.log", `created workspace=${workspaceId} ticket=${input.ticketId} path=${worktreePath} target=${input.targetDir}`);
     return workspace;
+  }
+
+  private async resolveBaseCommit(targetDir: string, baseRef: string): Promise<string> {
+    const attempts = 2;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        const base = await git(targetDir, ["rev-parse", baseRef]);
+        const baseCommit = base.stdout.trim();
+        if (!baseCommit) {
+          throw new Error(`git rev-parse ${baseRef} returned an empty commit`);
+        }
+        return baseCommit;
+      } catch (error) {
+        lastError = error;
+        if (attempt < attempts) {
+          await sleep(500);
+        }
+      }
+    }
+
+    const detail = lastError instanceof Error ? lastError.message.trim() : String(lastError);
+    throw new Error(`Workspace bootstrap failed: could not resolve ${baseRef} for target repo ${targetDir}. ${detail}`);
   }
 
   async cleanupWorkspace(workspaceId: string, force = false): Promise<void> {
@@ -201,7 +224,7 @@ export class WorkspaceBridge {
 
   async gitDiff(workspaceId: string): Promise<string> {
     const workspace = this.requireWorkspace(workspaceId);
-    await git(workspace.worktreePath, ["add", "-A"]);
+    await this.stageTicketChanges(workspace.worktreePath);
     const result = await git(workspace.worktreePath, ["diff", "--staged", "--", "."]);
     return result.stdout.trim();
   }
@@ -211,6 +234,28 @@ export class WorkspaceBridge {
     const remote = input.remote ?? "origin";
     await git(workspace.worktreePath, ["push", "-u", remote, workspace.branchName]);
     return `${remote}/${workspace.branchName}`;
+  }
+
+  async gitCreatePr(input: { workspaceId: string; title: string; body?: string; base?: string }): Promise<string | null> {
+    const workspace = this.requireWorkspace(input.workspaceId);
+    const base = input.base ?? "main";
+    try {
+      const result = await git(workspace.worktreePath, [
+        "pr", "create",
+        "--title", input.title,
+        "--body", input.body ?? "",
+        "--base", base
+      ]);
+      const output = result.stdout.trim();
+      if (output.includes("github.com")) {
+        return output;
+      }
+      const prMatch = output.match(/https?:\/\/[^\s]+/);
+      return prMatch ? prMatch[0] : null;
+    } catch (error) {
+      console.warn("Failed to create PR:", error);
+      return null;
+    }
   }
 
   async gitRemoteUrl(workspaceId: string): Promise<string | null> {
@@ -231,7 +276,7 @@ export class WorkspaceBridge {
 
   async gitCommit(input: { workspaceId: string; message: string }): Promise<string> {
     const workspace = this.requireWorkspace(input.workspaceId);
-    await git(workspace.worktreePath, ["add", "-A"]);
+    await this.stageTicketChanges(workspace.worktreePath);
     try {
       await git(workspace.worktreePath, ["commit", "-m", input.message]);
     } catch (error) {
@@ -244,7 +289,7 @@ export class WorkspaceBridge {
 
   async getDiffStats(workspaceId: string): Promise<{ path: string; additions: number; deletions: number }[]> {
     const workspace = this.requireWorkspace(workspaceId);
-    await git(workspace.worktreePath, ["add", "-A"]);
+    await this.stageTicketChanges(workspace.worktreePath);
     const result = await git(workspace.worktreePath, ["diff", "--staged", "--stat", "--", "."]);
     const lines = result.stdout.trim().split("\n").filter(l => l.includes("|"));
     return lines.map(line => {
@@ -259,6 +304,11 @@ export class WorkspaceBridge {
         deletions: delMatch ? parseInt(delMatch[1]) : 0
       };
     });
+  }
+
+  private async stageTicketChanges(worktreePath: string): Promise<void> {
+    // Exclude orchestrator bookkeeping from ticket diffs/commits.
+    await git(worktreePath, ["add", "-A", "--", ".", ":(exclude).orchestrator/context.json"]);
   }
 
   async saveArtifact(input: {
@@ -404,5 +454,76 @@ export class WorkspaceBridge {
     } catch {
       // Branch may already be gone if the worktree was cleaned manually.
     }
+  }
+
+  /**
+   * Read a single file from a workspace
+   */
+  async readFile(workspaceId: string, filePath: string): Promise<string> {
+    const workspace = this.requireWorkspace(workspaceId);
+    const fullPath = safeJoin(workspace.worktreePath, filePath);
+    return readFile(fullPath, "utf8");
+  }
+
+  /**
+   * Create a temporary worktree from an existing branch (without adding it to the database)
+   */
+  async createTempWorktreeFromBranch(repoRoot: string, branchName: string): Promise<string> {
+    const tempId = randomId("tmp");
+    const tempWorktreePath = path.join(this.config.workspacesDir, tempId);
+    await ensureDir(this.config.workspacesDir);
+
+    // Create worktree from the existing branch
+    await git(repoRoot, ["worktree", "add", tempWorktreePath, branchName]);
+    return tempWorktreePath;
+  }
+
+  /**
+   * Remove a temporary worktree
+   */
+  async removeTempWorktree(worktreePath: string): Promise<void> {
+    try {
+      // Remove the worktree
+      const repoRoot = path.dirname(worktreePath);
+      await git(repoRoot, ["worktree", "remove", worktreePath]);
+    } catch (error) {
+      // If removal fails, try rm -rf as fallback
+      try {
+        await rm(worktreePath, { recursive: true, force: true });
+      } catch {
+        // Ignore errors
+      }
+    }
+  }
+
+  /**
+   * Commit and push changes from a worktree path (used for temp worktrees)
+   */
+  async commitAndPushFromPath(worktreePath: string, branchName: string, message: string): Promise<string> {
+    // Stage all changes
+    await git(worktreePath, ["add", "-A"]);
+
+    // Commit
+    try {
+      await git(worktreePath, ["commit", "-m", message]);
+    } catch (error) {
+      // If nothing to commit, just get the current HEAD
+      const head = await git(worktreePath, ["rev-parse", "HEAD"]);
+      return head.stdout.trim();
+    }
+
+    // Push
+    await git(worktreePath, ["push", "-u", "origin", branchName]);
+
+    // Return commit SHA
+    const head = await git(worktreePath, ["rev-parse", "HEAD"]);
+    return head.stdout.trim();
+  }
+
+  /**
+   * Ensure a directory exists (thin wrapper around utils ensureDir for consistency)
+   */
+  async ensureDirectory(dirPath: string): Promise<void> {
+    await ensureDir(dirPath);
   }
 }

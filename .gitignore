@@ -1,3 +1,10 @@
 data/
 dist/
+build/
+frontend-dist/
+node_modules/
+**/node_modules/
+coverage/
+vite.svg
 *.log
+.env

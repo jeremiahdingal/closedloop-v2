@@ -36,6 +36,14 @@ function isBuilderOperation(value: unknown): value is BuilderOperation {
   );
 }
 
+function normalizeBuilderPath(value: string): string {
+  return value
+    .trim()
+    .replace(/^[`"'[\](){}]+/, "")
+    .replace(/[`"',\])}]+$/, "")
+    .trim();
+}
+
 export function validateGoalDecomposition(value: unknown): GoalDecomposition {
   if (!value || typeof value !== "object") throw new Error("Goal decomposition is not an object");
   const record = value as Record<string, unknown>;
@@ -51,7 +59,24 @@ export function validateBuilderPlan(value: unknown): BuilderPlan {
   if (typeof record.summary !== "string" || !isStringArray(record.intendedFiles) || !Array.isArray(record.operations) || !record.operations.every(isBuilderOperation)) {
     throw new Error("Builder plan shape invalid");
   }
-  return record as BuilderPlan;
+  const intendedFiles = record.intendedFiles
+    .map((file) => normalizeBuilderPath(file))
+    .filter(Boolean);
+  const operations = record.operations.map((operation) => {
+    const typed = operation as BuilderOperation;
+    return {
+      ...typed,
+      path: normalizeBuilderPath(typed.path)
+    };
+  }).filter((operation) => operation.path.length > 0);
+  if (!intendedFiles.length || !operations.length) {
+    throw new Error("Builder plan paths invalid");
+  }
+  return {
+    summary: record.summary,
+    intendedFiles,
+    operations
+  } satisfies BuilderPlan;
 }
 
 export function validateReviewerVerdict(value: unknown): ReviewerVerdict {

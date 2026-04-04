@@ -34,9 +34,12 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
   const baseURL = config.baseURL ?? "http://localhost:11434/v1";
   const apiKey = config.apiKey ?? "ollama";
+  const toolMode = config.toolMode ?? "native";
   const maxIterations = config.maxIterations ?? 25;
   const timeoutMs = config.timeoutMs ?? 600_000;
-  const temperature = config.temperature ?? 0;
+  const temperature = config.temperature ?? 1.0;
+  const topP = config.topP ?? 0.95;
+  const topK = config.topK ?? 64;
   const emit = config.onEvent ?? (() => {});
 
   // Augment tool context with braveApiKey from config if not already set
@@ -54,6 +57,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
   const history = new CallHistory();
   const collectedToolCalls: ToolCall[] = [];
   const startTime = Date.now();
+  let emptyResponseRetryUsed = false;
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     // Check timeout
@@ -98,17 +102,24 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         },
         body: JSON.stringify({
           model: config.model,
-          messages,
-          tools: tools.map(t => ({
-            type: t.type,
-            function: {
-              name: t.function.name,
-              description: t.function.description,
-              parameters: t.function.parameters,
-            },
+          messages: messages.map((message) => ({
+            ...message,
+            content: message.content ?? "",
           })),
+          ...(toolMode === "native" ? {
+            tools: tools.map(t => ({
+              type: t.type,
+              function: {
+                name: t.function.name,
+                description: t.function.description,
+                parameters: t.function.parameters,
+              },
+            })),
+          } : {}),
           stream: true,
           temperature,
+          top_p: topP,
+          top_k: topK,
         }),
       });
     } catch (err) {
@@ -220,6 +231,18 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         messages.push({
           role: "user",
           content: "No output. Call list_dir to start, then finish with your answer.",
+        });
+        continue;
+      }
+
+      if (!emptyResponseRetryUsed) {
+        emptyResponseRetryUsed = true;
+        messages.push({ role: "assistant", content: state.content || "" });
+        messages.push({
+          role: "user",
+          content: toolMode === "xml"
+            ? "No output. Continue with exactly one XML function call. Do not write prose."
+            : "No output. Continue with exactly one tool call. Do not write prose.",
         });
         continue;
       }
@@ -337,7 +360,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     // Append assistant message with tool calls
     messages.push({
       role: "assistant",
-      content: state.content || null,
+      content: state.content || "",
       tool_calls: assistantToolCalls.length > 0 ? assistantToolCalls : undefined,
     });
 
@@ -392,19 +415,19 @@ function extractJson(text: string): unknown | null {
 
 function extractXmlToolCalls(text: string): CompleteToolCall[] {
   const calls: CompleteToolCall[] = [];
-  const fnRegex = /<function=([^>]+)>[\s\S]*?<\/function=\1>/g;
+  const fnRegex = /<function=([^>]+)>([\s\S]*?)<\/function(?:=[^>]+)?>/g;
   let fnMatch: RegExpExecArray | null;
 
   while ((fnMatch = fnRegex.exec(text)) !== null) {
     const fnName = fnMatch[1];
-    const fnBody = fnMatch[0];
+    const fnBody = fnMatch[2] ?? "";
     const args: Record<string, unknown> = {};
-    const paramRegex = /<parameter=([^>]+)>([\s\S]*?)<\/parameter=\1>/g;
+    const paramRegex = /<parameter(?:=([^>]+)|\s+name="([^"]+)")>([\s\S]*?)<\/parameter(?:=[^>]+)?>/g;
     let paramMatch: RegExpExecArray | null;
 
     while ((paramMatch = paramRegex.exec(fnBody)) !== null) {
-      const paramName = paramMatch[1];
-      const rawValue = paramMatch[2];
+      const paramName = paramMatch[1] || paramMatch[2];
+      const rawValue = paramMatch[3];
       try {
         args[paramName] = JSON.parse(rawValue);
       } catch {

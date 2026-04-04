@@ -123,6 +123,17 @@ Complete (57 unit tests passing, live-tested with qwen3-coder:30b and glm-4.7-fl
 - [x] models.ts integration (MediatedAgentHarnessGateway)
 - [x] goal-runner.ts integration (epicDecoder, epicReviewer)
 - [x] ticket-runner.ts integration (builder role)
+- [x] ticket-runner.ts integration (tester role with test necessity scoring)
+
+## Tester Role
+
+The tester agent uses the mediated harness to:
+1. Score test necessity (0-100) based on changed files and diff
+2. Write targeted unit tests if score >= 50
+3. Run only the written tests (not full suite)
+4. Report results with score justification
+
+This avoids running the entire repo's test suite for every ticket, while still validating changes with focused tests.
 
 ## Fallback Chains
 

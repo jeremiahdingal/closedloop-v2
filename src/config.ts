@@ -1,5 +1,5 @@
 import path from "node:path";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import type { AgentRole, CommandCatalog } from "./types.ts";
 
 export type AppConfig = {
@@ -12,6 +12,8 @@ export type AppConfig = {
   repoRoot: string;
   apiPort: number;
   workerPollMs: number;
+  staleRunAfterMs: number;
+  staleRunMaxRecoveries: number;
   leaseTtlMs: number;
   workspaceRetentionHours: number;
   dryRun: boolean;
@@ -20,9 +22,24 @@ export type AppConfig = {
   models: Record<AgentRole, string>;
 };
 
-function readModelsFile(): Record<AgentRole, string> {
-  const filePath = path.resolve(process.cwd(), "config", "agent-models.json");
+export function getModelsFilePath(): string {
+  return path.resolve(process.cwd(), "config", "agent-models.json");
+}
+
+export function readModelsFile(): Record<AgentRole, string> {
+  const filePath = getModelsFilePath();
   return JSON.parse(readFileSync(filePath, "utf8")) as Record<AgentRole, string>;
+}
+
+export function writeModelsFile(models: Record<AgentRole, string>): void {
+  writeFileSync(getModelsFilePath(), `${JSON.stringify(models, null, 2)}\n`, "utf8");
+}
+
+export function updateAgentModel(role: AgentRole, model: string): Record<AgentRole, string> {
+  const models = readModelsFile();
+  models[role] = model;
+  writeModelsFile(models);
+  return models;
 }
 
 export function loadConfig(): AppConfig {
@@ -41,6 +58,8 @@ export function loadConfig(): AppConfig {
     repoRoot,
     apiPort: Number(process.env.API_PORT || 4010),
     workerPollMs: Number(process.env.WORKER_POLL_MS || 1000),
+    staleRunAfterMs: Number(process.env.STALE_RUN_AFTER_MS || 180_000),
+    staleRunMaxRecoveries: Number(process.env.STALE_RUN_MAX_RECOVERIES || 3),
     leaseTtlMs: Number(process.env.LEASE_TTL_MS || 60_000),
     workspaceRetentionHours: Number(process.env.WORKSPACE_RETENTION_HOURS || 48),
     dryRun: process.env.DRY_RUN === "1",

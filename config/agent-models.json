@@ -1,8 +1,8 @@
 {
-  "epicDecoder": "qwen3-coder:30b",
+  "epicDecoder": "qwen-cli",
   "builder": "mediated:qwen3-coder:30b",
-  "reviewer": "mediated:glm-4.7-flash:q4_K_M",
-  "tester": "mediated:glm-4.7-flash:q4_K_M",
-  "epicReviewer": "qwen3:8b",
+  "reviewer": "qwen3.5:9b",
+  "tester": "skip",
+  "epicReviewer": "qwen-cli",
   "doctor": "qwen3:8b"
 }

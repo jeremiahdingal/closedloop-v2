@@ -21,27 +21,41 @@ type AgentModelInfo = {
 
 const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
   epicDecoder: [
+    { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" },
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
-    { id: "ollama", label: "Ollama (Fallback)", description: "Pure LLM via local Ollama, no workspace tools" }
+    { id: "ollama", label: "Ollama (Fallback)", description: "Pure LLM via local Ollama, no workspace tools" },
+    { id: "gemma4:26b", label: "Ollama (gemma4:26b)", description: "Pure LLM via local Ollama, no workspace tools" }
   ],
   epicReviewer: [
+    { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" },
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" }
   ],
   reviewer: [
-    { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
-    { id: "glm-4.7-flash:q4_K_M", label: "Ollama (glm-4.7-flash)", description: "Pure LLM via local Ollama, no workspace tools" }
+    { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
+    { id: "qwen3.5:9b", label: "Ollama (qwen3.5:9b)", description: "Pure LLM via local Ollama, no workspace tools" },
+    { id: "glm-4.7-flash:q4_K_M", label: "Ollama (glm-4.7-flash)", description: "Pure LLM via local Ollama, no workspace tools" },
+    { id: "gemma4:26b", label: "Ollama (gemma4:26b)", description: "Pure LLM via local Ollama, no workspace tools" }
+  ],
+  tester: [
+    { id: "skip", label: "Skip Tester", description: "Bypass tester step and mark tests as skipped" },
+    { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" }
   ],
   builder: [
+    { id: "mediated:qwen2.5-coder:14b", label: "Mediated (qwen2.5-coder:14b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:qwen2.5-coder:7b", label: "Mediated (qwen2.5-coder:7b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:devstral-small-2:24b", label: "Mediated (devstral-small-2:24b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
-    { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" }
+    { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" }
   ]
 };
 
@@ -57,6 +71,14 @@ function getAgentModelsConfig(): Record<string, AgentModelInfo> {
   const models = loadConfig().models;
   const result: Record<string, AgentModelInfo> = {};
   for (const [role, rawModel] of Object.entries(models)) {
+    if (role === "epicReviewer") {
+      result[role] = {
+        currentModel: "qwen-cli",
+        adapters: [{ id: "qwen-cli", label: "Qwen CLI (Forced)", description: "Temporarily locked to Qwen CLI for epic review stability" }],
+        switchable: false
+      };
+      continue;
+    }
     const { adapter, model } = parseAdapter(rawModel);
     const switchableOptions = SWITCHABLE_ADAPTORS[role];
     const adapters: ModelAdapterOption[] = switchableOptions
@@ -106,7 +128,7 @@ function writeSseEvent(res: http.ServerResponse, event: string, data: unknown, i
 }
 
 async function main() {
-  const { config, db, goalRunner, lifecycle } = await bootstrap();
+  const { config, db, goalRunner, lifecycle, ticketRunner } = await bootstrap();
   const server = http.createServer(async (req, res) => {
     try {
       setCors(res);
@@ -127,11 +149,13 @@ async function main() {
         return json(res, 200, db.listArtifacts(url.searchParams.get("ticketId") || undefined));
       }
       if (url.pathname === "/api/agent-events" && req.method === "GET") {
-        return json(res, 200, db.listEventsAfterId(Number(url.searchParams.get("afterId") || 0), {
+        const afterId = Number(url.searchParams.get("afterId") || 0);
+        return json(res, 200, db.listEventsAfterId(afterId, {
           kind: "agent_stream",
           runId: url.searchParams.get("runId") || undefined,
           ticketId: url.searchParams.get("ticketId") || undefined,
-          limit: Number(url.searchParams.get("limit") || 500)
+          limit: Number(url.searchParams.get("limit") || 500),
+          newest: !url.searchParams.get("afterId")
         }));
       }
       if (url.pathname === "/api/agent-stream" && req.method === "GET") {
@@ -176,6 +200,14 @@ async function main() {
         const summary = await lifecycle.cancelEpic(decodeURIComponent(cancelEpicMatch[1]));
         return json(res, 200, { ok: true, ...summary });
       }
+      const reviewEpicMatch = /^\/api\/epics\/([^/]+)\/review$/.exec(url.pathname);
+      if (reviewEpicMatch && req.method === "POST") {
+        const epicId = decodeURIComponent(reviewEpicMatch[1]);
+        const epic = db.getEpic(epicId);
+        if (!epic) return json(res, 404, { error: "epic_not_found" });
+        const runId = await goalRunner.enqueueManualReview(epicId);
+        return json(res, 200, { ok: true, epicId, runId });
+      }
       const deleteEpicMatch = /^\/api\/epics\/([^/]+)$/.exec(url.pathname);
       if (deleteEpicMatch && req.method === "DELETE") {
         const summary = await lifecycle.deleteEpic(decodeURIComponent(deleteEpicMatch[1]));
@@ -185,6 +217,202 @@ async function main() {
       if (cancelTicketMatch && req.method === "POST") {
         const summary = await lifecycle.cancelTicket(decodeURIComponent(cancelTicketMatch[1]));
         return json(res, 200, { ok: true, ...summary });
+      }
+      const rerunTicketMatch = /^\/api\/tickets\/([^/]+)\/rerun$/.exec(url.pathname);
+      if (rerunTicketMatch && req.method === "POST") {
+        const ticketId = decodeURIComponent(rerunTicketMatch[1]);
+        const body = await readBody(req);
+        const cancelActive = body?.cancelActive !== false;
+        const ticket = db.getTicket(ticketId);
+        if (!ticket) return json(res, 404, { error: "ticket_not_found" });
+        const activeRuns = db
+          .listRunsForTicket(ticket.id)
+          .filter((run) => run.status === "queued" || run.status === "running" || run.status === "waiting");
+        if (activeRuns.length && !cancelActive) {
+          return json(res, 409, { error: "ticket_has_active_run", activeRunIds: activeRuns.map((run) => run.id) });
+        }
+        if (activeRuns.length) {
+          await lifecycle.cancelTicket(ticket.id);
+        }
+        const runId = await ticketRunner.start(ticket.id, ticket.epicId);
+        db.recordEvent({
+          aggregateType: "ticket",
+          aggregateId: ticket.id,
+          runId,
+          ticketId: ticket.id,
+          kind: "ticket_rerun_queued",
+          message: "Ticket rerun queued.",
+          payload: { ticketId: ticket.id, runId, cancelledPreviousRuns: activeRuns.map((run) => run.id) }
+        });
+        return json(res, 200, { ok: true, runId, ticketId: ticket.id });
+      }
+      const forceRerunInPlaceMatch = /^\/api\/tickets\/([^/]+)\/force-rerun-in-place$/.exec(url.pathname);
+      if (forceRerunInPlaceMatch && req.method === "POST") {
+        const ticketId = decodeURIComponent(forceRerunInPlaceMatch[1]);
+        const ticket = db.getTicket(ticketId);
+        if (!ticket) return json(res, 404, { error: "ticket_not_found" });
+        if (!ticket.currentRunId) {
+          return json(res, 409, { error: "ticket_has_no_current_run", message: "Ticket has no current run to reuse." });
+        }
+        const run = db.getRun(ticket.currentRunId);
+        if (!run) return json(res, 404, { error: "run_not_found", runId: ticket.currentRunId });
+        if (run.kind !== "ticket") {
+          return json(res, 409, { error: "invalid_run_kind", message: "Only ticket runs can be force-rerun in place." });
+        }
+
+        // Supersede stale/duplicate active jobs for this run before enqueuing a new one.
+        const supersededJobIds: string[] = [];
+        for (const job of db.listJobRecords()) {
+          const payload = (job.payload ?? {}) as Record<string, unknown>;
+          if (job.kind !== "run_ticket") continue;
+          if (String(payload.runId ?? "") !== run.id) continue;
+          if (job.status !== "queued" && job.status !== "running") continue;
+          db.failJob(job.id, "Superseded by force rerun in place.", false);
+          supersededJobIds.push(job.id);
+        }
+
+        const timestamp = new Date().toISOString();
+        const reason = "Force rerun requested by user (in place).";
+        db.updateRun({
+          runId: run.id,
+          status: "queued",
+          currentNode: "recovery",
+          heartbeatAt: timestamp,
+          lastMessage: reason,
+          errorText: null,
+          attempt: run.attempt + 1
+        });
+        db.updateTicketRunState({
+          ticketId: ticket.id,
+          status: "queued",
+          currentRunId: run.id,
+          currentNode: "recovery",
+          lastHeartbeatAt: timestamp,
+          lastMessage: reason
+        });
+        db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id });
+        db.recordEvent({
+          aggregateType: "ticket",
+          aggregateId: ticket.id,
+          runId: run.id,
+          ticketId: ticket.id,
+          kind: "ticket_force_rerun_in_place",
+          message: reason,
+          payload: {
+            ticketId: ticket.id,
+            runId: run.id,
+            priorStatus: run.status,
+            priorNode: run.currentNode,
+            supersededJobIds
+          }
+        });
+        return json(res, 200, { ok: true, runId: run.id, ticketId: ticket.id, supersededJobIds });
+      }
+      const forceRescueMatch = /^\/api\/tickets\/([^/]+)\/force-rescue$/.exec(url.pathname);
+      if (forceRescueMatch && req.method === "POST") {
+        const ticketId = decodeURIComponent(forceRescueMatch[1]);
+        const body = await readBody(req);
+        const minStaleMsRaw = Number(body?.minStaleMs ?? 60_000);
+        const minStaleMs = Number.isFinite(minStaleMsRaw) && minStaleMsRaw >= 0 ? minStaleMsRaw : 60_000;
+        const requireReviewerNode = body?.requireReviewerNode !== false;
+
+        const ticket = db.getTicket(ticketId);
+        if (!ticket) return json(res, 404, { error: "ticket_not_found" });
+        if (!ticket.currentRunId) {
+          return json(res, 409, { error: "ticket_has_no_current_run", message: "Ticket has no current run to rescue." });
+        }
+        const run = db.getRun(ticket.currentRunId);
+        if (!run) return json(res, 404, { error: "run_not_found", runId: ticket.currentRunId });
+        if (run.kind !== "ticket") {
+          return json(res, 409, { error: "invalid_run_kind", message: "Only ticket runs can be rescued." });
+        }
+
+        const node = String(run.currentNode ?? "").toLowerCase();
+        if (requireReviewerNode && !node.includes("review")) {
+          return json(res, 409, {
+            error: "run_not_in_reviewer",
+            message: "Force rescue is only allowed when current node is reviewer.",
+            currentNode: run.currentNode
+          });
+        }
+
+        const heartbeatAtMs = run.heartbeatAt ? new Date(run.heartbeatAt).getTime() : 0;
+        const stalledForMs = heartbeatAtMs > 0 ? Math.max(0, Date.now() - heartbeatAtMs) : Number.MAX_SAFE_INTEGER;
+        if (stalledForMs < minStaleMs) {
+          return json(res, 409, {
+            error: "run_not_stale_enough",
+            message: `Run heartbeat is still fresh (${stalledForMs}ms < ${minStaleMs}ms).`,
+            stalledForMs,
+            minStaleMs
+          });
+        }
+
+        const supersededJobIds: string[] = [];
+        for (const job of db.listJobRecords()) {
+          const payload = (job.payload ?? {}) as Record<string, unknown>;
+          if (job.kind !== "run_ticket") continue;
+          if (String(payload.runId ?? "") !== run.id) continue;
+          if (job.status !== "queued" && job.status !== "running") continue;
+          db.failJob(job.id, "Superseded by manual force rescue.", false);
+          supersededJobIds.push(job.id);
+        }
+
+        const timestamp = new Date().toISOString();
+        const reason = `Doctor forced rescue for ticket ${ticket.id} at ${run.currentNode ?? "unknown node"}.`;
+        db.updateRun({
+          runId: run.id,
+          status: "queued",
+          currentNode: "recovery",
+          heartbeatAt: timestamp,
+          lastMessage: reason,
+          errorText: null,
+          attempt: run.attempt + 1
+        });
+        db.updateTicketRunState({
+          ticketId: ticket.id,
+          status: "queued",
+          currentRunId: run.id,
+          currentNode: "recovery",
+          lastHeartbeatAt: timestamp,
+          lastMessage: reason
+        });
+        db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id });
+        db.recordEvent({
+          aggregateType: "ticket",
+          aggregateId: ticket.id,
+          runId: run.id,
+          ticketId: ticket.id,
+          kind: "agent_stream",
+          message: "doctor:assistant",
+          payload: {
+            agentRole: "doctor",
+            source: "orchestrator",
+            streamKind: "assistant",
+            content: reason,
+            runId: run.id,
+            ticketId: ticket.id,
+            epicId: ticket.epicId,
+            done: true
+          }
+        });
+        db.recordEvent({
+          aggregateType: "ticket",
+          aggregateId: ticket.id,
+          runId: run.id,
+          ticketId: ticket.id,
+          kind: "ticket_force_rescue",
+          message: reason,
+          payload: {
+            ticketId: ticket.id,
+            runId: run.id,
+            priorStatus: run.status,
+            priorNode: run.currentNode,
+            stalledForMs,
+            minStaleMs,
+            supersededJobIds
+          }
+        });
+        return json(res, 200, { ok: true, runId: run.id, ticketId: ticket.id, stalledForMs, supersededJobIds });
       }
       const deleteTicketMatch = /^\/api\/tickets\/([^/]+)$/.exec(url.pathname);
       if (deleteTicketMatch && req.method === "DELETE") {
@@ -205,6 +433,9 @@ async function main() {
         const model = String(body.model || "").trim();
         if (!isAgentRole(role)) return json(res, 400, { error: "invalid_role" });
         if (!model) return json(res, 400, { error: "missing_model" });
+        if (role === "epicReviewer" && model !== "qwen-cli") {
+          return json(res, 409, { error: "model_locked", message: "epicReviewer is temporarily locked to qwen-cli." });
+        }
         updateAgentModel(role, model);
         return json(res, 200, { ok: true, models: getAgentModelsConfig() });
       }

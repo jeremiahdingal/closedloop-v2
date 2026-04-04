@@ -7,7 +7,8 @@ import type {
   GoalDecomposition,
   GoalReview,
   OpenCodeBuilderResult,
-  ReviewerVerdict
+  ReviewerVerdict,
+  TesterResult
 } from "../types.ts";
 import {
   parseJsonText,
@@ -19,6 +20,7 @@ import {
 } from "./validation.ts";
 import { OpenCodeRunner } from "./opencode.ts";
 import { CodexRunner } from "./codex.ts";
+import { QwenRunner } from "./qwen.ts";
 import { MediatedAgentHarness } from "../mediated-agent-harness/index.ts";
 import type { ToolExecutionContext } from "../mediated-agent-harness/types.ts";
 
@@ -33,11 +35,16 @@ export interface ModelGateway {
   getGoalReview(prompt: string): Promise<GoalReview>;
   getFailureDecision(prompt: string): Promise<FailureDecision>;
   runBuilderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<OpenCodeBuilderResult>;
+  runTesterInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<TesterResult>;
   runGoalReviewInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview>;
   runEpicDecoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition>;
   runEpicDecoderOpenCode?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition>;
   runEpicReviewerCodex?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview>;
 }
+
+const DEFAULT_TEMPERATURE = 1.0;
+const DEFAULT_TOP_P = 0.95;
+const DEFAULT_TOP_K = 64;
 
 function buildZodSchemas(z: any) {
   const GoalTicketPlanSchema = z.object({
@@ -92,6 +99,11 @@ function resolveOllamaModel(role: AgentRole, models: Record<AgentRole, string>):
     if (role === "epicReviewer") return process.env.OLLAMA_EPICREVIEWER_MODEL || process.env.OLLAMA_FALLBACK_MODEL || models.doctor || "qwen3:8b";
     return process.env.OLLAMA_FALLBACK_MODEL || models.doctor || "qwen3:8b";
   }
+  if (raw === "qwen-cli") {
+    if (role === "epicDecoder") return process.env.OLLAMA_EPICDECODER_MODEL || process.env.OLLAMA_FALLBACK_MODEL || models.doctor || "qwen3:8b";
+    if (role === "epicReviewer") return process.env.OLLAMA_EPICREVIEWER_MODEL || process.env.OLLAMA_FALLBACK_MODEL || models.doctor || "qwen3:8b";
+    return process.env.OLLAMA_FALLBACK_MODEL || models.doctor || "qwen3:8b";
+  }
   return raw;
 }
 
@@ -113,7 +125,11 @@ export class OllamaGateway implements ModelGateway {
         model,
         prompt,
         stream: false,
-        options: { temperature: 0 }
+        options: {
+          temperature: DEFAULT_TEMPERATURE,
+          top_p: DEFAULT_TOP_P,
+          top_k: DEFAULT_TOP_K
+        }
       })
     });
     if (!response.ok) {
@@ -134,7 +150,9 @@ export class OllamaGateway implements ModelGateway {
       const resolvedModel = resolveOllamaModel(role, this.models);
       const model = new ChatOllama({
         model: resolvedModel,
-        temperature: 0,
+        temperature: DEFAULT_TEMPERATURE,
+        topP: DEFAULT_TOP_P,
+        topK: DEFAULT_TOP_K,
         baseUrl: this.baseUrl
       });
       const structured = model.withStructuredOutput((schemas as any)[schemaName]);
@@ -172,11 +190,13 @@ export class OpenCodeHybridGateway implements ModelGateway {
   private readonly ollama: OllamaGateway;
   private readonly opencode: OpenCodeRunner;
   private readonly codex: CodexRunner;
+  private readonly qwen: QwenRunner;
 
   constructor() {
     this.ollama = new OllamaGateway();
     this.opencode = new OpenCodeRunner();
     this.codex = new CodexRunner();
+    this.qwen = new QwenRunner();
   }
 
   rawPrompt(role: AgentRole, prompt: string): Promise<string> {
@@ -212,6 +232,9 @@ export class OpenCodeHybridGateway implements ModelGateway {
   }
 
   runEpicDecoderInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition> {
+    if (this.models.epicDecoder === "qwen-cli") {
+      return this.qwen.runEpicDecoder({ role: "epicDecoder", ...input });
+    }
     return this.codex.runEpicDecoder({ role: "epicDecoder", ...input });
   }
 
@@ -221,6 +244,9 @@ export class OpenCodeHybridGateway implements ModelGateway {
   }
 
   runEpicReviewerCodex(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview> {
+    if (this.models.epicReviewer === "qwen-cli") {
+      return this.qwen.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
     return this.codex.runEpicReviewer({ role: "epicReviewer", ...input });
   }
 }
@@ -384,12 +410,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
   }
 
   private readonly ollama: OllamaGateway;
+  private readonly opencode: OpenCodeRunner;
+  private readonly codex: CodexRunner;
+  private readonly qwen: QwenRunner;
   private readonly ollamaBaseURL: string;
   private readonly braveApiKey: string | undefined;
 
   constructor(ollamaBaseURL?: string) {
     this.ollamaBaseURL = ollamaBaseURL || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
     this.ollama = new OllamaGateway(this.ollamaBaseURL);
+    this.opencode = new OpenCodeRunner();
+    this.codex = new CodexRunner();
+    this.qwen = new QwenRunner();
     this.braveApiKey = process.env.BRAVE_API_KEY;
   }
 
@@ -424,6 +456,19 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     epicId?: string | null;
     onStream?: StreamHook;
   }): Promise<GoalDecomposition> {
+    const configuredModel = this.models.epicDecoder;
+
+    if (configuredModel === "codex-cli") {
+      return this.codex.runEpicDecoder({ role: "epicDecoder", ...input });
+    }
+    if (configuredModel === "qwen-cli") {
+      return this.qwen.runEpicDecoder({ role: "epicDecoder", ...input });
+    }
+    if (configuredModel.startsWith("opencode:")) {
+      const parsed = await this.opencode.runEpicDecoder({ role: "epicDecoder", ...input });
+      return validateGoalDecomposition(parsed);
+    }
+
     const model = this.resolveHarnessModel("epicDecoder");
     input.onStream?.({
       agentRole: "epicDecoder",
@@ -495,6 +540,14 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     epicId?: string | null;
     onStream?: StreamHook;
   }): Promise<GoalReview> {
+    const configuredModel = this.models.epicReviewer;
+    if (configuredModel === "qwen-cli") {
+      return this.qwen.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (configuredModel.startsWith("opencode:")) {
+      return this.opencode.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+
     const model = this.resolveHarnessModel("epicReviewer");
     input.onStream?.({
       agentRole: "epicReviewer",
@@ -548,6 +601,30 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     return validateGoalReview(parseJsonText(result.text));
   }
 
+  async runEpicDecoderOpenCode(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    epicId?: string | null;
+    onStream?: StreamHook;
+  }): Promise<GoalDecomposition> {
+    const parsed = await this.opencode.runEpicDecoder({ role: "epicDecoder", ...input });
+    return validateGoalDecomposition(parsed);
+  }
+
+  runEpicReviewerCodex(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    epicId?: string | null;
+    onStream?: StreamHook;
+  }): Promise<GoalReview> {
+    if (this.models.epicReviewer === "qwen-cli") {
+      return this.qwen.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    return this.codex.runEpicReviewer({ role: "epicReviewer", ...input });
+  }
+
   async runBuilderInWorkspace(input: {
     cwd: string;
     prompt: string;
@@ -568,7 +645,45 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, "builder");
+    try {
+      return await this.runBuilderAttempt(input, model, "native");
+    } catch (nativeError) {
+      input.onStream?.({
+        agentRole: "builder",
+        source: "orchestrator",
+        streamKind: "stderr",
+        content: `Mediated builder failed in native tool mode: ${nativeError instanceof Error ? nativeError.message : String(nativeError)}. Retrying in XML compatibility mode.`,
+        runId: input.runId,
+        ticketId: input.ticketId,
+        epicId: input.epicId,
+        sequence: 0,
+      });
+    }
+
+    return await this.runBuilderAttempt(input, model, "xml");
+  }
+
+  async runTesterInWorkspace(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    ticketId?: string | null;
+    epicId?: string | null;
+    onStream?: StreamHook;
+  }): Promise<TesterResult> {
+    const model = this.resolveHarnessModel("tester");
+    input.onStream?.({
+      agentRole: "tester",
+      source: "orchestrator",
+      streamKind: "status",
+      content: "Testing via mediated agent harness...",
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+    });
+
+    const toolContext = this.buildToolContext(input.cwd, "tester");
 
     const harness = new MediatedAgentHarness({
       baseURL: `${this.ollamaBaseURL}/v1`,
@@ -578,9 +693,96 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       toolContext,
     });
 
-    const result = await harness.run("builder", input.prompt, {
-      maxIterations: 30,
-      timeoutMs: 900_000,
+    // TIGHT LIMITS: Tester must decide within 10 iterations (prompt says 3 tool calls)
+    const result = await harness.run("tester", input.prompt, {
+      maxIterations: 10,
+      timeoutMs: 300_000, // 5 minutes
+      onEvent: (event) => {
+        if (event.kind === "text" || event.kind === "thinking") {
+          input.onStream?.({
+            agentRole: "tester",
+            source: "mediated-harness",
+            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
+            content: event.text,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+          });
+        }
+        if (event.kind === "tool_call") {
+          input.onStream?.({
+            agentRole: "tester",
+            source: "mediated-harness",
+            streamKind: "status",
+            content: `Tool: ${event.call.name}`,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+          });
+        }
+      },
+    });
+
+    const parsed = parseJsonText(result.text) as TesterResult;
+    return {
+      testNecessityScore: parsed.testNecessityScore ?? 0,
+      testNecessityReason: parsed.testNecessityReason ?? "",
+      testsWritten: parsed.testsWritten ?? false,
+      testFiles: parsed.testFiles ?? [],
+      testResults: parsed.testResults ?? "SKIPPED",
+      testOutput: parsed.testOutput ?? "",
+      testsRun: parsed.testsRun ?? 0,
+    };
+  }
+
+  private resolveHarnessModel(role: AgentRole): string {
+    const raw = this.models[role];
+    if (raw.startsWith("mediated:")) return raw.slice("mediated:".length);
+    return raw;
+  }
+
+  protected buildBuilderXmlPrompt(prompt: string): string {
+    return [
+      "You are a code-writing agent using XML function calls.",
+      "Every assistant turn must be exactly one XML function call and nothing else.",
+      "Use XML function calls instead of native tool calling.",
+      "Available functions include read_file, read_files, write_file, write_files, list_dir, glob_files, grep_files, run_command, save_artifact, and finish.",
+      "Use this exact syntax when calling tools:",
+      "<function=read_file><parameter=path>package.json</parameter></function=read_file>",
+      "After each tool result, continue with exactly one XML function call.",
+      "Do not emit prose before or after tool calls.",
+      "",
+      prompt
+    ].join("\n\n");
+  }
+
+  protected async runBuilderAttempt(
+    input: {
+      cwd: string;
+      prompt: string;
+      runId?: string | null;
+      ticketId?: string | null;
+      epicId?: string | null;
+      onStream?: StreamHook;
+    },
+    model: string,
+    toolMode: "native" | "xml"
+  ): Promise<OpenCodeBuilderResult> {
+    const toolContext = this.buildToolContext(input.cwd, "builder");
+    const harness = new MediatedAgentHarness({
+      baseURL: `${this.ollamaBaseURL}/v1`,
+      apiKey: "ollama",
+      model,
+      braveApiKey: this.braveApiKey,
+      toolContext,
+    });
+
+    const result = await harness.run("builder", toolMode === "xml" ? this.buildBuilderXmlPrompt(input.prompt) : input.prompt, {
+      maxIterations: 50,
+      timeoutMs: 1_800_000,
+      toolMode,
       onEvent: (event) => {
         if (event.kind === "text" || event.kind === "thinking") {
           input.onStream?.({
@@ -606,6 +808,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
             sequence: 0,
           });
         }
+        if (event.kind === "tool_error") {
+          input.onStream?.({
+            agentRole: "builder",
+            source: "mediated-harness",
+            streamKind: "stderr",
+            content: `Tool error: ${event.error}`,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+          });
+        }
       },
     });
 
@@ -614,12 +828,6 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sessionId: null,
       rawOutput: result.text,
     };
-  }
-
-  private resolveHarnessModel(role: AgentRole): string {
-    const raw = this.models[role];
-    if (raw.startsWith("mediated:")) return raw.slice("mediated:".length);
-    return raw;
   }
 
   private buildToolContext(cwd: string, workspaceId: string): ToolExecutionContext {

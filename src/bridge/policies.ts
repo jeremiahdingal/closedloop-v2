@@ -17,7 +17,8 @@ export class PathPolicy {
     if (normalized.includes("..")) {
       throw new Error(`Parent traversal is forbidden: ${relativePath}`);
     }
-    if (this.allowedPrefixes.length === 0) return;
+    const hasDirectory = normalized.includes("/");
+    if (!hasDirectory || this.allowedPrefixes.length === 0 || this.allowedPrefixes.includes("*")) return;
     if (!this.allowedPrefixes.some((prefix) => normalized === prefix || normalized.startsWith(prefix.endsWith("/") ? prefix : prefix + "/"))) {
       throw new Error(`Path not allowed by ticket policy: ${relativePath}`);
     }

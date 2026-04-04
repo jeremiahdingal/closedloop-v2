@@ -5,7 +5,8 @@ async function main() {
   const { db, goalRunner } = await bootstrap({ dryRun: true });
   const epic = GoalRunner.createEpic(db, {
     title: "Demo epic",
-    goalText: "Demonstrate production-ready orchestration backend."
+    goalText: "Demonstrate production-ready orchestration backend.",
+    targetDir: process.cwd()
   });
   const runId = await goalRunner.enqueueGoal(epic.id);
   console.log(JSON.stringify({ epicId: epic.id, runId }, null, 2));
