@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import "./styles.css";
 
 type Epic = { id: string; title: string; goalText: string; targetDir: string; targetBranch: string | null; status: string; createdAt: string; updatedAt: string };
@@ -211,20 +212,39 @@ function PlanningModal(props: { sessionId: string; epicTitle: string; open: bool
         </div>
         <div className="modal-stream-list">
           {streamItems.length ? streamItems.map((item) => (
-            <div className="modal-stream-item" key={item.id}>
+            <div className={`modal-stream-item plan-stream-item plan-stream-${item.streamKind || "raw"}`} key={item.id}>
               <div className="modal-stream-meta">
                 <span className={`pill pill-${item.streamKind || "raw"}`}>{item.streamKind || "raw"}</span>
                 <span className="modal-stream-time">{item.source}</span>
               </div>
-              <pre>{item.content}</pre>
+              {(item.streamKind === "assistant" || item.streamKind === "thinking") ? (
+                <div className="plan-md-content">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown>
+                </div>
+              ) : (
+                <pre className="plan-plain-text">{item.content}</pre>
+              )}
             </div>
           )) : <p className="modal-empty">Planner is exploring the repository...</p>}
           <div ref={streamEndRef} />
         </div>
         {latestPlan && (
           <div className="plan-preview">
-            <strong>Plan: {latestPlan.summary}</strong>
-            <ul>{latestPlan.tickets.map((t) => <li key={t.id}><strong>{t.title}</strong> — {t.description.slice(0, 80)}{t.description.length > 80 ? "…" : ""}</li>)}</ul>
+            <div className="plan-preview-summary">📋 {latestPlan.summary}</div>
+            <div className="plan-ticket-list">
+              {latestPlan.tickets.map((t, i) => (
+                <div className="plan-ticket-row" key={t.id}>
+                  <span className="plan-ticket-num">{i + 1}</span>
+                  <div className="plan-ticket-body">
+                    <div className="plan-ticket-title">{t.title}</div>
+                    <div className="plan-ticket-meta">
+                      <span className={`priority-${t.priority}`}>{t.priority}</span>
+                      {t.allowedPaths.length > 0 && <span className="plan-ticket-paths">{t.allowedPaths.join(", ")}</span>}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         )}
         <div className="planning-modal-input-bar">

@@ -2205,95 +2205,266 @@ body::after {
    ========================================================= */
 
 .planning-modal {
-  max-width: 860px;
-  width: 95vw;
-  max-height: 90vh;
+  max-width: 900px;
+  width: 96vw;
+  max-height: 92vh;
   display: flex;
   flex-direction: column;
 }
 
 .planning-modal .modal-stream-list {
   flex: 1;
-  min-height: 200px;
-  max-height: 420px;
-}
-
-.plan-preview {
-  background: #000;
-  color: var(--arcade-cyan);
-  border: 2px solid var(--arcade-cyan);
-  padding: 0.75rem 1rem;
-  font-size: 0.85rem;
-  font-family: 'Fira Code', monospace;
-  max-height: 160px;
+  min-height: 180px;
+  max-height: 400px;
   overflow-y: auto;
 }
 
-.plan-preview strong {
-  display: block;
-  margin-bottom: 0.4rem;
-  color: var(--arcade-yellow);
+/* Stream item variants */
+.plan-stream-item { padding: 0.5rem 0.75rem; }
+.plan-stream-thinking { opacity: 0.75; font-style: italic; }
+.plan-stream-status pre, .plan-stream-stderr pre, .plan-stream-tool_call pre {
+  font-family: 'Fira Code', monospace;
+  font-size: 0.8rem;
+  color: var(--win-gray-dark);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.plan-stream-stderr pre { color: var(--arcade-red); }
+
+.plan-plain-text {
+  font-family: 'Fira Code', monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  padding: 0;
 }
 
-.plan-preview ul {
-  list-style: disc;
-  padding-left: 1.25rem;
+/* ── Markdown rendered content ── */
+.plan-md-content {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  font-size: 0.9rem;
   line-height: 1.6;
+  color: #1a1a1a;
+  padding: 0.25rem 0;
 }
 
+.plan-md-content h1,
+.plan-md-content h2,
+.plan-md-content h3,
+.plan-md-content h4 {
+  font-family: 'VT323', monospace;
+  color: var(--win-blue);
+  margin: 0.75rem 0 0.35rem;
+  letter-spacing: 0.02em;
+}
+.plan-md-content h1 { font-size: 1.4rem; border-bottom: 2px solid var(--win-blue); padding-bottom: 0.2rem; }
+.plan-md-content h2 { font-size: 1.2rem; }
+.plan-md-content h3 { font-size: 1.05rem; }
+
+.plan-md-content p { margin: 0.4rem 0; }
+
+.plan-md-content ul,
+.plan-md-content ol {
+  padding-left: 1.4rem;
+  margin: 0.3rem 0;
+}
+.plan-md-content li { margin: 0.15rem 0; }
+
+.plan-md-content strong { color: #000; font-weight: 700; }
+.plan-md-content em     { font-style: italic; color: #444; }
+
+/* Inline code */
+.plan-md-content code {
+  background: #f0f0f0;
+  border: 1px solid #bbb;
+  border-radius: 2px;
+  padding: 0.1em 0.35em;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.82em;
+  color: #c7254e;
+}
+
+/* Code blocks */
+.plan-md-content pre {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border: 2px solid #444;
+  border-left: 4px solid var(--arcade-cyan);
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  margin: 0.5rem 0;
+  border-radius: 0;
+}
+.plan-md-content pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
+}
+
+/* Tables */
+.plan-md-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.6rem 0;
+  font-size: 0.85rem;
+}
+.plan-md-content th {
+  background: var(--win-blue);
+  color: #fff;
+  padding: 0.35rem 0.6rem;
+  text-align: left;
+  font-weight: 600;
+  border: 1px solid #000;
+}
+.plan-md-content td {
+  padding: 0.3rem 0.6rem;
+  border: 1px solid #bbb;
+  vertical-align: top;
+}
+.plan-md-content tr:nth-child(even) td { background: #f5f5f5; }
+.plan-md-content tr:hover td { background: #e8f0fe; }
+
+/* Blockquote */
+.plan-md-content blockquote {
+  border-left: 4px solid var(--arcade-yellow);
+  background: #fffde7;
+  margin: 0.5rem 0;
+  padding: 0.4rem 0.75rem;
+  color: #555;
+  font-style: italic;
+}
+
+/* Horizontal rule */
+.plan-md-content hr {
+  border: none;
+  border-top: 2px solid var(--win-gray-dark);
+  margin: 0.75rem 0;
+}
+
+/* ── Plan preview (ticket list) ── */
+.plan-preview {
+  background: #fff;
+  border-top: 2px solid var(--win-gray-dark);
+  border-bottom: 2px solid var(--win-gray-dark);
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.plan-preview-summary {
+  background: var(--win-blue);
+  color: #fff;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.85rem;
+  font-family: 'VT323', monospace;
+  font-size: 1rem;
+  letter-spacing: 0.03em;
+}
+
+.plan-ticket-list { padding: 0.3rem 0; }
+
+.plan-ticket-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.3rem 0.75rem;
+  border-bottom: 1px solid #eee;
+}
+.plan-ticket-row:last-child { border-bottom: none; }
+.plan-ticket-row:hover { background: #f0f4ff; }
+
+.plan-ticket-num {
+  background: var(--win-blue);
+  color: #fff;
+  min-width: 1.4rem;
+  height: 1.4rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: bold;
+  flex-shrink: 0;
+  margin-top: 0.1rem;
+}
+
+.plan-ticket-body { flex: 1; }
+.plan-ticket-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #111;
+}
+.plan-ticket-meta {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.15rem;
+  align-items: center;
+}
+.plan-ticket-paths {
+  font-size: 0.72rem;
+  font-family: 'Fira Code', monospace;
+  color: #666;
+  background: #f0f0f0;
+  border: 1px solid #ccc;
+  padding: 0.05rem 0.3rem;
+}
+
+/* ── Input bar ── */
 .planning-modal-input-bar {
   display: flex;
   gap: 0.5rem;
   padding: 0.5rem 0.75rem;
   background: var(--win-gray);
   border-top: 2px solid var(--win-gray-dark);
+  align-items: center;
 }
 
 .planning-modal-input {
   flex: 1;
   background: #fff;
   border: 2px inset var(--win-gray-dark);
-  padding: 0.35rem 0.5rem;
-  font-family: 'Fira Code', monospace;
-  font-size: 0.85rem;
+  padding: 0.35rem 0.6rem;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  font-size: 0.88rem;
   outline: none;
 }
+.planning-modal-input:focus { border-color: var(--win-blue); }
 
-.planning-modal-input:focus {
-  border-color: var(--win-blue);
-}
-
+/* ── Approve button ── */
 .plan-approve-btn {
   background: #006400;
-  color: var(--arcade-green);
+  color: #fff;
   border: 2px outset #009900;
   font-weight: bold;
-  letter-spacing: 0.04em;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.8rem;
 }
-
-.plan-approve-btn:hover:not(:disabled) {
-  background: #008000;
-}
-
+.plan-approve-btn:hover:not(:disabled) { background: #008000; }
 .plan-approve-btn:disabled {
   background: var(--win-gray-dark);
-  color: var(--win-gray);
+  color: #aaa;
   border-color: var(--win-gray-dark);
+  cursor: not-allowed;
 }
 
+/* ── Status badge ── */
 .plan-status-badge {
   font-size: 0.7rem;
-  padding: 0.15rem 0.45rem;
-  border: 1px solid var(--win-gray-dark);
+  padding: 0.15rem 0.5rem;
+  border: 1px solid currentColor;
   background: #000;
   margin-left: 0.5rem;
+  font-family: 'Fira Code', monospace;
 }
+.plan-status-badge.status-running { color: var(--arcade-yellow); }
+.plan-status-badge.status-idle    { color: var(--arcade-green); }
+.plan-status-badge.status-error   { color: var(--arcade-red); }
 
-.plan-status-badge.status-running  { color: var(--arcade-yellow); border-color: var(--arcade-yellow); }
-.plan-status-badge.status-idle     { color: var(--arcade-green);  border-color: var(--arcade-green); }
-.plan-status-badge.status-error    { color: var(--arcade-red);    border-color: var(--arcade-red); }
-
-/* Mode select in new epic form */
+/* ── Mode select ── */
 .mode-select {
   background: #fff;
   border: 2px inset var(--win-gray-dark);
@@ -2301,10 +2472,9 @@ body::after {
   font-size: 0.85rem;
   cursor: pointer;
 }
-
 .mode-hint {
   font-size: 0.75rem;
-  color: var(--win-blue);
+  color: #555;
   margin-left: 0.4rem;
   font-style: italic;
 }
