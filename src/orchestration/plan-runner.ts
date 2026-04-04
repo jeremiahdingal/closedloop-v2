@@ -65,9 +65,16 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
 
   const { gateway } = input;
   const planSessionId = input.sessionId ?? "plan";
+  const configuredModel = gateway.models.epicDecoder;
 
-  // Mediated / codex-cli / qwen-cli / opencode paths (workspace-aware)
-  if (gateway.runEpicDecoderInWorkspace) {
+  // Mirror the same routing logic as GoalRunner.runEpicDecoder
+  // to avoid sending qwen-cli/codex-cli as model IDs to OpenCode.
+
+  // qwen-cli / codex-cli — runs via QwenRunner / CodexRunner
+  if (
+    gateway.runEpicDecoderInWorkspace &&
+    (configuredModel === "codex-cli" || configuredModel === "qwen-cli")
+  ) {
     try {
       const result = await gateway.runEpicDecoderInWorkspace({
         cwd: input.cwd,
@@ -78,11 +85,12 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
       });
       return { plan: result, rawText: JSON.stringify(result) };
     } catch (err) {
-      console.warn(`[PlanRunner] Primary decoder path failed: ${err}. Falling back to Ollama.`);
+      console.warn(`[PlanRunner] ${configuredModel} failed: ${err}. Falling back to Ollama.`);
     }
   }
 
-  if (gateway.runEpicDecoderOpenCode) {
+  // opencode:<model> — runs via OpenCodeRunner
+  if (gateway.runEpicDecoderOpenCode && configuredModel.startsWith("opencode:")) {
     try {
       const result = await gateway.runEpicDecoderOpenCode({
         cwd: input.cwd,
@@ -93,11 +101,27 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
       });
       return { plan: result, rawText: JSON.stringify(result) };
     } catch (err) {
-      console.warn(`[PlanRunner] OpenCode decoder path failed: ${err}. Falling back to Ollama.`);
+      console.warn(`[PlanRunner] OpenCode decoder failed: ${err}. Falling back to Ollama.`);
     }
   }
 
-  // Pure Ollama fallback (no workspace tools)
+  // mediated:<model> — runs via MediatedAgentHarness
+  if (gateway.runEpicDecoderInWorkspace && configuredModel.startsWith("mediated:")) {
+    try {
+      const result = await gateway.runEpicDecoderInWorkspace({
+        cwd: input.cwd,
+        prompt,
+        runId: null,
+        epicId: planSessionId,
+        onStream: input.onStream,
+      });
+      return { plan: result, rawText: JSON.stringify(result) };
+    } catch (err) {
+      console.warn(`[PlanRunner] Mediated harness failed: ${err}. Falling back to Ollama.`);
+    }
+  }
+
+  // Pure Ollama fallback — response is prose with embedded FINAL_JSON block
   const rawText = await gateway.rawPrompt("epicDecoder", prompt);
   const plan = validateGoalDecomposition(parseJsonText(rawText));
   return { plan, rawText };
