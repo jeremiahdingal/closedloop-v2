@@ -375,7 +375,8 @@ export function epicDecoderPlanModePrompt(
   epicTitle: string,
   epicDescription: string,
   userMessages: string[],
-  projectStructure?: string | null
+  projectStructure?: string | null,
+  ragContext?: { codeContext: string; docContext: string } | null
 ): string {
   const sections: string[] = [
     "You are the Epic Planner agent. Your job is to collaboratively explore the repository and produce a thorough, well-scoped implementation plan.",
@@ -388,6 +389,9 @@ export function epicDecoderPlanModePrompt(
   if (projectStructure) {
     sections.push(`## Project Structure\n\`\`\`\n${projectStructure.slice(0, 6000)}\n\`\`\``);
   }
+
+  if (ragContext?.docContext) sections.push(ragContext.docContext);
+  if (ragContext?.codeContext) sections.push(ragContext.codeContext);
 
   if (userMessages.length > 0) {
     const msgBlock = userMessages.map((m, i) => `${i + 1}. ${m}`).join("\n");

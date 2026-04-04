@@ -6,10 +6,12 @@
 
 import type { ModelGateway, StreamHook } from "./models.ts";
 import type { GoalDecomposition } from "../types.ts";
+import type { AppDatabase } from "../db/database.ts";
 import { epicDecoderPlanModePrompt } from "./prompts.ts";
 import { ensureProjectStructureFile } from "./project-structure.ts";
-import { parseJsonText } from "./validation.ts";
-import { validateGoalDecomposition } from "./validation.ts";
+import { buildContextForQuery } from "../rag/context-builder.ts";
+import { git } from "../bridge/git.ts";
+import { parseJsonText, validateGoalDecomposition } from "./validation.ts";
 
 export interface PlanRunInput {
   cwd: string;
@@ -17,6 +19,7 @@ export interface PlanRunInput {
   epicDescription: string;
   userMessages: string[];
   gateway: ModelGateway;
+  db?: AppDatabase;
   onStream?: StreamHook;
   sessionId?: string;
 }
@@ -36,12 +39,28 @@ export interface PlanRunResult {
  * and never creates runs, tickets, or epics.
  */
 export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult> {
-  const projectStructure = await ensureProjectStructureFile(input.cwd).catch(() => null);
+  const [projectStructure, ragCtx] = await Promise.all([
+    ensureProjectStructureFile(input.cwd).catch(() => null),
+    input.db
+      ? git(input.cwd, ["rev-parse", "HEAD"])
+          .then(({ stdout }) =>
+            buildContextForQuery({
+              query: `${input.epicTitle} ${input.epicDescription}`.slice(0, 1000),
+              db: input.db!,
+              repoRoot: input.cwd,
+              commitHash: stdout.trim(),
+            })
+          )
+          .catch(() => null)
+      : Promise.resolve(null),
+  ]);
+
   const prompt = epicDecoderPlanModePrompt(
     input.epicTitle,
     input.epicDescription,
     input.userMessages,
-    projectStructure
+    projectStructure,
+    ragCtx
   );
 
   const { gateway } = input;

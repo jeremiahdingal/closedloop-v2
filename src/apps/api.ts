@@ -503,6 +503,7 @@ async function main() {
               epicDescription: sess.epicDescription,
               userMessages: sess.userMessages,
               sessionId: sess.id,
+              db,
               gateway,
               onStream: (event: AgentStreamPayload) => {
                 sess.streamChunks.push(event);
@@ -600,6 +601,7 @@ async function main() {
               epicDescription: sess.epicDescription,
               userMessages: sess.userMessages,
               sessionId: sess.id,
+              db,
               gateway,
               onStream: (event: AgentStreamPayload) => {
                 sess.streamChunks.push(event);
