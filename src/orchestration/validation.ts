@@ -125,9 +125,43 @@ export function validateFailureDecision(value: unknown): FailureDecision {
 
 export function parseJsonText(text: string): unknown {
   const trimmed = text.trim();
+
+  // 1. Prefer content inside <FINAL_JSON> tags
+  const tagged = trimmed.match(/<FINAL_JSON>([\s\S]*?)<\/FINAL_JSON>/i);
+  if (tagged) {
+    try { return JSON.parse(tagged[1].trim()); } catch {}
+  }
+
+  // 2. Fenced code block
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) {
+    try { return JSON.parse(fenced[1].trim()); } catch {}
+  }
+
+  // 3. Brace-balanced extraction — find first { or [ and walk to matching close
   const firstBrace = Math.min(
     ...[trimmed.indexOf("{"), trimmed.indexOf("[")].filter((index) => index >= 0)
   );
-  const jsonText = Number.isFinite(firstBrace) && firstBrace >= 0 ? trimmed.slice(firstBrace) : trimmed;
-  return JSON.parse(jsonText);
+  if (!Number.isFinite(firstBrace) || firstBrace < 0) return JSON.parse(trimmed);
+
+  const openChar = trimmed[firstBrace];
+  const closeChar = openChar === "{" ? "}" : "]";
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = firstBrace; i < trimmed.length; i++) {
+    const c = trimmed[i];
+    if (inString) {
+      if (escaped) { escaped = false; continue; }
+      if (c === "\\") { escaped = true; continue; }
+      if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === openChar) depth++;
+    else if (c === closeChar && --depth === 0) return JSON.parse(trimmed.slice(firstBrace, i + 1));
+  }
+
+  // 4. Last resort: slice from first brace to end
+  return JSON.parse(trimmed.slice(firstBrace));
 }

@@ -9,6 +9,7 @@ import type {
 export function epicDecoderPrompt(epic: EpicRecord): string {
   return [
     "You are the Goal Decomposer.",
+    "⚠️ EXECUTOR CONSTRAINT: Every ticket you create will be handed to a 20–30B parameter model with limited reasoning and a short context window. Tickets MUST be trivially simple — one cohesive change, touching 1–3 files at most, with no ambiguity. If a task seems big, split it into multiple tickets. Prefer 8 small tickets over 3 large ones.",
     "Return JSON only with shape:",
     JSON.stringify({
       summary: "string",
@@ -59,7 +60,7 @@ export function builderPrompt(ticket: TicketRecord, packet: TicketContextPacket)
     `Allowed paths: ${ticket.allowedPaths.join(", ") || "(none)"}`,
     `Review blockers: ${packet.reviewBlockers.join("; ") || "(none)"}`,
     `Prior test failures: ${packet.priorTestFailures.join("; ") || "(none)"}`,
-    `Read PROJECT_STRUCTURE.md first.`,
+    ...(packet.retrievedContext ? [] : [`Read PROJECT_STRUCTURE.md first.`]),
     "Generate only minimal targeted changes."
   );
 
@@ -70,7 +71,7 @@ export function builderToolingPrompt(ticket: TicketRecord, packet: TicketContext
   const sections = [
     "Work inside the current repository using the tools that are actually available in this session.",
     "Use read, glob, grep, edit, write, task, todowrite, and skill as sparingly.",
-    `Read PROJECT_STRUCTURE.md first.`,
+    ...(!packet.retrievedContext ? [`Read PROJECT_STRUCTURE.md first.`] : []),
     "Do not ask the user for clarification or request unavailable tools. Just inspect the workspace and make the change.",
   ];
 
@@ -267,6 +268,17 @@ export function epicDecoderToolingPrompt(
     "Understand the codebase structure, existing patterns, and conventions before decomposing the epic.",
     `Epic: ${epic.title}`,
     `Goal: ${epic.goalText}`,
+    [
+      "⚠️ EXECUTOR CONSTRAINT — read this before writing a single ticket:",
+      "Each ticket you create will be executed by a 20–30B parameter model. That model has limited reasoning capacity and a short context window.",
+      "This means every ticket MUST be:",
+      "  • Atomic — one coherent, self-contained change only",
+      "  • Narrow — touches 1–3 files at most; never spans the whole codebase",
+      "  • Explicit — the description and acceptance criteria must be so clear that no further discovery is needed",
+      "  • Small — the full change should fit comfortably in a single LLM response",
+      "If a task feels large or multi-faceted, SPLIT IT. Prefer 10 simple tickets over 4 complex ones.",
+      "Do NOT create tickets like 'Implement the feature end-to-end' or 'Refactor the module'. Break those into individual file-level changes.",
+    ].join("\n"),
   ];
 
   if (projectStructure) {
@@ -279,8 +291,8 @@ export function epicDecoderToolingPrompt(
     "Steps:",
     "1. Explore the repo structure with glob/grep and read key files",
     "2. Understand existing code patterns and architecture",
-    "3. Decompose the epic into well-scoped tickets",
-    "4. Each ticket should have clear acceptance criteria and allowed paths",
+    "3. Decompose the epic into atomic, file-scoped tickets (keep each one small!)",
+    "4. Each ticket must have literal acceptance criteria and tight allowedPaths",
     "After you finish, output exactly one FINAL_JSON block and nothing after it.",
     `<FINAL_JSON>${JSON.stringify({
       summary: "string",
@@ -371,6 +383,66 @@ export function epicReviewerCodexPrompt(
   return sections.join("\n\n");
 }
 
+export function ticketRedecomposerPrompt(
+  epic: EpicRecord,
+  ticket: TicketRecord,
+  reviewerBlockers: string[]
+): string {
+  const blockerBlock = reviewerBlockers.length
+    ? reviewerBlockers.map((b, i) => `  Attempt ${i + 1}: ${b}`).join("\n")
+    : "  (no recorded blockers — builder produced no diff or crashed)";
+
+  const sections: string[] = [
+    "You are the Ticket Re-decomposer.",
+    "A builder agent has exhausted its retry budget on the ticket below without producing an approved result.",
+    "Your job is NOT to fix the code yourself. Instead, analyse why the ticket was too broad or ambiguous for a 20–30B executor model, then re-decompose it into 2–4 simpler, strictly atomic sub-tickets.",
+    `Epic: ${epic.title}`,
+    `Epic Goal: ${epic.goalText}`,
+    [
+      "## Failed Ticket",
+      `Title: ${ticket.title}`,
+      `Description: ${ticket.description}`,
+      `Acceptance Criteria:\n${ticket.acceptanceCriteria.map((c) => `  - ${c}`).join("\n")}`,
+      `Allowed Paths: ${ticket.allowedPaths.join(", ") || "(unrestricted)"}`,
+    ].join("\n"),
+    [
+      "## Reviewer Blockers Across All Attempts",
+      blockerBlock,
+    ].join("\n"),
+    [
+      "## Instructions",
+      "1. Use read/glob/grep to inspect the specific files in allowedPaths",
+      "2. Understand precisely what the original ticket was asking for",
+      "3. Identify why the executor model kept failing — wrong API, too many files at once, ambiguous scope, etc.",
+      "4. Split the work into 2–4 sub-tickets, each touching at most 1–2 files",
+      "5. Every sub-ticket must be self-contained: its description alone must be enough to implement it with no additional discovery",
+    ].join("\n"),
+    [
+      "⚠️ EXECUTOR CONSTRAINT: Each sub-ticket will be run by a 20–30B model.",
+      "  • Atomic — one coherent change only",
+      "  • Narrow — 1–2 files at most; tight allowedPaths",
+      "  • Explicit — include the exact function/class name, file path, and expected signature in the description",
+      "  • No ambiguity — if the original ticket was vague, be precise here",
+      "Use IDs: RSUB1, RSUB2, RSUB3, RSUB4 (only as many as needed).",
+    ].join("\n"),
+    "After your analysis, output exactly one FINAL_JSON block and nothing after it.",
+    `<FINAL_JSON>${JSON.stringify({
+      summary: "string — why the original ticket failed and how you split it",
+      tickets: [{
+        id: "RSUB1",
+        title: "string",
+        description: "string — explicit enough that no further discovery is needed",
+        acceptanceCriteria: ["string"],
+        dependencies: [],
+        allowedPaths: ["string"],
+        priority: "high|medium|low"
+      }]
+    })}</FINAL_JSON>`,
+  ];
+
+  return sections.join("\n\n");
+}
+
 export function epicDecoderPlanModePrompt(
   epicTitle: string,
   epicDescription: string,
@@ -406,7 +478,20 @@ export function epicDecoderPlanModePrompt(
     "4. Decompose the epic into well-scoped, independently executable tickets",
     "5. Each ticket must have clear acceptance criteria, file scope (allowedPaths), dependencies, and priority",
     "Think carefully. Be specific about what each ticket changes and why.",
-    "When you are satisfied with the plan, output exactly one FINAL_JSON block:",
+    [
+      "⚠️ EXECUTOR CONSTRAINT — critical for ticket design:",
+      "Each ticket in the FINAL_JSON will be handed to a 20–30B parameter model with limited reasoning and a short context window.",
+      "Design every ticket so that model can succeed without needing to explore the broader codebase.",
+      "Rules for each ticket:",
+      "  • Atomic: one coherent change only — no 'and also' tickets",
+      "  • Narrow: 1–3 files touched at most; use tight allowedPaths",
+      "  • Self-contained: the description alone must be enough to implement it — no implicit knowledge required",
+      "  • Small: the change should fit in a single model response",
+      "When in doubt, split. 12 simple tickets are far better than 5 complex ones.",
+      "Avoid vague titles like 'Update module X' — be precise: 'Add exportFoo() to src/foo.ts'.",
+    ].join("\n"),
+    "## Required Output Format",
+    "Before outputting FINAL_JSON, you MUST write a structured analysis in plain text so the user can follow your reasoning. Use this exact format:\n\n## Codebase Analysis\n[Describe what you found: key files, existing patterns, relevant architecture, important types/interfaces]\n\n## What Exists vs What Needs Building\n[Enumerate what is already implemented and what is missing or incomplete]\n\n## Risks & Unknowns\n[List ambiguities, potential issues, or things that need clarification]\n\n## Ticket Overview\n[For each ticket: name, 1-sentence rationale, key files it touches]\n\nThen, after this analysis, output exactly one FINAL_JSON block:",
     `<FINAL_JSON>${JSON.stringify({
       summary: "brief summary of overall plan",
       tickets: [{

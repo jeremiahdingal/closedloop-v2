@@ -1259,8 +1259,191 @@ body::after {
 }
 
 .ticket-modal {
-  max-width: 700px;
+  max-width: 1300px;
+  width: 95vw;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
 }
+
+/* ── Ticket modal 2-column layout ── */
+.ticket-modal-body {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ticket-modal-left {
+  width: 42%;
+  min-width: 320px;
+  overflow-y: auto;
+  padding: 1rem;
+  border-right: 2px solid var(--win-gray-dark);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.ticket-modal-right {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #fff;
+}
+
+.ticket-events-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--win-gray);
+  border-bottom: 2px solid var(--win-gray-dark);
+  flex-shrink: 0;
+}
+
+.ticket-events-count {
+  background: var(--win-blue);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0.1rem 0.4rem;
+  border-radius: 2px;
+}
+
+.ticket-events-feed {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.5rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+/* ── Agent Event Card ── */
+.ticket-event-item {
+  border-bottom: 1px solid var(--win-gray);
+  padding: 0.4rem 0;
+}
+
+.tev-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 0.2rem;
+}
+
+.tev-time {
+  color: var(--win-gray-dark);
+  font-family: 'Fira Code', monospace;
+  font-size: 0.68rem;
+  flex-shrink: 0;
+}
+
+.tev-role {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #1a3d6b;
+  background: #dde8f8;
+  border: 1px solid #aac0e0;
+  padding: 0.05rem 0.35rem;
+  border-radius: 2px;
+}
+
+.tev-source {
+  font-size: 0.66rem;
+  color: #666;
+  background: #e8e8e8;
+  border: 1px solid #ccc;
+  padding: 0.05rem 0.3rem;
+  border-radius: 2px;
+  font-family: 'Fira Code', monospace;
+}
+
+/* streamKind pill */
+.tev-kind {
+  font-size: 0.64rem;
+  font-weight: 700;
+  padding: 0.05rem 0.3rem;
+  border-radius: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.tev-kind-pill-tool_call  { background: #fff0cc; color: #7a5000; border: 1px solid #e0b040; }
+.tev-kind-pill-assistant  { background: #ddeeff; color: #003a80; border: 1px solid #88aadd; }
+.tev-kind-pill-thinking   { background: #ede8ff; color: #5020a0; border: 1px solid #b09de0; }
+.tev-kind-pill-status     { background: #e8e8e8; color: #444;    border: 1px solid #bbb; }
+.tev-kind-pill-stderr     { background: #ffe0e0; color: #800;    border: 1px solid #e09090; }
+.tev-kind-pill-stdout     { background: #e0f0e0; color: #244;    border: 1px solid #90c090; }
+.tev-kind-pill-raw        { background: #f0f0f0; color: #555;    border: 1px solid #ccc; }
+.tev-kind-pill-sys        { background: #f0f0f0; color: #555;    border: 1px solid #ccc; }
+
+.tev-model {
+  font-size: 0.64rem;
+  color: #3a6020;
+  background: #e4f2d8;
+  border: 1px solid #90c060;
+  padding: 0.05rem 0.35rem;
+  border-radius: 2px;
+  font-family: 'Fira Code', monospace;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tev-err-flag { color: #c00; font-size: 0.75rem; }
+.tev-think-flag { color: #7040c0; font-size: 0.75rem; }
+
+.tev-body {
+  margin-top: 0.1rem;
+}
+
+/* Tool call body */
+.tev-tool-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.tev-tool-name {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #7a4000;
+  font-family: 'Fira Code', monospace;
+}
+.tev-tool-args {
+  font-size: 0.72rem;
+  font-family: 'Fira Code', monospace;
+  background: #fffaf0;
+  border: 1px solid #e8d090;
+  padding: 0.25rem 0.4rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #4a3000;
+  max-height: 120px;
+  overflow-y: auto;
+  border-radius: 1px;
+}
+
+/* Plain text content */
+.tev-text-content {
+  font-size: 0.76rem;
+  font-family: 'Fira Code', monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #222;
+  line-height: 1.45;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+/* Colour tint entire card per kind */
+.tev-kind-tool_call { background: #fffdf5; }
+.tev-kind-stderr    { background: #fff8f8; }
+.tev-kind-thinking  { background: #faf8ff; }
 
 .modal-body {
   padding: 1rem;
@@ -1469,6 +1652,59 @@ body::after {
   margin-bottom: 1rem;
 }
 
+/* ── Epic Modal (full-size, uniform with Planning Modal) ── */
+.epic-modal {
+  max-width: 1400px;
+  width: 96vw;
+  height: 90vh;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.epic-main-section {
+  margin-bottom: 1.25rem;
+  padding-bottom: 1rem;
+  border-bottom: 2px solid var(--win-gray-dark);
+}
+.epic-main-section:last-child { border-bottom: none; margin-bottom: 0; }
+
+.epic-main-section-label {
+  font-family: 'VT323', monospace;
+  font-size: 1.15rem;
+  color: var(--win-blue);
+  border-bottom: 2px solid var(--win-blue);
+  padding-bottom: 0.2rem;
+  margin-bottom: 0.6rem;
+  letter-spacing: 0.04em;
+}
+
+.epic-sidebar-meta { padding: 0.3rem 0.4rem; }
+
+.epic-meta-row {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.15rem 0.25rem;
+  align-items: flex-start;
+}
+.epic-meta-label {
+  color: var(--win-gray-dark);
+  min-width: 52px;
+  font-weight: 700;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.68rem;
+  flex-shrink: 0;
+  margin-top: 0.05rem;
+}
+.epic-meta-value {
+  color: #111;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.68rem;
+  word-break: break-all;
+  line-height: 1.35;
+}
+
+/* keep old epic-detail-* for any other uses */
 .epic-detail-header {
   display: flex;
   align-items: center;
@@ -2205,18 +2441,132 @@ body::after {
    ========================================================= */
 
 .planning-modal {
-  max-width: 900px;
+  max-width: 1400px;
   width: 96vw;
-  max-height: 92vh;
+  height: 90vh;
+  max-height: 90vh;
   display: flex;
   flex-direction: column;
 }
 
-.planning-modal .modal-stream-list {
+/* ── Two-column body ── */
+.planning-modal-body {
+  display: flex;
   flex: 1;
-  min-height: 180px;
-  max-height: 400px;
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* ── Sidebar ── */
+.planning-modal-sidebar {
+  width: 240px;
+  min-width: 240px;
+  border-right: 2px solid var(--win-gray-dark);
   overflow-y: auto;
+  background: #f4f4f4;
+  display: flex;
+  flex-direction: column;
+}
+
+.plan-nav-group {
+  border-bottom: 1px solid var(--win-gray-dark);
+  padding-bottom: 0.4rem;
+}
+.plan-nav-group:last-child { border-bottom: none; }
+
+.plan-nav-group-label {
+  font-family: 'VT323', monospace;
+  font-size: 0.85rem;
+  color: var(--win-gray-dark);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 0.45rem 0.65rem 0.2rem;
+  border-bottom: 1px dashed var(--win-gray-dark);
+  margin-bottom: 0.15rem;
+}
+
+.plan-nav-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.1s;
+}
+.plan-nav-item:hover { background: var(--win-blue); color: #fff; }
+.plan-nav-h1 { padding: 0.28rem 0.65rem; font-size: 0.82rem; font-weight: 700; color: #111; }
+.plan-nav-h2 { padding: 0.28rem 0.65rem; font-size: 0.82rem; font-weight: 600; color: #222; }
+.plan-nav-h3 { padding: 0.22rem 0.65rem 0.22rem 1.2rem; font-size: 0.76rem; color: #444; }
+
+.plan-nav-summary {
+  font-size: 0.73rem;
+  color: #555;
+  font-style: italic;
+  padding: 0.25rem 0.65rem 0.3rem;
+  border-bottom: 1px dashed #ccc;
+  line-height: 1.4;
+}
+
+.plan-nav-ticket {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+  padding: 0.3rem 0.6rem;
+  border-bottom: 1px solid #e8e8e8;
+}
+.plan-nav-ticket:last-child { border-bottom: none; }
+.plan-nav-ticket:hover { background: #e8f0fe; }
+
+.plan-nav-ticket-num {
+  background: var(--win-blue);
+  color: #fff;
+  min-width: 1.2rem;
+  height: 1.2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.68rem;
+  font-weight: bold;
+  flex-shrink: 0;
+  margin-top: 0.1rem;
+}
+
+.plan-nav-ticket-body { flex: 1; min-width: 0; }
+.plan-nav-ticket-title {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #111;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.plan-nav-ticket-priority { font-size: 0.67rem; margin-top: 0.1rem; display: block; }
+
+.plan-nav-empty {
+  font-size: 0.78rem;
+  color: #999;
+  font-style: italic;
+  padding: 0.75rem 0.65rem;
+}
+
+/* ── Main scroll area ── */
+.planning-modal-main {
+  flex: 1;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+.planning-modal .modal-stream-list {
+  overflow-y: visible;
+  min-height: auto;
+  max-height: none;
+  padding: 0.75rem 1rem;
 }
 
 /* Stream item variants */
@@ -2434,6 +2784,119 @@ body::after {
 }
 .planning-modal-input:focus { border-color: var(--win-blue); }
 
+/* ── Branch bar ── */
+.planning-modal-branch-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.75rem 0.4rem;
+  background: var(--win-gray);
+  border-top: 1px solid var(--win-gray-dark);
+}
+
+.plan-branch-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #444;
+  white-space: nowrap;
+}
+
+.plan-branch-input {
+  flex: 1;
+  background: #fff;
+  border: 2px inset var(--win-gray-dark);
+  padding: 0.25rem 0.5rem;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.82rem;
+  color: #222;
+  outline: none;
+  max-width: 380px;
+}
+.plan-branch-input:focus { border-color: var(--win-blue); }
+.plan-branch-input::placeholder { color: #999; font-style: italic; }
+
+/* ── Phase 2 toolbar ── */
+.plan-phase2-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--win-gray-dark);
+  background: var(--win-gray-light);
+}
+
+.plan-raw-toggle {
+  font-size: 0.78rem;
+  padding: 0.2rem 0.6rem;
+}
+
+/* ── Terminal output (Phase 1 + raw toggle) ── */
+.plan-terminal-wrap {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: #0d0d0d;
+}
+
+.plan-terminal-wrap--inline {
+  height: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.plan-terminal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.3rem 0.75rem;
+  background: #1a1a1a;
+  border-bottom: 1px solid #333;
+  flex-shrink: 0;
+}
+
+.plan-terminal-title {
+  font-family: 'Fira Code', monospace;
+  font-size: 0.75rem;
+  color: var(--arcade-green);
+  letter-spacing: 0.05em;
+}
+
+.plan-terminal-chars {
+  font-family: 'Fira Code', monospace;
+  font-size: 0.68rem;
+  color: #555;
+}
+
+.plan-terminal-output {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.75rem 1rem;
+  margin: 0;
+  background: #0d0d0d;
+  color: #e0e0e0;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.plan-terminal-output--inline {
+  max-height: 520px;
+  flex: none;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+.plan-terminal-cursor {
+  display: inline-block;
+  animation: blink 1s step-start infinite;
+  color: var(--arcade-green);
+}
+
 /* ── Approve button ── */
 .plan-approve-btn {
   background: #006400;
@@ -2450,6 +2913,30 @@ body::after {
   border-color: var(--win-gray-dark);
   cursor: not-allowed;
 }
+
+/* ── Modal action buttons ── */
+
+/* Base: remove ◆ pseudo, keep gray bg */
+.btn[class*="btn-modal"]::before { content: none; }
+.btn[class*="btn-modal"] {
+  background: var(--win-gray);
+  color: #111;
+  font-weight: 600;
+  border-style: solid;
+  border-width: 2px;
+}
+
+.btn-modal-rerun,
+.btn-modal-retry  { border-color: #3a7bd5; }
+.btn-modal-review { border-color: #2a8f80; }
+.btn-modal-force  { border-color: #7c5cbf; }
+.btn-modal-rescue { border-color: #3a8f50; }
+.btn-modal-cancel { border-color: #b06010; color: #7a3d00; }
+.btn-modal-delete { border-color: #c03030; color: #8b0000; }
+.btn-modal-ok     { border-color: var(--win-gray-dark); }
+
+.btn[class*="btn-modal"]:hover:not(:disabled) { background: var(--win-gray-light); }
+.btn[class*="btn-modal"]:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* ── Status badge ── */
 .plan-status-badge {

@@ -39,18 +39,29 @@ export interface PlanRunResult {
  * and never creates runs, tickets, or epics.
  */
 export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult> {
+  const emit = (content: string) =>
+    input.onStream?.({
+      agentRole: "epicDecoder",
+      source: "orchestrator",
+      streamKind: "status",
+      content,
+      sequence: 0,
+    });
+
+  emit("Loading project structure…");
   const [projectStructure, ragCtx] = await Promise.all([
     ensureProjectStructureFile(input.cwd).catch(() => null),
     input.db
       ? git(input.cwd, ["rev-parse", "HEAD"])
-          .then(({ stdout }) =>
-            buildContextForQuery({
+          .then(({ stdout }) => {
+            emit("Building RAG context…");
+            return buildContextForQuery({
               query: `${input.epicTitle} ${input.epicDescription}`.slice(0, 1000),
               db: input.db!,
               repoRoot: input.cwd,
               commitHash: stdout.trim(),
-            })
-          )
+            });
+          })
           .catch(() => null)
       : Promise.resolve(null),
   ]);
@@ -122,6 +133,7 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
   }
 
   // Pure Ollama fallback — response is prose with embedded FINAL_JSON block
+  emit("Querying model (no streaming on this path — output will appear when complete)…");
   const rawText = await gateway.rawPrompt("epicDecoder", prompt);
   const plan = validateGoalDecomposition(parseJsonText(rawText));
   return { plan, rawText };

@@ -505,17 +505,20 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
             runId: input.runId,
             epicId: input.epicId,
             sequence: 0,
+            metadata: { model },
           });
         }
         if (event.kind === "tool_call") {
+          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
           input.onStream?.({
             agentRole: "epicDecoder",
             source: "mediated-harness",
-            streamKind: "status",
-            content: `Tool: ${event.call.name}`,
+            streamKind: "tool_call",
+            content: `${event.call.name}(${argsPreview})`,
             runId: input.runId,
             epicId: input.epicId,
             sequence: 0,
+            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
           });
         }
         if (event.kind === "complete") {
@@ -527,6 +530,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
             runId: input.runId,
             epicId: input.epicId,
             sequence: 0,
+            metadata: { model },
           });
         }
       },
@@ -586,17 +590,32 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
             runId: input.runId,
             epicId: input.epicId,
             sequence: 0,
+            metadata: { model },
           });
         }
         if (event.kind === "tool_call") {
+          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
+          input.onStream?.({
+            agentRole: "epicReviewer",
+            source: "mediated-harness",
+            streamKind: "tool_call",
+            content: `${event.call.name}(${argsPreview})`,
+            runId: input.runId,
+            epicId: input.epicId,
+            sequence: 0,
+            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
+          });
+        }
+        if (event.kind === "complete") {
           input.onStream?.({
             agentRole: "epicReviewer",
             source: "mediated-harness",
             streamKind: "status",
-            content: `Tool: ${event.call.name}`,
+            content: `Completed in ${event.iterations} iterations`,
             runId: input.runId,
             epicId: input.epicId,
             sequence: 0,
+            metadata: { model },
           });
         }
       },
@@ -712,18 +731,34 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
             ticketId: input.ticketId,
             epicId: input.epicId,
             sequence: 0,
+            metadata: { model },
           });
         }
         if (event.kind === "tool_call") {
+          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
           input.onStream?.({
             agentRole: "tester",
             source: "mediated-harness",
-            streamKind: "status",
-            content: `Tool: ${event.call.name}`,
+            streamKind: "tool_call",
+            content: `${event.call.name}(${argsPreview})`,
             runId: input.runId,
             ticketId: input.ticketId,
             epicId: input.epicId,
             sequence: 0,
+            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
+          });
+        }
+        if (event.kind === "complete") {
+          input.onStream?.({
+            agentRole: "tester",
+            source: "mediated-harness",
+            streamKind: "status",
+            content: `Completed in ${event.iterations} iterations`,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+            metadata: { model },
           });
         }
       },
@@ -784,7 +819,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     });
 
     const result = await harness.run("builder", toolMode === "xml" ? this.buildBuilderXmlPrompt(input.prompt) : input.prompt, {
-      maxIterations: 50,
+      maxIterations: 100,
       timeoutMs: 1_800_000,
       toolMode,
       onEvent: (event) => {
@@ -798,18 +833,21 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
             ticketId: input.ticketId,
             epicId: input.epicId,
             sequence: 0,
+            metadata: { model },
           });
         }
         if (event.kind === "tool_call") {
+          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
           input.onStream?.({
             agentRole: "builder",
             source: "mediated-harness",
-            streamKind: "status",
-            content: `Tool: ${event.call.name}`,
+            streamKind: "tool_call",
+            content: `${event.call.name}(${argsPreview})`,
             runId: input.runId,
             ticketId: input.ticketId,
             epicId: input.epicId,
             sequence: 0,
+            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
           });
         }
         if (event.kind === "tool_error") {
@@ -822,6 +860,20 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
             ticketId: input.ticketId,
             epicId: input.epicId,
             sequence: 0,
+            metadata: { model },
+          });
+        }
+        if (event.kind === "complete") {
+          input.onStream?.({
+            agentRole: "builder",
+            source: "mediated-harness",
+            streamKind: "status",
+            content: `Completed in ${event.iterations} iterations`,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+            metadata: { model },
           });
         }
       },

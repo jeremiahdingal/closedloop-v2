@@ -17,6 +17,7 @@ type PlanSession = {
   epicTitle: string;
   epicDescription: string;
   targetDir: string;
+  targetBranch: string | null;
   userMessages: string[];
   latestPlan: GoalDecomposition | null;
   status: "running" | "idle" | "error";
@@ -227,6 +228,15 @@ async function main() {
         const epic = db.getEpic(epicId);
         if (!epic) return json(res, 404, { error: "epic_not_found" });
         const runId = await goalRunner.enqueueManualReview(epicId);
+        return json(res, 200, { ok: true, epicId, runId });
+      }
+      const retryEpicMatch = /^\/api\/epics\/([^/]+)\/retry$/.exec(url.pathname);
+      if (retryEpicMatch && req.method === "POST") {
+        const epicId = decodeURIComponent(retryEpicMatch[1]);
+        const epic = db.getEpic(epicId);
+        if (!epic) return json(res, 404, { error: "epic_not_found" });
+        db.updateEpicStatus(epicId, "executing");
+        const runId = await goalRunner.enqueueGoal(epicId);
         return json(res, 200, { ok: true, epicId, runId });
       }
       const deleteEpicMatch = /^\/api\/epics\/([^/]+)$/.exec(url.pathname);
@@ -478,12 +488,14 @@ async function main() {
         const epicDescription = String(body.epicDescription || "");
         const targetDir = String(body.targetDir || process.cwd());
 
+        const targetBranch = body.targetBranch ? String(body.targetBranch) : null;
         const sessionId = randomId("plan");
         const session: PlanSession = {
           id: sessionId,
           epicTitle,
           epicDescription,
           targetDir,
+          targetBranch,
           userMessages: [],
           latestPlan: null,
           status: "running",
@@ -497,7 +509,7 @@ async function main() {
         const runSession = async (sess: PlanSession) => {
           try {
             const gateway = (goalRunner as any).gateway;
-            await runPlanDecoder({
+            const result = await runPlanDecoder({
               cwd: sess.targetDir,
               epicTitle: sess.epicTitle,
               epicDescription: sess.epicDescription,
@@ -514,6 +526,19 @@ async function main() {
                 }
               },
             });
+            // Ollama fallback: onStream was never called — push rawText as a stream chunk
+            if (!sess.latestPlan) {
+              sess.latestPlan = result.plan;
+              if (result.rawText) {
+                sess.streamChunks.push({
+                  agentRole: "epicDecoder",
+                  source: "orchestrator",
+                  streamKind: "assistant",
+                  content: result.rawText,
+                  sequence: sess.streamChunks.length,
+                });
+              }
+            }
           } catch (err) {
             sess.streamChunks.push({
               agentRole: "epicDecoder",
@@ -531,6 +556,8 @@ async function main() {
             sess.userMessages.push(...sess.pendingMessages);
             sess.pendingMessages = [];
             sess.textChunks = [];
+            sess.latestPlan = null;
+            sess.streamChunks.push({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "plan_cleared", content: "", sequence: sess.streamChunks.length });
             sess.status = "running";
             void runSession(sess);
           }
@@ -590,12 +617,13 @@ async function main() {
         // Re-run with new message
         session.userMessages.push(message);
         session.textChunks = [];
+        session.streamChunks.push({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "plan_cleared", content: "", sequence: session.streamChunks.length });
         session.latestPlan = null;
         session.status = "running";
         const gateway = (goalRunner as any).gateway;
         const runSession = async (sess: PlanSession) => {
           try {
-            await runPlanDecoder({
+            const result = await runPlanDecoder({
               cwd: sess.targetDir,
               epicTitle: sess.epicTitle,
               epicDescription: sess.epicDescription,
@@ -612,6 +640,18 @@ async function main() {
                 }
               },
             });
+            if (!sess.latestPlan) {
+              sess.latestPlan = result.plan;
+              if (result.rawText) {
+                sess.streamChunks.push({
+                  agentRole: "epicDecoder",
+                  source: "orchestrator",
+                  streamKind: "assistant",
+                  content: result.rawText,
+                  sequence: sess.streamChunks.length,
+                });
+              }
+            }
           } catch (err) {
             sess.streamChunks.push({
               agentRole: "epicDecoder",
@@ -628,6 +668,8 @@ async function main() {
             sess.userMessages.push(...sess.pendingMessages);
             sess.pendingMessages = [];
             sess.textChunks = [];
+            sess.latestPlan = null;
+            sess.streamChunks.push({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "plan_cleared", content: "", sequence: sess.streamChunks.length });
             sess.status = "running";
             void runSession(sess);
           }
@@ -643,12 +685,30 @@ async function main() {
         if (!session) return json(res, 404, { error: "plan_session_not_found" });
         if (!session.latestPlan) return json(res, 409, { error: "no_plan_ready", message: "The planner has not produced a plan yet." });
 
+        const approveBody = await readBody(req);
+        // Allow approve-time override; fall back to branch set at session creation
+        const resolvedBranch = (approveBody.targetBranch ? String(approveBody.targetBranch) : null) ?? session.targetBranch ?? undefined;
+
         const epic = GoalRunner.createEpic(db, {
           title: session.epicTitle,
           goalText: session.epicDescription,
           targetDir: session.targetDir,
+          targetBranch: resolvedBranch || undefined,
         });
         const runId = await goalRunner.approveFromPlan(epic.id, session.latestPlan);
+        // Persist plan analysis stream as agent_stream events so the epic modal can display them
+        for (const chunk of session.streamChunks) {
+          if (!chunk.content) continue;
+          db.recordEvent({
+            aggregateType: "epic",
+            aggregateId: epic.id,
+            runId: null,
+            ticketId: null,
+            kind: "agent_stream",
+            message: `planAnalysis:${chunk.streamKind || "assistant"}`,
+            payload: { ...chunk, agentRole: "planAnalysis", epicId: epic.id, runId: null, ticketId: null } as any,
+          });
+        }
         planSessions.delete(sessionId);
         return json(res, 201, { epicId: epic.id, runId });
       }

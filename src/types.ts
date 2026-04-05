@@ -183,7 +183,7 @@ export type WriteFileInput = {
 export type AgentStreamPayload = {
   agentRole: AgentRole;
   source: "opencode" | "orchestrator" | "mediated-harness";
-  streamKind: "stdout" | "stderr" | "thinking" | "assistant" | "system" | "status" | "raw";
+  streamKind: "stdout" | "stderr" | "thinking" | "assistant" | "system" | "status" | "raw" | "tool_call" | "plan_cleared";
   content: string;
   runId?: string | null;
   ticketId?: string | null;
