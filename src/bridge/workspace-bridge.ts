@@ -504,8 +504,9 @@ export class WorkspaceBridge {
     const tempWorktreePath = path.join(this.config.workspacesDir, tempId);
     await ensureDir(this.config.workspacesDir);
 
-    // Create worktree from the existing branch
-    await git(repoRoot, ["worktree", "add", tempWorktreePath, branchName]);
+    // Use detached HEAD pointing at the branch tip — avoids "already in use" error
+    // when the branch is currently checked out in another active worktree.
+    await git(repoRoot, ["worktree", "add", "--detach", tempWorktreePath, branchName]);
     return tempWorktreePath;
   }
 

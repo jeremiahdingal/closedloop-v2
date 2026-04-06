@@ -8,6 +8,7 @@ import { loadConfig, updateAgentModel } from "../config.ts";
 import type { AgentRole, AgentStreamPayload, GoalDecomposition } from "../types.ts";
 import { runPlanDecoder, extractPlanFromStream } from "../orchestration/plan-runner.ts";
 import { randomId } from "../utils.ts";
+import { git } from "../bridge/git.ts";
 
 // ---------------------------------------------------------------------------
 // In-memory plan session store (ephemeral — lost on server restart, by design)
@@ -453,7 +454,11 @@ async function main() {
       if (url.pathname === "/api/config" && req.method === "GET") {
         const configPath = path.join(process.cwd(), "config", "workspace.json");
         const wsConfig = existsSync(configPath) ? JSON.parse(await readFile(configPath, "utf8")) : {};
-        return json(res, 200, { ...wsConfig, models: getAgentModelsConfig() });
+        const repoRoot = typeof wsConfig.targetDir === "string" ? wsConfig.targetDir : process.cwd();
+        const currentBranch = await git(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
+          .then(r => r.stdout.trim())
+          .catch(() => null);
+        return json(res, 200, { ...wsConfig, currentBranch, models: getAgentModelsConfig() });
       }
       if (url.pathname === "/api/models" && req.method === "GET") {
         return json(res, 200, getAgentModelsConfig());

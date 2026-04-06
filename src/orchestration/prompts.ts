@@ -383,6 +383,40 @@ export function epicReviewerCodexPrompt(
   return sections.join("\n\n");
 }
 
+/**
+ * Prompt for a build-fix pass: the reviewer already ran once, build checks
+ * revealed errors, and now the model must fix them directly.
+ */
+export function epicReviewerBuildFixPrompt(
+  epic: EpicRecord,
+  _tickets: TicketRecord[],
+  buildErrors: string,
+  round: number
+): string {
+  return [
+    `You are the Epic Reviewer performing build-fix pass ${round}.`,
+    "The codebase still has build / typecheck errors that must be resolved before this epic can be approved.",
+    "",
+    "## Build / typecheck errors",
+    buildErrors,
+    "",
+    `## Epic: ${epic.title}`,
+    epic.goalText,
+    "",
+    "## Instructions",
+    "1. Read each file mentioned in the errors above.",
+    "2. Fix every error by editing the relevant source files.",
+    "3. You may edit ANY file in the codebase needed to resolve the errors — do not limit yourself to specific paths.",
+    "4. When all errors are resolved, output exactly one FINAL_JSON block:",
+    '<FINAL_JSON>{"verdict":"approved","summary":"Fixed all build errors.","followupTickets":[]}</FINAL_JSON>',
+    "",
+    "If errors remain that you cannot fix, describe them as follow-up tickets:",
+    '<FINAL_JSON>{"verdict":"needs_followups","summary":"...","followupTickets":[{"id":"BUILD-FIX-1","title":"Fix remaining build errors","description":"...","acceptanceCriteria":["All typecheck errors resolved"],"priority":"high","dependencies":[],"allowedPaths":["src/"]}]}</FINAL_JSON>',
+    "",
+    "Focus entirely on fixing the errors. Do NOT make unrelated changes.",
+  ].join("\n");
+}
+
 export function ticketRedecomposerPrompt(
   epic: EpicRecord,
   ticket: TicketRecord,

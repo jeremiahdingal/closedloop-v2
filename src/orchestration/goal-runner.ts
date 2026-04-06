@@ -1,10 +1,10 @@
-import { writeFile, mkdir } from "node:fs/promises";
+import { writeFile, mkdir, symlink, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import { AppDatabase } from "../db/database.ts";
 import { randomId, nowIso } from "../utils.ts";
-import { epicDecoderPrompt, epicDecoderToolingPrompt, epicReviewerPrompt, epicReviewerToolingPrompt, epicReviewerCodexPrompt, ticketRedecomposerPrompt } from "./prompts.ts";
+import { epicDecoderPrompt, epicDecoderToolingPrompt, epicReviewerPrompt, epicReviewerToolingPrompt, epicReviewerCodexPrompt, epicReviewerBuildFixPrompt, ticketRedecomposerPrompt } from "./prompts.ts";
 import type { ModelGateway } from "./models.ts";
-import type { AgentStreamPayload, EpicRecord, GoalDecomposition, GoalTicketPlan, TicketRecord } from "../types.ts";
+import type { AgentStreamPayload, EpicRecord, GoalDecomposition, GoalReview, GoalTicketPlan, TicketRecord } from "../types.ts";
 import { TicketRunner } from "./ticket-runner.ts";
 import { loadConfig } from "../config.ts";
 import { loadLangGraphRuntime, type LangGraphRuntime } from "./langgraph-loader.ts";
@@ -963,6 +963,137 @@ export class GoalRunner {
     return newTickets;
   }
 
+  private async ensureNodeModulesLinked(worktreePath: string, epicTargetDir: string): Promise<void> {
+    const linkPath = `${worktreePath}/node_modules`;
+    const targetPath = `${epicTargetDir}/node_modules`;
+    try {
+      await stat(linkPath);
+      // Already exists — nothing to do
+    } catch {
+      try {
+        await symlink(targetPath, linkPath, "junction");
+      } catch (err) {
+        console.warn(`[EpicReview] Could not link node_modules: ${err}`);
+      }
+    }
+  }
+
+  private async runBuildChecks(
+    workspaceId: string,
+    worktreePath: string,
+    epicTargetDir: string,
+    runId: string,
+    epicId: string
+  ): Promise<{ passed: boolean; output: string }> {
+    await this.ensureNodeModulesLinked(worktreePath, epicTargetDir);
+    const parts: string[] = [];
+    const tcResult = await this.bridge.runNamedCommand({
+      workspaceId,
+      runId,
+      ticketId: `${epicId}__BUILD_CHECK`,
+      nodeName: "epicReviewer",
+      commandName: "typecheck",
+      timeoutMs: 120_000
+    });
+    parts.push(`=== typecheck (exit ${tcResult.exitCode}) ===\n${tcResult.stdout}\n${tcResult.stderr}`.trim());
+    let passed = tcResult.exitCode === 0;
+
+    if (process.env.EPIC_REVIEW_RUN_TESTS === "1") {
+      const testResult = await this.bridge.runNamedCommand({
+        workspaceId,
+        runId,
+        ticketId: `${epicId}__BUILD_CHECK`,
+        nodeName: "epicReviewer",
+        commandName: "test",
+        timeoutMs: 300_000
+      });
+      parts.push(`=== test (exit ${testResult.exitCode}) ===\n${testResult.stdout}\n${testResult.stderr}`.trim());
+      if (testResult.exitCode !== 0) passed = false;
+    }
+
+    return { passed, output: parts.join("\n\n") };
+  }
+
+  private async callEpicReviewerModel(opts: {
+    reviewEpic: EpicRecord;
+    tickets: TicketRecord[];
+    ragCtx: { codeContext: string; docContext: string; indexId: number | null } | null;
+    projectStructure: string | null;
+    runId: string;
+    epicId: string;
+    codexPrompt: string;
+    toolingPrompt: string;
+    ollamaPrompt: string;
+  }): Promise<GoalReview> {
+    const { reviewEpic, tickets, ragCtx, runId, epicId, codexPrompt, toolingPrompt, ollamaPrompt } = opts;
+
+    if (this.gateway.models.epicReviewer === "qwen-cli" && this.gateway.runEpicReviewerCodex) {
+      try {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: "Goal review started via Qwen CLI (forced)...", runId, epicId, sequence: 0 });
+        const review = await this.withTimeout(
+          this.gateway.runEpicReviewerCodex({ cwd: reviewEpic.targetDir, prompt: codexPrompt, runId, epicId, onStream: (e: AgentStreamPayload) => this.recordAgentStream(e) }),
+          this.epicReviewTimeoutMs, `Epic reviewer timed out after ${this.epicReviewTimeoutMs}ms`
+        );
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} - ${review.summary}`, runId, epicId, sequence: 1, done: true });
+        return review;
+      } catch (err) {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "stderr", content: `${formatQwenFailure(err)}. Retrying with codex path.`, runId, epicId, sequence: 0 });
+      }
+    }
+
+    if (this.gateway.runEpicReviewerCodex && (this.gateway.models.epicReviewer === "codex-cli" || this.gateway.models.epicReviewer === "qwen-cli")) {
+      try {
+        const via = this.gateway.models.epicReviewer === "qwen-cli" ? "Qwen CLI" : "Codex";
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: `Goal review started via ${via}...`, runId, epicId, sequence: 0 });
+        const review = await this.withTimeout(
+          this.gateway.runEpicReviewerCodex({ cwd: reviewEpic.targetDir, prompt: codexPrompt, runId, epicId, onStream: (e: AgentStreamPayload) => this.recordAgentStream(e) }),
+          this.epicReviewTimeoutMs, `Epic reviewer timed out after ${this.epicReviewTimeoutMs}ms`
+        );
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} - ${review.summary}`, runId, epicId, sequence: 1, done: true });
+        return review;
+      } catch (err) {
+        const details = this.gateway.models.epicReviewer === "qwen-cli" ? formatQwenFailure(err) : formatCodexFailure(err);
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "stderr", content: `${details}. Falling back to OpenCode.`, runId, epicId, sequence: 0 });
+      }
+    }
+
+    if (this.gateway.runGoalReviewInWorkspace && !this.gateway.models.epicReviewer.startsWith("mediated:")) {
+      try {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: "Goal review started via OpenCode...", runId, epicId, sequence: 0 });
+        const review = await this.withTimeout(
+          this.gateway.runGoalReviewInWorkspace({ cwd: reviewEpic.targetDir, prompt: toolingPrompt, runId, epicId, onStream: (e: AgentStreamPayload) => this.recordAgentStream(e) }),
+          this.epicReviewTimeoutMs, `Epic reviewer timed out after ${this.epicReviewTimeoutMs}ms`
+        );
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} - ${review.summary}`, runId, epicId, sequence: 1, done: true });
+        return review;
+      } catch (err) {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "stderr", content: `${formatOpenCodeFailure(err)}. Falling back to Ollama.`, runId, epicId, sequence: 0 });
+      }
+    }
+
+    if (this.gateway.runGoalReviewInWorkspace && this.gateway.models.epicReviewer.startsWith("mediated:")) {
+      try {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: "Goal review started via mediated agent harness...", runId, epicId, sequence: 0 });
+        const review = await this.withTimeout(
+          this.gateway.runGoalReviewInWorkspace({ cwd: reviewEpic.targetDir, prompt: toolingPrompt, runId, epicId, ragIndexId: ragCtx?.indexId ?? undefined, db: this.db, onStream: (e: AgentStreamPayload) => this.recordAgentStream(e) }),
+          this.epicReviewTimeoutMs, `Epic reviewer timed out after ${this.epicReviewTimeoutMs}ms`
+        );
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} - ${review.summary}`, runId, epicId, sequence: 1, done: true });
+        return review;
+      } catch (err) {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "stderr", content: `Mediated harness failed: ${err instanceof Error ? err.message : String(err)}. Falling back to Ollama.`, runId, epicId, sequence: 0 });
+      }
+    }
+
+    this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: "Goal review started via Ollama...", runId, epicId, sequence: 0 });
+    const review = await this.withTimeout(
+      this.gateway.getGoalReview(ollamaPrompt),
+      this.epicReviewTimeoutMs, `Epic reviewer timed out after ${this.epicReviewTimeoutMs}ms`
+    );
+    this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} - ${review.summary}`, runId, epicId, sequence: 1, done: true });
+    return review;
+  }
+
   private async runEpicReview(epic: EpicRecord, tickets: TicketRecord[], runId: string) {
     const reviewWorkspace = await this.bridge.createWorkspace({
       ticketId: `${epic.id}__EPIC_REVIEW`,
@@ -1004,126 +1135,71 @@ export class GoalRunner {
       return review;
     };
 
-    try {
-    if (this.gateway.models.epicReviewer === "qwen-cli" && this.gateway.runEpicReviewerCodex) {
-      try {
-        this.recordAgentStream({
-          agentRole: "epicReviewer",
-          source: "orchestrator",
-          streamKind: "status",
-          content: "Goal review started via Qwen CLI (forced)...",
-          runId,
-          epicId: epic.id,
-          sequence: 0
-        });
-        const review = await this.withTimeout(
-          this.gateway.runEpicReviewerCodex({
-            cwd: reviewEpic.targetDir,
-            prompt: epicReviewerCodexPrompt(reviewEpic, tickets, ragCtx, projectStructure),
-            runId,
-            epicId: epic.id,
-            onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
-          }),
-          this.epicReviewTimeoutMs,
-          `Epic reviewer timed out after ${this.epicReviewTimeoutMs}ms`
-        );
-        this.recordAgentStream({
-          agentRole: "epicReviewer",
-          source: "orchestrator",
-          streamKind: "assistant",
-          content: `Verdict: ${review.verdict} - ${review.summary}`,
-          runId,
-          epicId: epic.id,
-          sequence: 1,
-          done: true
-        });
-        return await finalizeReview(review);
-      } catch (err) {
-        const details = formatQwenFailure(err);
-        this.recordAgentStream({
-          agentRole: "epicReviewer",
-          source: "orchestrator",
-          streamKind: "stderr",
-          content: `${details}. Retrying with codex path.`,
-          runId,
-          epicId: epic.id,
-          sequence: 0
-        });
-      }
-    }
+    const MAX_BUILD_FIX_ROUNDS = 3;
 
-    if (this.gateway.runEpicReviewerCodex && (this.gateway.models.epicReviewer === "codex-cli" || this.gateway.models.epicReviewer === "qwen-cli")) {
-      try {
-        const via = this.gateway.models.epicReviewer === "qwen-cli" ? "Qwen CLI" : "Codex";
-        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: `Goal review started via ${via}...`, runId, epicId: epic.id, sequence: 0 });
-        const review = await this.withTimeout(
-          this.gateway.runEpicReviewerCodex({
-            cwd: reviewEpic.targetDir,
-            prompt: epicReviewerCodexPrompt(reviewEpic, tickets, ragCtx, projectStructure),
-            runId,
-            epicId: epic.id,
-            onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
-          }),
-          this.epicReviewTimeoutMs,
-          `Epic reviewer timed out after ${this.epicReviewTimeoutMs}ms`
-        );
-        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} - ${review.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
-        return await finalizeReview(review);
-      } catch (err) {
-        const details = this.gateway.models.epicReviewer === "qwen-cli" ? formatQwenFailure(err) : formatCodexFailure(err);
-        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "stderr", content: `${details}. Falling back to OpenCode.`, runId, epicId: epic.id, sequence: 0 });
+    try {
+      // Initial review pass
+      let currentReview = await this.callEpicReviewerModel({
+        reviewEpic,
+        tickets,
+        ragCtx,
+        projectStructure,
+        runId,
+        epicId: epic.id,
+        codexPrompt: epicReviewerCodexPrompt(reviewEpic, tickets, ragCtx, projectStructure),
+        toolingPrompt: epicReviewerToolingPrompt(reviewEpic, tickets, ragCtx),
+        ollamaPrompt: epicReviewerPrompt(reviewEpic, tickets)
+      });
+
+      // Build-check loop
+      for (let round = 1; round <= MAX_BUILD_FIX_ROUNDS; round++) {
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: `Running build checks (round ${round})...`, runId, epicId: epic.id });
+        const { passed, output } = await this.runBuildChecks(reviewWorkspace.id, reviewWorkspace.worktreePath, epic.targetDir, runId, epic.id);
+
+        if (passed) {
+          this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: "Build checks passed.", runId, epicId: epic.id });
+          break;
+        }
+
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "stderr", content: `Build checks failed (round ${round}):\n${output}`, runId, epicId: epic.id });
+
+        if (round === MAX_BUILD_FIX_ROUNDS) {
+          // Exhausted rounds — force needs_followups
+          currentReview = {
+            verdict: "needs_followups",
+            summary: `${currentReview.summary}\nBuild checks failed after ${MAX_BUILD_FIX_ROUNDS} fix round(s):\n${output}`,
+            followupTickets: [
+              ...(currentReview.followupTickets ?? []),
+              {
+                id: "BUILD-FIX-REMAINING",
+                title: "Fix remaining build/typecheck errors",
+                description: `The epic reviewer could not resolve all build errors within ${MAX_BUILD_FIX_ROUNDS} rounds.\n\nErrors:\n${output}`,
+                acceptanceCriteria: ["All typecheck errors are resolved", "npm run typecheck exits with code 0"],
+                priority: "high" as const,
+                dependencies: [],
+                allowedPaths: ["src/"]
+              }
+            ]
+          };
+          break;
+        }
+
+        // Ask the model to fix the errors
+        const fixPrompt = epicReviewerBuildFixPrompt(epic, tickets, output, round);
+        currentReview = await this.callEpicReviewerModel({
+          reviewEpic,
+          tickets,
+          ragCtx,
+          projectStructure,
+          runId,
+          epicId: epic.id,
+          codexPrompt: fixPrompt,
+          toolingPrompt: fixPrompt,
+          ollamaPrompt: fixPrompt
+        });
       }
-    }
-    if (this.gateway.runGoalReviewInWorkspace && !this.gateway.models.epicReviewer.startsWith("mediated:")) {
-      try {
-        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: "Goal review started via OpenCode...", runId, epicId: epic.id, sequence: 0 });
-        const review = await this.withTimeout(
-          this.gateway.runGoalReviewInWorkspace({
-            cwd: reviewEpic.targetDir,
-            prompt: epicReviewerToolingPrompt(reviewEpic, tickets, ragCtx),
-            runId,
-            epicId: epic.id,
-            onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
-          }),
-          this.epicReviewTimeoutMs,
-          `Epic reviewer timed out after ${this.epicReviewTimeoutMs}ms`
-        );
-        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} - ${review.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
-        return await finalizeReview(review);
-      } catch (err) {
-        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "stderr", content: `${formatOpenCodeFailure(err)}. Falling back to Ollama.`, runId, epicId: epic.id, sequence: 0 });
-      }
-    }
-    if (this.gateway.runGoalReviewInWorkspace && this.gateway.models.epicReviewer.startsWith("mediated:")) {
-      try {
-        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: "Goal review started via mediated agent harness...", runId, epicId: epic.id, sequence: 0 });
-        const review = await this.withTimeout(
-          this.gateway.runGoalReviewInWorkspace({
-            cwd: reviewEpic.targetDir,
-            prompt: epicReviewerToolingPrompt(reviewEpic, tickets, ragCtx),
-            runId,
-            epicId: epic.id,
-            ragIndexId: ragCtx?.indexId ?? undefined,
-            db: this.db,
-            onStream: (event: AgentStreamPayload) => this.recordAgentStream(event)
-          }),
-          this.epicReviewTimeoutMs,
-          `Epic reviewer timed out after ${this.epicReviewTimeoutMs}ms`
-        );
-        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} - ${review.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
-        return await finalizeReview(review);
-      } catch (err) {
-        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "stderr", content: `Mediated harness failed: ${err instanceof Error ? err.message : String(err)}. Falling back to Ollama.`, runId, epicId: epic.id, sequence: 0 });
-      }
-    }
-    this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: "Goal review started via Ollama...", runId, epicId: epic.id, sequence: 0 });
-    const review = await this.withTimeout(
-      this.gateway.getGoalReview(epicReviewerPrompt(reviewEpic, tickets)),
-      this.epicReviewTimeoutMs,
-      `Epic reviewer timed out after ${this.epicReviewTimeoutMs}ms`
-    );
-    this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Verdict: ${review.verdict} - ${review.summary}`, runId, epicId: epic.id, sequence: 1, done: true });
-    return await finalizeReview(review);
+
+      return await finalizeReview(currentReview);
     } catch (error) {
       await cleanupWorkspace();
       throw error;

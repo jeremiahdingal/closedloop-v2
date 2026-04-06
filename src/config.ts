@@ -12,6 +12,7 @@ export type AppConfig = {
   repoRoot: string;
   apiPort: number;
   workerPollMs: number;
+  workerConcurrency: number;
   staleRunAfterMs: number;
   staleRunMaxRecoveries: number;
   leaseTtlMs: number;
@@ -58,6 +59,7 @@ export function loadConfig(): AppConfig {
     repoRoot,
     apiPort: Number(process.env.API_PORT || 4010),
     workerPollMs: Number(process.env.WORKER_POLL_MS || 1000),
+    workerConcurrency: Number(process.env.WORKER_CONCURRENCY || 1),
     staleRunAfterMs: Number(process.env.STALE_RUN_AFTER_MS || 180_000),
     staleRunMaxRecoveries: Number(process.env.STALE_RUN_MAX_RECOVERIES || 3),
     leaseTtlMs: Number(process.env.LEASE_TTL_MS || 60_000),

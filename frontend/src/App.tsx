@@ -221,8 +221,6 @@ function PlanningModal(props: { sessionId: string; epicTitle: string; initialBra
         return;
       }
       setStreamItems((prev) => [...prev, data]);
-      // Only auto-scroll the structured view (Phase 2) — terminal handles its own scroll
-      if (latestPlan) setTimeout(() => streamEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
     });
     es.addEventListener("session_status", (e) => {
       const data = JSON.parse(e.data);
@@ -909,6 +907,7 @@ export function App() {
   useEffect(() => {
     fetchJson<Record<string, unknown>>("/api/config").then(cfg => {
       if (typeof cfg.targetDir === "string") setTargetDir(cfg.targetDir);
+      if (typeof cfg.currentBranch === "string" && cfg.currentBranch) setTargetBranch(cfg.currentBranch);
       if (cfg.models && typeof cfg.models === "object" && !Array.isArray(cfg.models)) {
         setModelsConfig(cfg.models as AgentModelsConfig);
       }
@@ -1586,7 +1585,6 @@ export function App() {
                   </select>
                   {epicMode === "plan" && <span className="mode-hint">Explore &amp; plan before building</span>}
                 </div>
-                {epicMode === "build" && (
                 <div className="target-dir-row">
                   <label className="target-dir-label">Target Branch:</label>
                   <input
@@ -1596,7 +1594,6 @@ export function App() {
                     placeholder="feature/my-branch (optional)"
                   />
                 </div>
-                )}
                 <div className="target-dir-row">
                   <label className="target-dir-label">Target Dir:</label>
                   <input 

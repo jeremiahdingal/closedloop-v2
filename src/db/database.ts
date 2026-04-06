@@ -454,20 +454,27 @@ export class AppDatabase {
   }
 
   nextQueuedJob(): { id: string; kind: string; payload: Json; attempts: number } | null {
-    const row = this.db.prepare(`
+    return this.nextQueuedJobs(1)[0] ?? null;
+  }
+
+  nextQueuedJobs(n: number): { id: string; kind: string; payload: Json; attempts: number }[] {
+    const rows = this.db.prepare(`
       SELECT * FROM jobs
       WHERE status = 'queued' AND available_at <= ?
       ORDER BY created_at ASC
-      LIMIT 1
-    `).get(nowIso()) as any;
-    if (!row) return null;
-    this.db.prepare(`UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = ? WHERE id = ?`).run(nowIso(), row.id);
-    return {
+      LIMIT ?
+    `).all(nowIso(), n) as any[];
+    if (rows.length === 0) return [];
+    const now = nowIso();
+    for (const row of rows) {
+      this.db.prepare(`UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = ? WHERE id = ?`).run(now, row.id);
+    }
+    return rows.map(row => ({
       id: row.id,
       kind: row.kind,
       payload: JSON.parse(row.payload_json),
       attempts: row.attempts + 1
-    };
+    }));
   }
 
   completeJob(id: string): void {
