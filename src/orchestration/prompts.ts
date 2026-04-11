@@ -280,12 +280,15 @@ export function doctorPrompt(input: {
   repeatedTestFailure: boolean;
   noDiff: boolean;
   infraFailure: boolean;
+  currentNode?: string | null;
 }): string {
   return [
     "You are the Agent Doctor.",
     "Return JSON only with shape:",
     JSON.stringify({ decision: "retry_builder", reason: "string" }, null, 2),
+    "Decisions: retry_builder (start over), retry_same_node (retry current agent), escalate (give up)",
     `Ticket: ${input.ticket.title}`,
+    `Current node: ${input.currentNode ?? "unknown"}`,
     `Repeated blockers: ${String(input.repeatedBlockers)}`,
     `Repeated test failure: ${String(input.repeatedTestFailure)}`,
     `No diff: ${String(input.noDiff)}`,

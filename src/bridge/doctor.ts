@@ -5,9 +5,10 @@ export function deterministicDoctor(input: {
   repeatedTestFailure: boolean;
   noDiff: boolean;
   infraFailure: boolean;
+  isStall?: boolean;
 }): FailureDecision {
-  if (input.infraFailure) {
-    return { decision: "retry_same_node", reason: "Transient infrastructure failure." };
+  if (input.infraFailure || input.isStall) {
+    return { decision: "retry_same_node", reason: input.infraFailure ? "Transient infrastructure failure." : "Agent stalled; restarting at current node." };
   }
   if (input.noDiff) {
     return { decision: "retry_builder", reason: "Builder produced no diff." };

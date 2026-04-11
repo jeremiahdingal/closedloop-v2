@@ -540,7 +540,8 @@ export class TicketRunner {
         repeatedBlockers: state.repeatedBlockers,
         repeatedTestFailure: state.repeatedTestFailure,
         noDiff: state.noDiff,
-        infraFailure: false
+        infraFailure: false,
+        currentNode: state.status // status in state matches current role/node
       });
       console.log(`[TICKET ${ticket.id}] Doctor decision: ${failure.decision} - ${failure.reason}`);
       return {

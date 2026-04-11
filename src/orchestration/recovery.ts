@@ -148,10 +148,18 @@ export class RecoveryService {
         }
 
         if (ticket.currentRunId !== activeRun.id) {
+          const node = (activeRun.currentNode ?? "").toLowerCase();
+          let status = ticket.status;
+          if (node.includes("review")) status = "reviewing";
+          else if (node.includes("test")) status = "testing";
+          else if (node.includes("build")) status = "building";
+          else if (activeRun.status === "running") status = "building";
+          else if (activeRun.status === "queued") status = "queued";
+
           this.db.updateTicketRunState({
             ticketId: ticket.id,
             currentRunId: activeRun.id,
-            status: activeRun.status === "running" ? "building" : "queued",
+            status: status as any,
             currentNode: activeRun.currentNode,
             lastHeartbeatAt: nowIso(),
             lastMessage: "Doctor realigned ticket with active run."
@@ -246,7 +254,7 @@ export class RecoveryService {
 
         const repeatedBlockers = streamTexts.some((text) => text.toLowerCase().includes("blocker"));
         const repeatedTestFailure = streamTexts.some((text) => text.toLowerCase().includes("tests failed"));
-        const doctor = deterministicDoctor({ repeatedBlockers, repeatedTestFailure, noDiff, infraFailure });
+        const doctor = deterministicDoctor({ repeatedBlockers, repeatedTestFailure, noDiff, infraFailure, isStall: true });
 
         const ticketLabel = run.ticketId ? `ticket ${run.ticketId}` : `run ${run.id}`;
         if (run.attempt >= maxRecoveries || doctor.decision === "escalate" || doctor.decision === "blocked") {
