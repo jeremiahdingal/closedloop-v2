@@ -209,21 +209,26 @@ function hasPathArg(toolName: string): boolean {
 }
 
 function getPathArg(toolName: string, args: Record<string, unknown>): string | null {
+  // Check for both 'path' and 'paths'
+  let rawPath = args.path || args.paths;
+  if (Array.isArray(rawPath)) rawPath = rawPath[0];
+  
+  const pathStr = typeof rawPath === "string" ? rawPath : null;
+
   switch (toolName) {
     case "read_file":
     case "write_file":
     case "list_dir":
-      return typeof args.path === "string" ? args.path : null;
+    case "remove_file":
+      return pathStr;
     case "read_files":
-      return Array.isArray(args.paths) && typeof args.paths[0] === "string" ? args.paths[0] : null;
+      return pathStr; // Already handled above
     case "write_files":
       return Array.isArray(args.files) && args.files[0]?.path ? args.files[0].path : null;
     case "glob_files":
     case "grep_files":
-      // These don't have direct paths — they have patterns
       return null;
     case "save_artifact":
-      // Artifact names aren't file paths
       return null;
     default:
       return null;
@@ -298,10 +303,24 @@ function checkPathPolicy(
 function repairJson(raw: string): Record<string, unknown> | null {
   let repaired = raw.trim();
 
-  // Remove trailing commas
+  // 1. Remove markdown code blocks if present
+  repaired = repaired.replace(/```(?:json)?\n?([\s\S]*?)\n?```/g, "$1").trim();
+
+  // 2. Basic single quote to double quote conversion
+  // Only if it looks like a JSON-ish string
+  if (repaired.includes("'")) {
+    // This is risky but often helpful for small models
+    // Convert 'key': 'value' or 'key': "value"
+    repaired = repaired.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, '"$1"');
+  }
+
+  // 3. Handle unquoted keys (e.g. { path: "..." } instead of { "path": "..." })
+  repaired = repaired.replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":');
+
+  // 4. Remove trailing commas
   repaired = repaired.replace(/,(\s*[}\]])/g, "$1");
 
-  // Count braces/brackets
+  // 5. Count braces/brackets
   let opens = 0;
   let closes = 0;
   for (const ch of repaired) {
@@ -309,7 +328,7 @@ function repairJson(raw: string): Record<string, unknown> | null {
     if (ch === "}" || ch === "]") closes++;
   }
 
-  // Close unclosed structures
+  // 6. Close unclosed structures
   const diff = opens - closes;
   for (let i = 0; i < diff; i++) {
     const lastBrace = repaired.lastIndexOf("{");
@@ -327,7 +346,18 @@ function repairJson(raw: string): Record<string, unknown> | null {
       return parsed;
     }
   } catch {
-    // Repair failed
+    // Final attempt: find the first { and last }
+    const start = repaired.indexOf("{");
+    const end = repaired.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        const slice = repaired.slice(start, end + 1);
+        const parsed = JSON.parse(slice);
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          return parsed;
+        }
+      } catch {}
+    }
   }
 
   return null;

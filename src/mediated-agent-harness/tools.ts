@@ -605,7 +605,7 @@ export const WORKSPACE_TOOLS: ToolDef[] = [
             description: "The final result, as a JSON string matching the expected output schema"
           }
         },
-        required: ["summary", "result"],
+        required: ["result"],
         additionalProperties: false
       }
     }
@@ -1111,7 +1111,17 @@ async function execReadFile(
   args: Record<string, unknown>,
   ctx: ToolExecutionContext
 ): Promise<ToolResult> {
-  const filePath = String(args.path ?? "");
+  let filePath = String(args.path ?? "");
+  
+  // Robustness for models providing 'paths' (array or string) to single read_file
+  if (!filePath && args.paths) {
+    if (Array.isArray(args.paths)) {
+      filePath = String(args.paths[0] ?? "");
+    } else {
+      filePath = String(args.paths);
+    }
+  }
+
   if (!filePath) {
     return { callId, name: "read_file", output: "Error: path is required", isError: true };
   }
