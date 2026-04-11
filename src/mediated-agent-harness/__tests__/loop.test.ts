@@ -264,6 +264,101 @@ test("loop executes tools and feeds results back in multi-step flow", async () =
   }
 });
 
+test("loop executes strict JSON tool-call text fallback", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
+  await writeFile(path.join(tmpDir, "hello.txt"), "Hello from json fallback", "utf-8");
+
+  let requestCount = 0;
+  const server = await new Promise<{ server: Server; port: number }>((resolve) => {
+    const srv = createServer((req, res) => {
+      if (req.method === "POST" && req.url?.endsWith("/chat/completions")) {
+        let body = "";
+        req.on("data", (chunk) => { body += chunk; });
+        req.on("end", () => {
+          requestCount++;
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+
+          if (requestCount === 1) {
+            res.write(makeTextChunk('{"tool_name":"read_file","arguments":{"path":"hello.txt"}}') + "\n");
+            res.write("data: [DONE]\n");
+          } else {
+            res.write(makeToolCallChunk({
+              id: "call_2",
+              name: "finish",
+              args: { summary: "done", result: '{"ok":true}' },
+            }) + "\n");
+            res.write("data: [DONE]\n");
+          }
+          res.end();
+        });
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    srv.listen(0, () => resolve({ server: srv, port: (srv.address() as any).port }));
+  });
+
+  const resolvedServer = await server;
+  try {
+    const result = await runMediatedLoop({
+      systemPrompt: "Test",
+      userPrompt: "Read hello.txt and report.",
+      config: {
+        baseURL: `http://localhost:${resolvedServer.port}/v1`,
+        apiKey: "test",
+        model: "test-model",
+        cwd: tmpDir,
+        temperature: 0,
+        maxIterations: 5,
+      },
+      toolContext: createMockContext(tmpDir),
+    });
+
+    assert.equal(requestCount, 2);
+    assert.equal(result.toolCalls.length, 2);
+    assert.equal(result.toolCalls[0].name, "read_file");
+    assert.equal(result.toolCalls[1].name, "finish");
+  } finally {
+    resolvedServer.server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("loop executes batched JSON tool-call payloads", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
+
+  const sseLines = [
+    makeTextChunk('{"tool_calls":[{"name":"list_dir","arguments":{"path":"."}},{"name":"finish","arguments":{"summary":"done","result":"{\\"ok\\":true}"}}]}'),
+    "data: [DONE]",
+  ];
+  const { server, port } = await createMockServer(sseLines);
+
+  try {
+    const result = await runMediatedLoop({
+      systemPrompt: "Test",
+      userPrompt: "List the directory then finish.",
+      config: {
+        baseURL: `http://localhost:${port}/v1`,
+        apiKey: "test",
+        model: "test-model",
+        cwd: tmpDir,
+        temperature: 0,
+        maxIterations: 3,
+      },
+      toolContext: createMockContext(tmpDir),
+    });
+
+    assert.equal(result.iterations, 1);
+    assert.equal(result.toolCalls.length, 2);
+    assert.equal(result.toolCalls[0].name, "list_dir");
+    assert.equal(result.toolCalls[1].name, "finish");
+  } finally {
+    server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("loop handles model connection error", async () => {
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
 

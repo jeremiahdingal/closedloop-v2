@@ -110,3 +110,50 @@ test("workspace bridge cleans up archived workspaces after retention", async () 
     services.restore();
   }
 });
+
+test("workspace bridge pushes detached HEAD to a fully-qualified target branch ref", async () => {
+  const root = await makeTempDir("repo-");
+  const remote = await makeTempDir("remote-");
+  const dataDir = await makeTempDir("data-");
+  await initGitRepo(root);
+  await execFileAsync("git", ["init", "--bare"], { cwd: remote });
+  await execFileAsync("git", ["remote", "add", "origin", remote], { cwd: root });
+  await execFileAsync("git", ["push", "-u", "origin", "HEAD:refs/heads/main"], { cwd: root });
+
+  const services = await bootstrapForTest({
+    REPO_ROOT: root,
+    DATA_DIR: dataDir,
+    TEST_COMMAND: "node --eval \"process.exit(0)\"",
+    LINT_COMMAND: "node --eval \"process.exit(0)\"",
+    TYPECHECK_COMMAND: "node --eval \"process.exit(0)\""
+  }, { dryRun: true });
+
+  try {
+    const workspace = await services.bridge.createWorkspace({
+      ticketId: "T4",
+      runId: "R4",
+      owner: "R4",
+      targetDir: root,
+      baseRef: "main",
+      useTargetBranch: true
+    });
+    await services.bridge.acquireWorkspaceLease(workspace.id, "R4");
+
+    await services.bridge.writeFiles({
+      workspaceId: workspace.id,
+      runId: "R4",
+      ticketId: "T4",
+      nodeName: "builder_apply",
+      allowedPaths: ["README.md"],
+      files: [{ path: "README.md", content: "# Test Repo\n\nupdated on target branch\n" }]
+    });
+    await services.bridge.gitCommit({ workspaceId: workspace.id, message: "update target branch" });
+    await services.bridge.gitPushToBranch({ workspaceId: workspace.id, targetBranch: "theming" });
+
+    const remoteHead = await git(remote, ["rev-parse", "refs/heads/theming"]);
+    const localHead = await git(workspace.worktreePath, ["rev-parse", "HEAD"]);
+    assert.equal(remoteHead.stdout.trim(), localHead.stdout.trim());
+  } finally {
+    services.restore();
+  }
+});

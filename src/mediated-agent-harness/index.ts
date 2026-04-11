@@ -4,7 +4,7 @@ import { getPromptForRole } from "./prompts.ts";
 
 export type { MediatedHarnessConfig, MediatedHarnessResult, ToolExecutionContext } from "./types.ts";
 export type { MediatedHarnessEvent, ToolCall, ToolResult } from "./types.ts";
-export { WORKSPACE_TOOLS, TOOL_ALIASES, executeToolCall } from "./tools.ts";
+export { WORKSPACE_TOOLS, BROWSER_TOOLS, TOOL_ALIASES, executeToolCall } from "./tools.ts";
 export { StreamParser } from "./stream-parser.ts";
 export { CallHistory, validateAndRepair } from "./validator.ts";
 export {
@@ -47,7 +47,7 @@ export class MediatedAgentHarness {
     userPrompt: string,
     options?: Partial<MediatedHarnessConfig>
   ): Promise<MediatedHarnessResult> {
-    const systemPrompt = getPromptForRole(role, this.toolContext.cwd);
+    const systemPrompt = getPromptForRole(role, this.toolContext.cwd, options?.toolMode ?? "native");
 
     return runMediatedLoop({
       systemPrompt,
@@ -57,6 +57,7 @@ export class MediatedAgentHarness {
         apiKey: options?.apiKey ?? this.apiKey,
         model: options?.model ?? this.model,
         cwd: this.toolContext.cwd,
+        role: role,
         toolMode: options?.toolMode,
         allowedPaths: options?.allowedPaths ?? ["*"],
         maxIterations: options?.maxIterations,

@@ -1,8 +1,10 @@
 {
   "epicDecoder": "qwen-cli",
-  "builder": "mediated:qwen3-coder:30b",
+  "builder": "mediated:gemma4:e4b",
   "reviewer": "qwen3.5:9b",
   "tester": "skip",
   "epicReviewer": "qwen-cli",
+  "playWriter": "qwen-cli",
+  "playTester": "mediated:qwen3.5:9b",
   "doctor": "qwen3:8b"
 }

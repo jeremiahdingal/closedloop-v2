@@ -72,6 +72,7 @@ export interface MediatedHarnessConfig {
   apiKey?: string;
   model: string;
   cwd: string;
+  role?: string;
   toolMode?: "native" | "xml";
   allowedPaths?: string[];
   maxIterations?: number;

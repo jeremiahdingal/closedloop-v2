@@ -13,13 +13,17 @@ import { WorkspaceBridge } from "../bridge/workspace-bridge.ts";
 import { deterministicDoctor } from "../bridge/doctor.ts";
 import { loadConfig } from "../config.ts";
 import { randomId, nowIso, sleep } from "../utils.ts";
-import { builderPrompt, builderToolingPrompt, doctorPrompt, reviewerPrompt } from "./prompts.ts";
+import { builderPrompt, builderToolingPrompt, doctorPrompt, reviewerPrompt, reviewerToolingPrompt } from "./prompts.ts";
 import type { ModelGateway } from "./models.ts";
 import { loadLangGraphRuntime, type LangGraphRuntime } from "./langgraph-loader.ts";
 import { OpenCodeLaunchError, formatOpenCodeFailure } from "./opencode.ts";
 import { LifecycleService } from "./lifecycle.ts";
-import { buildContextForTicket } from "../rag/context-builder.ts";
+import { buildContextForTicket, buildToolingContext } from "../rag/context-builder.ts";
 import { git } from "../bridge/git.ts";
+import { getAvailableToolsList } from "../mediated-agent-harness/tools.ts";
+import { loadReviewContract, runReviewGuard, type ReviewerMode, type ReviewContractLoadResult } from "./review-guard.ts";
+import { ensureProjectStructureFile } from "./project-structure.ts";
+import { createHash } from "node:crypto";
 
 type TicketLoopResult = {
   runId: string;
@@ -59,7 +63,7 @@ export class TicketRunner {
   readonly config = loadConfig();
   private readonly heartbeatIntervalMs = 15_000;
   private readonly builderPlanTimeoutMs = Number(process.env.BUILDER_PLAN_TIMEOUT_MS || 180_000);
-  private readonly reviewerTimeoutMs = Number(process.env.REVIEWER_TIMEOUT_MS || 240_000);
+  private readonly reviewerTimeoutMs = Number(process.env.REVIEWER_TIMEOUT_MS || 420_000);
   private readonly compareBaseRef = this.normalizeCompareRef(process.env.PR_COMPARE_BASE || "origin/main");
   private readonly db: AppDatabase;
   private readonly bridge: WorkspaceBridge;
@@ -135,7 +139,7 @@ export class TicketRunner {
       ticketId: z.string(),
       workspaceId: z.string().default(""),
       buildAttempts: z.number().default(0),
-      maxBuildAttempts: z.number().default(Number(ticket.metadata.maxBuildAttempts ?? 3)),
+      maxBuildAttempts: z.number().default(this.resolveMaxBuildAttempts(ticket)),
       intendedFiles: z.array(z.string()).default([]),
       blockHistory: z.array(z.string()).default([]),
       testHistory: z.array(z.string()).default([]),
@@ -160,7 +164,8 @@ export class TicketRunner {
       this.db.updateTicketRunState({ ticketId: ticket.id, status: "building", currentRunId: runId, currentNode: "prepare_context", lastHeartbeatAt: nowIso(), lastMessage: "Preparing workspace." });
       const epic = this.db.getEpic(ticket.epicId);
       const baseRef = epic?.targetBranch ?? undefined;
-      const workspace = await this.bridge.createWorkspace({ ticketId: ticket.id, runId, owner: runId, targetDir: epic?.targetDir || this.config.repoRoot, baseRef });
+      const useTargetBranch = !!epic?.targetBranch;
+      const workspace = await this.bridge.createWorkspace({ ticketId: ticket.id, runId, owner: runId, targetDir: epic?.targetDir || this.config.repoRoot, baseRef, useTargetBranch });
       await this.bridge.acquireWorkspaceLease(workspace.id, runId);
       const packet: TicketContextPacket = {
         epicId: ticket.epicId,
@@ -183,7 +188,7 @@ export class TicketRunner {
       return {
         workspaceId: workspace.id,
         buildAttempts: 0,
-        maxBuildAttempts: Number(ticket.metadata.maxBuildAttempts ?? 3),
+        maxBuildAttempts: this.resolveMaxBuildAttempts(ticket),
         lastMessage: "Workspace prepared.",
         status: "building"
       } satisfies Partial<TicketGraphState>;
@@ -200,6 +205,9 @@ export class TicketRunner {
       try {
         const commitResult = await git(workspace.worktreePath, ["rev-parse", "HEAD"]);
         const commitHash = commitResult.stdout.trim();
+        const builderModel = this.gateway.models.builder.startsWith("mediated:")
+          ? this.gateway.models.builder.slice("mediated:".length)
+          : this.gateway.models.builder;
 
         const ragResult = await buildContextForTicket({
           ticket,
@@ -207,11 +215,25 @@ export class TicketRunner {
           db: this.db,
           repoRoot: workspace.worktreePath,
           commitHash,
+          model: builderModel,
         });
+
+        // Pre-fetch tool guidance
+        const toolContext = await buildToolingContext({
+          role: "builder",
+          availableTools: getAvailableToolsList("builder"),
+          db: this.db,
+          indexId: this.db.getRagIndexByCommit(commitHash)?.id ?? 0,
+          model: builderModel,
+        });
+
+        const projectStructure = await ensureProjectStructureFile(workspace.worktreePath);
 
         retrievedContext = {
           codeContext: ragResult.codeContext,
           docContext: ragResult.docContext,
+          toolContext,
+          projectStructure,
           retrievalMode: ragResult.retrievalMode,
           chunkCount: ragResult.chunkCount,
         };
@@ -268,8 +290,13 @@ export class TicketRunner {
       console.log(`[TICKET ${ticket.id}] Reviewer starting`);
       this.heartbeat(runId, ticket.id, "reviewer", "Reviewing diff.");
       this.recordAgentStream({ agentRole: "reviewer", source: "orchestrator", streamKind: "status", content: "Reviewing diff...", runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 0, done: false });
-      const reviewVerdict = await this.getReviewerVerdictWithRetry(runId, ticket, state.lastDiff);
+      const reviewVerdict = await this.getReviewerVerdictWithRetry(runId, ticket, state.lastDiff, state.workspaceId);
       console.log(`[TICKET ${ticket.id}] Reviewer verdict: ${reviewVerdict.approved ? 'APPROVED' : 'REJECTED'} - ${reviewVerdict.blockers.join('; ') || 'no blockers'}`);
+
+      if (!reviewVerdict.approved) {
+        await this.autoExpandAllowedPathsFromReviewerBlockers(runId, ticket, reviewVerdict.blockers);
+      }
+
       this.recordAgentStream({ agentRole: "reviewer", source: "orchestrator", streamKind: "assistant", content: `Approved: ${reviewVerdict.approved}\nBlockers: ${reviewVerdict.blockers.join(", ") || "none"}\nSuggestions: ${reviewVerdict.suggestions.join(", ") || "none"}`, runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 1, done: true });
       await this.writeHandoff(state.workspaceId, runId, ticket.id, {
         role: "reviewer",
@@ -279,12 +306,20 @@ export class TicketRunner {
         payload: reviewVerdict as any
       });
       const blockerKey = reviewVerdict.blockers.join("|");
-      const repeatedBlockers = Boolean(blockerKey) && state.blockHistory.includes(blockerKey);
+      const blockerHistoryKey = blockerKey ? `block:${blockerKey}` : "";
+      const reviewerHistoryKey = `review:${this.reviewerVerdictFingerprint(reviewVerdict, state.lastDiff)}`;
+      const repeatedBlockers =
+        (Boolean(blockerHistoryKey) && state.blockHistory.includes(blockerHistoryKey))
+        || state.blockHistory.includes(reviewerHistoryKey);
       return {
         reviewApproved: reviewVerdict.approved,
         reviewBlockers: reviewVerdict.blockers,
         reviewSuggestions: reviewVerdict.suggestions,
-        blockHistory: blockerKey ? [...state.blockHistory, blockerKey] : state.blockHistory,
+        blockHistory: [
+          ...state.blockHistory,
+          ...(blockerHistoryKey ? [blockerHistoryKey] : []),
+          reviewerHistoryKey
+        ],
         repeatedBlockers,
         lastMessage: reviewVerdict.approved ? "Reviewer approved changes." : reviewVerdict.blockers.join("; ") || "Reviewer rejected changes.",
         status: reviewVerdict.approved ? "approved" : "reviewing"
@@ -486,6 +521,16 @@ export class TicketRunner {
     const classifyNode = async (state: TicketGraphState) => {
       this.assertNotCancelled(ticket.id, ticket.epicId);
       console.log(`[TICKET ${ticket.id}] Classify node: buildAttempts=${state.buildAttempts}, noDiff=${state.noDiff}, repeatedBlockers=${state.repeatedBlockers}`);
+      if (state.repeatedBlockers) {
+        const reason = "Reviewer produced duplicate/unchanged verdicts across attempts; escalating early to prevent drift.";
+        console.log(`[TICKET ${ticket.id}] Classify early escalation: ${reason}`);
+        return {
+          failureDecision: "escalate",
+          failureReason: reason,
+          lastMessage: reason,
+          status: "escalated"
+        } satisfies Partial<TicketGraphState>;
+      }
       const failure = await this.getFailureDecision(runId, ticket, state.reviewApproved ? {
         approved: state.reviewApproved,
         blockers: state.reviewBlockers,
@@ -513,28 +558,36 @@ export class TicketRunner {
       const diffStats = await this.bridge.getDiffStats(state.workspaceId);
       const commitResult = await this.bridge.gitCommit({ workspaceId: state.workspaceId, message: `[${ticket.id}] automated ticket completion` });
       
-      const epic = this.db.getEpic(ticket.epicId);
-      const prBase = epic?.targetBranch ?? this.compareBaseRef.replace("origin/", "");
-      
-      let prUrl: string | null = null;
-      if (!commitResult.startsWith("noop:")) {
-        for (let attempt = 1; attempt <= 2; attempt++) {
-          try {
-            await this.bridge.gitPush({ workspaceId: state.workspaceId });
-            const title = `${ticket.title} (${ticket.id})`;
-            const body = `Automated ticket completion.\n\n**Description:** ${ticket.description}\n\n**Acceptance Criteria:**\n${ticket.acceptanceCriteria.map((c) => `- ${c}`).join("\n")}`;
-            prUrl = await this.bridge.gitCreatePr({
-              workspaceId: state.workspaceId,
-              title,
-              body,
-              base: prBase
-            });
-            break;
-          } catch (pushError) {
-            const msg = pushError instanceof Error ? pushError.message : String(pushError);
-            console.error(`[${ticket.id}] Push/PR creation failed (attempt ${attempt}/2):`, msg);
-            if (attempt === 2) {
-              console.error(`[${ticket.id}] All push/PR attempts exhausted. Ticket approved but PR not created.`);
+        const epic = this.db.getEpic(ticket.epicId);
+        const useTargetBranch = !!epic?.targetBranch;
+        const prBase = epic?.targetBranch ?? this.compareBaseRef.replace("origin/", "");
+        
+        let prUrl: string | null = null;
+        if (!commitResult.startsWith("noop:")) {
+          if (this.config.localOnly) {
+            console.log(`[${ticket.id}] Local-only mode enabled. Skipping push/PR creation.`);
+          } else if (useTargetBranch) {
+            await this.bridge.gitPushToBranch({ workspaceId: state.workspaceId, targetBranch: prBase });
+            prUrl = null;
+          } else {
+            for (let attempt = 1; attempt <= 2; attempt++) {
+              try {
+              await this.bridge.gitPush({ workspaceId: state.workspaceId });
+              const title = `${ticket.title} (${ticket.id})`;
+              const body = `Automated ticket completion.\n\n**Description:** ${ticket.description}\n\n**Acceptance Criteria:**\n${ticket.acceptanceCriteria.map((c) => `- ${c}`).join("\n")}`;
+              prUrl = await this.bridge.gitCreatePr({
+                workspaceId: state.workspaceId,
+                title,
+                body,
+                base: prBase
+              });
+              break;
+            } catch (pushError) {
+              const msg = pushError instanceof Error ? pushError.message : String(pushError);
+              console.error(`[${ticket.id}] Push/PR creation failed (attempt ${attempt}/2):`, msg);
+              if (attempt === 2) {
+                console.error(`[${ticket.id}] All push/PR attempts exhausted. Ticket approved but PR not created.`);
+              }
             }
           }
         }
@@ -633,6 +686,10 @@ export class TicketRunner {
         if (workspace) await this.bridge.archiveWorkspace(workspace.id);
         return { runId, workspaceId: workspace?.id ?? "", status: "failed", lastDiff: "", reviewVerdict: null, testSummary: error.message };
       }
+      if (this.isPushConflictError(error)) {
+        const workspace = this.db.findWorkspaceByRun(runId);
+        return await this.autoRerunFromFreshHeadOnPushConflict(runId, ticket, workspace?.id ?? "", error);
+      }
       this.db.updateRun({ runId, status: "failed", currentNode: "error", heartbeatAt: nowIso(), lastMessage: "Ticket crashed.", errorText: (error as Error).message });
       this.db.updateTicketRunState({ ticketId: ticket.id, status: "failed", currentNode: "error", lastHeartbeatAt: nowIso(), lastMessage: (error as Error).message });
       throw error;
@@ -654,7 +711,8 @@ export class TicketRunner {
 
     const epic = this.db.getEpic(ticket.epicId);
     const baseRef = epic?.targetBranch ?? undefined;
-    const workspace = await this.bridge.createWorkspace({ ticketId: ticket.id, runId, owner: runId, targetDir: epic?.targetDir || this.config.repoRoot, baseRef });
+    const useTargetBranch = !!epic?.targetBranch;
+    const workspace = await this.bridge.createWorkspace({ ticketId: ticket.id, runId, owner: runId, targetDir: epic?.targetDir || this.config.repoRoot, baseRef, useTargetBranch });
     await this.bridge.acquireWorkspaceLease(workspace.id, runId);
 
     let reviewVerdict: ReviewerVerdict | null = null;
@@ -663,7 +721,7 @@ export class TicketRunner {
     let blockHistory: string[] = [];
     let testHistory: string[] = [];
     let buildAttempts = 0;
-    const maxBuildAttempts = Number(ticket.metadata.maxBuildAttempts ?? 3);
+    const maxBuildAttempts = this.resolveMaxBuildAttempts(ticket);
 
     const packet: TicketContextPacket = {
       epicId: ticket.epicId,
@@ -691,6 +749,44 @@ export class TicketRunner {
         packet.attempt = buildAttempts;
         this.heartbeat(runId, ticket.id, "builder_plan", `Builder attempt ${buildAttempts}.`);
 
+        try {
+          const commitResult = await git(workspace.worktreePath, ["rev-parse", "HEAD"]);
+          const commitHash = commitResult.stdout.trim();
+          const builderModel = this.gateway.models.builder.startsWith("mediated:")
+            ? this.gateway.models.builder.slice("mediated:".length)
+            : this.gateway.models.builder;
+
+          const ragResult = await buildContextForTicket({
+            ticket,
+            packet: {} as TicketContextPacket,
+            db: this.db,
+            repoRoot: workspace.worktreePath,
+            commitHash,
+            model: builderModel,
+          });
+
+          const toolContext = await buildToolingContext({
+            role: "builder",
+            availableTools: getAvailableToolsList("builder"),
+            db: this.db,
+            indexId: this.db.getRagIndexByCommit(commitHash)?.id ?? 0,
+            model: builderModel,
+          });
+
+          const projectStructure = await ensureProjectStructureFile(workspace.worktreePath);
+
+          packet.retrievedContext = {
+            codeContext: ragResult.codeContext,
+            docContext: ragResult.docContext,
+            toolContext,
+            projectStructure,
+            retrievalMode: ragResult.retrievalMode,
+            chunkCount: ragResult.chunkCount,
+          };
+        } catch (err) {
+          console.warn(`[RAG] Context build failed for ticket ${ticket.id}: ${err}. Continuing without context.`);
+        }
+
       const builderResult = await this.withHeartbeat(runId, ticket.id, "builder_plan", `Builder attempt ${buildAttempts}.`, () =>
         this.executeBuilder(workspace.id, runId, ticket.id, ticket.allowedPaths, ticket, packet, buildAttempts)
       );
@@ -709,7 +805,10 @@ export class TicketRunner {
         }
 
         this.heartbeat(runId, ticket.id, "reviewer", "Reviewing diff.");
-      reviewVerdict = await this.getReviewerVerdictWithRetry(runId, ticket, lastDiff);
+      reviewVerdict = await this.getReviewerVerdictWithRetry(runId, ticket, lastDiff, workspace.id);
+        if (!reviewVerdict.approved) {
+          await this.autoExpandAllowedPathsFromReviewerBlockers(runId, ticket, reviewVerdict.blockers);
+        }
         await this.writeHandoff(workspace.id, runId, ticket.id, {
           role: "reviewer",
           state: reviewVerdict.approved ? "approved" : "rejected",
@@ -721,9 +820,22 @@ export class TicketRunner {
         if (!reviewVerdict.approved) {
           this.assertNotCancelled(ticket.id, ticket.epicId);
           const blockerKey = reviewVerdict.blockers.join("|");
-          const repeatedBlockers = blockerKey.length > 0 && blockHistory.includes(blockerKey);
-          blockHistory.push(blockerKey);
+          const blockerHistoryKey = blockerKey.length > 0 ? `block:${blockerKey}` : "";
+          const reviewerHistoryKey = `review:${this.reviewerVerdictFingerprint(reviewVerdict, lastDiff)}`;
+          const repeatedBlockers =
+            (blockerHistoryKey.length > 0 && blockHistory.includes(blockerHistoryKey))
+            || blockHistory.includes(reviewerHistoryKey);
+          if (blockerHistoryKey.length > 0) blockHistory.push(blockerHistoryKey);
+          blockHistory.push(reviewerHistoryKey);
           packet.reviewBlockers = reviewVerdict.blockers;
+          if (repeatedBlockers) {
+            return await this.escalate(
+              runId,
+              workspace.id,
+              ticket.id,
+              "Reviewer produced duplicate/unchanged verdicts across attempts; escalating early to prevent drift."
+            );
+          }
           const failure = await this.getFailureDecision(runId, ticket, reviewVerdict, testSummary, {
             repeatedBlockers,
             repeatedTestFailure: false,
@@ -815,27 +927,35 @@ export class TicketRunner {
             const commitResult = await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] automated ticket completion` });
 
             const epic = this.db.getEpic(ticket.epicId);
+            const useTargetBranch = !!epic?.targetBranch;
             const prBase = epic?.targetBranch ?? this.compareBaseRef.replace("origin/", "");
             
             let prUrl: string | null = null;
             if (!commitResult.startsWith("noop:")) {
-              for (let attempt = 1; attempt <= 2; attempt++) {
-                try {
-                  await this.bridge.gitPush({ workspaceId: workspace.id });
-                  const title = `${ticket.title} (${ticket.id})`;
-                  const body = `Automated ticket completion.\n\n**Description:** ${ticket.description}\n\n**Acceptance Criteria:**\n${ticket.acceptanceCriteria.map((c) => `- ${c}`).join("\n")}`;
-                  prUrl = await this.bridge.gitCreatePr({
-                    workspaceId: workspace.id,
-                    title,
-                    body,
-                    base: prBase
-                  });
-                  break;
-                } catch (pushError) {
-                  const msg = pushError instanceof Error ? pushError.message : String(pushError);
-                  console.error(`[${ticket.id}] Push/PR creation failed (attempt ${attempt}/2):`, msg);
-                  if (attempt === 2) {
-                    console.error(`[${ticket.id}] All push/PR attempts exhausted. Ticket approved but PR not created.`);
+              if (this.config.localOnly) {
+                console.log(`[${ticket.id}] Local-only mode enabled. Skipping push/PR creation.`);
+              } else if (useTargetBranch) {
+                await this.bridge.gitPushToBranch({ workspaceId: workspace.id, targetBranch: prBase });
+                prUrl = null;
+              } else {
+                for (let attempt = 1; attempt <= 2; attempt++) {
+                  try {
+                    await this.bridge.gitPush({ workspaceId: workspace.id });
+                    const title = `${ticket.title} (${ticket.id})`;
+                    const body = `Automated ticket completion.\n\n**Description:** ${ticket.description}\n\n**Acceptance Criteria:**\n${ticket.acceptanceCriteria.map((c) => `- ${c}`).join("\n")}`;
+                    prUrl = await this.bridge.gitCreatePr({
+                      workspaceId: workspace.id,
+                      title,
+                      body,
+                      base: prBase
+                    });
+                    break;
+                  } catch (pushError) {
+                    const msg = pushError instanceof Error ? pushError.message : String(pushError);
+                    console.error(`[${ticket.id}] Push/PR creation failed (attempt ${attempt}/2):`, msg);
+                    if (attempt === 2) {
+                      console.error(`[${ticket.id}] All push/PR attempts exhausted. Ticket approved but PR not created.`);
+                    }
                   }
                 }
               }
@@ -895,25 +1015,36 @@ export class TicketRunner {
             const diffStats = await this.bridge.getDiffStats(workspace.id);
             const commitResult = await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] automated ticket completion` });
 
+            const epic = this.db.getEpic(ticket.epicId);
+            const useTargetBranch = !!epic?.targetBranch;
+            const prBase = epic?.targetBranch ?? this.compareBaseRef.replace("origin/", "");
+            
             let prUrl: string | null = null;
             if (!commitResult.startsWith("noop:")) {
-              for (let attempt = 1; attempt <= 2; attempt++) {
-                try {
-                  await this.bridge.gitPush({ workspaceId: workspace.id });
-                  const title = `${ticket.title} (${ticket.id})`;
-                  const body = `Automated ticket completion.\n\n**Description:** ${ticket.description}\n\n**Acceptance Criteria:**\n${ticket.acceptanceCriteria.map((c) => `- ${c}`).join("\n")}`;
-                  prUrl = await this.bridge.gitCreatePr({
-                    workspaceId: workspace.id,
-                    title,
-                    body,
-                    base: this.compareBaseRef.replace("origin/", "")
-                  });
-                  break;
-                } catch (pushError) {
-                  const msg = pushError instanceof Error ? pushError.message : String(pushError);
-                  console.error(`[${ticket.id}] Push/PR creation failed (attempt ${attempt}/2):`, msg);
-                  if (attempt === 2) {
-                    console.error(`[${ticket.id}] All push/PR attempts exhausted. Ticket approved but PR not created.`);
+              if (this.config.localOnly) {
+                console.log(`[${ticket.id}] Local-only mode enabled. Skipping push/PR creation.`);
+              } else if (useTargetBranch) {
+                await this.bridge.gitPushToBranch({ workspaceId: workspace.id, targetBranch: prBase });
+                prUrl = null;
+              } else {
+                for (let attempt = 1; attempt <= 2; attempt++) {
+                  try {
+                    await this.bridge.gitPush({ workspaceId: workspace.id });
+                    const title = `${ticket.title} (${ticket.id})`;
+                    const body = `Automated ticket completion.\n\n**Description:** ${ticket.description}\n\n**Acceptance Criteria:**\n${ticket.acceptanceCriteria.map((c) => `- ${c}`).join("\n")}`;
+                    prUrl = await this.bridge.gitCreatePr({
+                      workspaceId: workspace.id,
+                      title,
+                      body,
+                      base: prBase
+                    });
+                    break;
+                  } catch (pushError) {
+                    const msg = pushError instanceof Error ? pushError.message : String(pushError);
+                    console.error(`[${ticket.id}] Push/PR creation failed (attempt ${attempt}/2):`, msg);
+                    if (attempt === 2) {
+                      console.error(`[${ticket.id}] All push/PR attempts exhausted. Ticket approved but PR not created.`);
+                    }
                   }
                 }
               }
@@ -959,6 +1090,9 @@ export class TicketRunner {
         await this.bridge.archiveWorkspace(workspace.id);
         return { runId, workspaceId: workspace.id, status: "failed", lastDiff, reviewVerdict, testSummary: error.message };
       }
+      if (this.isPushConflictError(error)) {
+        return await this.autoRerunFromFreshHeadOnPushConflict(runId, ticket, workspace.id, error);
+      }
       this.db.updateRun({ runId, status: "failed", currentNode: "error", heartbeatAt: nowIso(), lastMessage: "Ticket crashed.", errorText: (error as Error).message });
       this.db.updateTicketRunState({ ticketId: ticket.id, status: "failed", currentNode: "error", lastHeartbeatAt: nowIso(), lastMessage: (error as Error).message });
       await this.bridge.archiveWorkspace(workspace.id);
@@ -1002,6 +1136,7 @@ export class TicketRunner {
         });
         const lastDiff = await this.bridge.gitDiff(workspace.id);
         const intendedFiles = this.extractChangedFiles(lastDiff);
+        const buildCheck = await this.maybeRunRequiredBuildCheck(workspace.id, runId, ticketId, ticket);
         await this.bridge.saveArtifact({
           runId,
           ticketId,
@@ -1021,7 +1156,7 @@ export class TicketRunner {
         return {
           intendedFiles,
           lastDiff,
-          summary: result.summary
+          summary: buildCheck ? `${result.summary}\n${buildCheck}` : result.summary
         };
       } catch (err) {
         if (err instanceof OpenCodeLaunchError) {
@@ -1071,6 +1206,7 @@ export class TicketRunner {
         });
         const lastDiff = await this.bridge.gitDiff(workspace.id);
         const intendedFiles = this.extractChangedFiles(lastDiff);
+        const buildCheck = await this.maybeRunRequiredBuildCheck(workspace.id, runId, ticketId, ticket);
         await this.bridge.saveArtifact({
           runId,
           ticketId,
@@ -1090,7 +1226,7 @@ export class TicketRunner {
         return {
           intendedFiles,
           lastDiff,
-          summary: result.summary
+          summary: buildCheck ? `${result.summary}\n${buildCheck}` : result.summary
         };
       } catch (err) {
         const launchInfo = err instanceof OpenCodeLaunchError ? err.launchInfo : null;
@@ -1144,6 +1280,7 @@ export class TicketRunner {
 
     this.recordAgentStream({ agentRole: "builder", source: "orchestrator", streamKind: "status", content: `Applied ${changedFiles.length} file(s): ${changedFiles.join(", ")}`, runId, ticketId, epicId: ticket.epicId, sequence: 2, done: true });
     const lastDiff = await this.bridge.gitDiff(workspace.id);
+    const buildCheck = await this.maybeRunRequiredBuildCheck(workspace.id, runId, ticketId, ticket);
     await this.bridge.saveArtifact({
       runId,
       ticketId,
@@ -1155,7 +1292,7 @@ export class TicketRunner {
     return {
       intendedFiles: plan.intendedFiles,
       lastDiff,
-      summary: plan.summary
+      summary: buildCheck ? `${plan.summary}\n${buildCheck}` : plan.summary
     };
   }
 
@@ -1302,45 +1439,147 @@ export class TicketRunner {
     }
   }
 
-  private async getReviewerVerdictWithRetry(runId: string, ticket: TicketRecord, diff: string): Promise<ReviewerVerdict> {
-    const maxAttempts = 2;
+  private async getReviewerVerdictWithRetry(runId: string, ticket: TicketRecord, diff: string, workspaceId: string): Promise<ReviewerVerdict> {
+    const runtimeConfig = loadConfig();
+    const reviewerMode = this.resolveReviewerMode(runtimeConfig.reviewerMode);
+    const reviewerTimeoutMs = reviewerMode === "mediated-deep"
+      ? runtimeConfig.reviewDeepTimeoutMs
+      : runtimeConfig.reviewFastTimeoutMs;
+    const maxAttempts = reviewerMode === "mediated-deep" ? 2 : 1;
+    const workspace = this.bridge.requireWorkspace(workspaceId);
+    const contract = runtimeConfig.reviewGuardEnabled
+      ? await loadReviewContract(workspace.worktreePath, runtimeConfig.reviewContractPath)
+      : {
+          found: false,
+          valid: false,
+          contractPath: runtimeConfig.reviewContractPath,
+          warnings: ["Review guard disabled by configuration."],
+          contract: null,
+        } satisfies ReviewContractLoadResult;
+    const destructiveBlockers = this.getDestructiveDiffBlockers(diff);
+    const guard = runReviewGuard({
+      diff,
+      allowedPaths: ticket.allowedPaths,
+      contract,
+      destructiveBlockers,
+    });
+
+    this.recordAgentStream({
+      agentRole: "reviewer",
+      source: "orchestrator",
+      streamKind: "status",
+      content: `Review guard started (${reviewerMode}).`,
+      runId,
+      ticketId: ticket.id,
+      epicId: ticket.epicId,
+      sequence: 0,
+      metadata: {
+        reviewerMode,
+        guardPassed: guard.passed,
+        contractFound: contract.found,
+        contractValid: contract.valid,
+      }
+    });
+
+    if (!guard.passed || reviewerMode === "off") {
+      const blockers = [...guard.blockers];
+      const suggestions = [...guard.suggestions];
+      if (reviewerMode === "off") {
+        suggestions.unshift("Reviewer model disabled; guard-only review applied.");
+      }
+      const guardContent = destructiveBlockers.length > 0
+        ? `Destructive diff guard triggered: ${destructiveBlockers.join(" | ")}`
+        : `Review guard failed: ${guard.blockers.join(" | ")}`;
+      this.recordAgentStream({
+        agentRole: "reviewer",
+        source: "orchestrator",
+        streamKind: guard.passed ? "status" : "stderr",
+        content: guard.passed
+          ? "Review guard passed; reviewer skipped because mode is off."
+          : guardContent,
+        runId,
+        ticketId: ticket.id,
+        epicId: ticket.epicId,
+        sequence: 1,
+        metadata: {
+          reviewerMode,
+          guardRuleHits: guard.metadata.ruleHits,
+          changedFiles: guard.metadata.changedFiles,
+          contractPath: guard.metadata.contractPath,
+        }
+      });
+      return {
+        approved: guard.passed,
+        blockers,
+        suggestions,
+        riskLevel: guard.passed ? "low" : "high",
+      };
+    }
+
+    const reviewerContext = this.buildReviewerContext(ticket, diff, guard, contract);
+    const useMediatedReviewer = reviewerMode === "mediated-deep" && Boolean(this.gateway.runReviewerInWorkspace);
     let lastError: unknown = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
-        const verdict = await this.withHeartbeat(runId, ticket.id, "reviewer", "Reviewing diff.", () =>
-          this.withTimeout(
-            this.gateway.getReviewerVerdict(reviewerPrompt(ticket, diff)),
-            this.reviewerTimeoutMs,
-            `Reviewer timed out after ${this.reviewerTimeoutMs}ms`
-          )
-        );
-        const destructiveBlockers = this.getDestructiveDiffBlockers(diff);
-        if (!destructiveBlockers.length) return verdict;
-        const blockers = [...new Set([...verdict.blockers, ...destructiveBlockers])];
-        const suggestions = [...new Set([
-          ...verdict.suggestions,
-          "Destructive diff guard triggered: split risky changes into explicit, approved steps."
-        ])];
-        const guardMessage = `Destructive diff guard triggered: ${destructiveBlockers.join(" | ")}`;
         this.recordAgentStream({
           agentRole: "reviewer",
           source: "orchestrator",
-          streamKind: "stderr",
-          content: guardMessage,
+          streamKind: "status",
+          content: `Review model call started (${reviewerMode}).`,
           runId,
           ticketId: ticket.id,
           epicId: ticket.epicId,
-          sequence: attempt
+          sequence: attempt,
+          metadata: {
+            reviewerMode,
+            guardRuleHits: guard.metadata.ruleHits,
+            changedFiles: guard.metadata.changedFiles,
+          }
+        });
+        const verdict = await this.withHeartbeat(runId, ticket.id, "reviewer", "Reviewing diff.", () =>
+          this.withTimeout(
+            useMediatedReviewer
+              ? this.gateway.runReviewerInWorkspace!({
+                  cwd: workspace.worktreePath,
+                  prompt: reviewerToolingPrompt(ticket),
+                  runId,
+                  ticketId: ticket.id,
+                  epicId: ticket.epicId,
+                  onStream: (event) => this.recordAgentStream(event)
+                })
+              : this.gateway.getReviewerVerdict(reviewerPrompt(ticket, reviewerContext)),
+            reviewerTimeoutMs,
+            `Reviewer timed out after ${reviewerTimeoutMs}ms`
+          )
+        );
+
+        const blockers = [...new Set([...verdict.blockers, ...guard.blockers])];
+        const suggestions = [...new Set([...verdict.suggestions, ...guard.suggestions])];
+        const approved = blockers.length === 0 && verdict.approved;
+        this.recordAgentStream({
+          agentRole: "reviewer",
+          source: "orchestrator",
+          streamKind: "status",
+          content: `Review model call completed (${reviewerMode}).`,
+          runId,
+          ticketId: ticket.id,
+          epicId: ticket.epicId,
+          sequence: attempt,
+          metadata: {
+            reviewerMode,
+            approved,
+            guardRuleHits: guard.metadata.ruleHits,
+          }
         });
         return {
-          approved: false,
+          approved,
           blockers,
           suggestions,
-          riskLevel: "high"
+          riskLevel: blockers.length > 0 ? "high" : verdict.riskLevel,
         };
       } catch (error) {
         lastError = error;
-        const isRetryable = this.isReviewerInfraError(error);
+        const isRetryable = reviewerMode === "mediated-deep" && this.isReviewerInfraError(error);
         const message = this.formatReviewerError(error);
         this.recordAgentStream({
           agentRole: "reviewer",
@@ -1352,7 +1591,12 @@ export class TicketRunner {
           runId,
           ticketId: ticket.id,
           epicId: ticket.epicId,
-          sequence: attempt
+          sequence: attempt,
+          metadata: {
+            reviewerMode,
+            guardRuleHits: guard.metadata.ruleHits,
+            changedFiles: guard.metadata.changedFiles,
+          }
         });
         if (!isRetryable || attempt >= maxAttempts) {
           throw new Error(message);
@@ -1361,6 +1605,45 @@ export class TicketRunner {
       }
     }
     throw new Error(this.formatReviewerError(lastError));
+  }
+
+  private resolveReviewerMode(rawMode: string | undefined | null): ReviewerMode {
+    const normalized = String(rawMode ?? "").trim().toLowerCase();
+    if (normalized === "off" || normalized === "mediated-deep" || normalized === "direct-fast") {
+      return normalized;
+    }
+    return "direct-fast";
+  }
+
+  private buildReviewerContext(
+    ticket: TicketRecord,
+    diff: string,
+    guard: ReturnType<typeof runReviewGuard>,
+    contract: ReviewContractLoadResult
+  ): string {
+    const contractSummary = contract.contract
+      ? [
+          `Review contract: ${contract.contractPath}`,
+          `Schema sources: ${contract.contract.schemaSources.join(", ") || "(none)"}`,
+          `Derived schemas: ${contract.contract.derivedSchemas.map((rule) => `${rule.derived} <- ${rule.source}`).join(", ") || "(none)"}`,
+          `Generated read-only paths: ${contract.contract.generatedReadOnlyPaths.join(", ") || "(none)"}`,
+          `Folder ownership: ${contract.contract.folderOwnership.map((rule) => `${rule.path} -> ${rule.owner}`).join(", ") || "(none)"}`,
+        ].join("\n")
+      : [
+          `Review contract unavailable: ${contract.contractPath}`,
+          ...contract.warnings,
+        ].join("\n");
+
+    return [
+      "Reviewer context:",
+      `Ticket: ${ticket.title}`,
+      `Allowed paths: ${ticket.allowedPaths.join(", ") || "(none)"}`,
+      `Changed files: ${guard.metadata.changedFiles.join(", ") || "(none)"}`,
+      `Guard rule hits: ${guard.metadata.ruleHits.join(", ") || "(none)"}`,
+      contractSummary,
+      "Diff:",
+      diff,
+    ].join("\n\n");
   }
 
   private isReviewerInfraError(error: unknown): boolean {
@@ -1422,6 +1705,47 @@ export class TicketRunner {
     return [...new Set(blockers)];
   }
 
+  private extractOutOfScopePaths(blockers: string[]): string[] {
+    const prefix = "changed file outside allowed paths:";
+    const extracted = blockers
+      .map((value) => String(value || "").trim())
+      .map((value) => {
+        const lower = value.toLowerCase();
+        if (!lower.startsWith(prefix)) return "";
+        return value.slice(prefix.length).trim();
+      })
+      .filter(Boolean);
+    return Array.from(new Set(extracted));
+  }
+
+  private async autoExpandAllowedPathsFromReviewerBlockers(
+    runId: string | null,
+    ticket: TicketRecord,
+    blockers: string[]
+  ): Promise<void> {
+    const outOfScopePaths = this.extractOutOfScopePaths(blockers);
+    if (!outOfScopePaths.length) return;
+
+    const current = ticket.allowedPaths ?? [];
+    const merged = Array.from(new Set([...current, ...outOfScopePaths]));
+    if (merged.length === current.length) return;
+
+    this.db.updateTicketAllowedPaths(ticket.id, merged);
+    ticket.allowedPaths = merged;
+
+    this.recordAgentStream({
+      agentRole: "doctor",
+      source: "orchestrator",
+      streamKind: "assistant",
+      content: `Auto-expanded allowed paths for ${ticket.id}: ${outOfScopePaths.join(", ")}. Retrying builder with updated scope.`,
+      runId,
+      ticketId: ticket.id,
+      epicId: ticket.epicId,
+      sequence: 1,
+      done: true
+    });
+  }
+
   private async getFailureDecision(
     runId: string | null,
     ticket: TicketRecord,
@@ -1449,6 +1773,143 @@ export class TicketRunner {
     }
   }
 
+  private requiresBuildValidation(ticket: TicketRecord): boolean {
+    const text = [
+      ticket.title,
+      ticket.description,
+      ...(ticket.acceptanceCriteria ?? [])
+    ]
+      .join(" ")
+      .toLowerCase();
+    return /\b(build|compile|compiles|compilation)\b/.test(text);
+  }
+
+  private async maybeRunRequiredBuildCheck(
+    workspaceId: string,
+    runId: string,
+    ticketId: string,
+    ticket: TicketRecord
+  ): Promise<string | null> {
+    if (!this.requiresBuildValidation(ticket)) return null;
+
+    this.recordAgentStream({
+      agentRole: "builder",
+      source: "orchestrator",
+      streamKind: "status",
+      content: "Running required build validation...",
+      runId,
+      ticketId,
+      epicId: ticket.epicId,
+      sequence: 9
+    });
+
+    const result = await this.bridge.runNamedCommand({
+      workspaceId,
+      runId,
+      ticketId,
+      nodeName: "builder_build_check",
+      commandName: "build",
+      timeoutMs: 300_000
+    });
+
+    if (result.exitCode !== 0) {
+      const output = `${result.stdout}\n${result.stderr}`.trim().slice(0, 2000);
+      throw new Error(`Required build validation failed (exit ${result.exitCode}). ${output}`);
+    }
+
+    return "Required build validation passed.";
+  }
+
+  private isPushConflictError(error: unknown): boolean {
+    const text = error instanceof Error ? error.message : String(error ?? "");
+    const lower = text.toLowerCase();
+    return (
+      lower.includes("non-fast-forward") ||
+      lower.includes("failed to push some refs") ||
+      (lower.includes("rebase") && lower.includes("could not apply"))
+    );
+  }
+
+  private async autoRerunFromFreshHeadOnPushConflict(
+    runId: string,
+    ticket: TicketRecord,
+    workspaceId: string,
+    error: unknown
+  ): Promise<TicketLoopResult> {
+    const messageText = error instanceof Error ? error.message : String(error);
+    const recentPushConflicts = this.db
+      .listRunsForTicket(ticket.id)
+      .filter((run) => {
+        const text = `${run.lastMessage ?? ""}\n${run.errorText ?? ""}`.toLowerCase();
+        return text.includes("non-fast-forward") || text.includes("failed to push some refs") || text.includes("could not apply");
+      }).length;
+
+    if (recentPushConflicts >= 2) {
+      this.db.updateRun({
+        runId,
+        status: "failed",
+        currentNode: "error",
+        heartbeatAt: nowIso(),
+        lastMessage: "Push conflict repeated; manual merge required.",
+        errorText: messageText
+      });
+      this.db.updateTicketRunState({
+        ticketId: ticket.id,
+        status: "failed",
+        currentNode: "error",
+        lastHeartbeatAt: nowIso(),
+        lastMessage: "Push conflict repeated; manual merge required."
+      });
+      if (workspaceId) await this.bridge.archiveWorkspace(workspaceId).catch(() => undefined);
+      return {
+        runId,
+        workspaceId,
+        status: "failed",
+        lastDiff: "",
+        reviewVerdict: null,
+        testSummary: "Push conflict repeated; manual merge required."
+      };
+    }
+
+    const nextRunId = await this.start(ticket.id, ticket.epicId);
+    const note = `Push conflict while landing changes; auto-rerunning from fresh head as ${nextRunId}.`;
+    this.db.updateRun({
+      runId,
+      status: "failed",
+      currentNode: "error",
+      heartbeatAt: nowIso(),
+      lastMessage: note,
+      errorText: messageText
+    });
+    this.db.updateTicketRunState({
+      ticketId: ticket.id,
+      status: "queued",
+      currentRunId: nextRunId,
+      currentNode: "queued",
+      lastHeartbeatAt: nowIso(),
+      lastMessage: note
+    });
+    this.recordAgentStream({
+      agentRole: "doctor",
+      source: "orchestrator",
+      streamKind: "assistant",
+      content: note,
+      runId,
+      ticketId: ticket.id,
+      epicId: ticket.epicId,
+      done: true
+    });
+    if (workspaceId) await this.bridge.archiveWorkspace(workspaceId).catch(() => undefined);
+    return {
+      runId,
+      workspaceId,
+      status: "failed",
+      lastDiff: "",
+      reviewVerdict: null,
+      testSummary: note
+    };
+  }
+
   private async escalate(runId: string, workspaceId: string, ticketId: string, reason: string): Promise<TicketLoopResult> {
     this.db.updateRun({ runId, status: "escalated", currentNode: "escalated", heartbeatAt: nowIso(), lastMessage: reason, errorText: reason });
     this.db.updateTicketRunState({ ticketId, status: "escalated", currentNode: "escalated", lastHeartbeatAt: nowIso(), lastMessage: reason });
@@ -1470,6 +1931,22 @@ export class TicketRunner {
     if (epicId && this.lifecycle.isEpicCancelled(epicId)) {
       throw new TicketCancelledError(`Epic ${epicId} cancelled by user.`);
     }
+  }
+
+  private resolveMaxBuildAttempts(ticket: TicketRecord): number {
+    const configured = Number(ticket.metadata.maxBuildAttempts ?? 3);
+    if (!Number.isFinite(configured) || configured <= 0) return 3;
+    return Math.min(3, Math.floor(configured));
+  }
+
+  private reviewerVerdictFingerprint(verdict: ReviewerVerdict, diff: string): string {
+    const payload = JSON.stringify({
+      approved: verdict.approved,
+      blockers: verdict.blockers,
+      suggestions: verdict.suggestions,
+      diff: diff.slice(0, 8000)
+    });
+    return createHash("sha1").update(payload).digest("hex");
   }
 }
 

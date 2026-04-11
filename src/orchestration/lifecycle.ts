@@ -61,6 +61,16 @@ export class LifecycleService {
     if (!epic) throw new Error(`Epic not found: ${epicId}`);
 
     this.db.updateEpicStatus(epic.id, "cancelled");
+    
+    // 1. Revert any changes in the target directory
+    try {
+      console.log(`[LIFECYCLE] Reverting changes in ${epic.targetDir} for epic ${epicId}...`);
+      await git(epic.targetDir, ["reset", "--hard", "HEAD"]);
+      await git(epic.targetDir, ["clean", "-fd"]);
+    } catch (err) {
+      console.warn(`[LIFECYCLE] Failed to revert changes in ${epic.targetDir}: ${err}`);
+    }
+
     const tickets = this.db.listTickets(epic.id);
     const summaries = await Promise.all(tickets.map((ticket) => this.cancelTicketRecord(ticket)));
     const runs = this.db.listRunsForEpic(epic.id).filter((run) => !run.ticketId);

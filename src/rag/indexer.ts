@@ -13,6 +13,8 @@ const DEFAULT_EMBEDDING_MODEL = "nomic-embed-text";
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 const MAX_FILE_SIZE = 50 * 1024; // 50KB
 const SKIP_PATTERNS = /node_modules|\.git|\.next|dist|build|\.env|\.lock/;
+const EMBEDDING_BATCH_SIZE = 64;
+const EMBEDDING_MAX_CHARS = 4000;
 
 export interface IndexOptions {
   repoRoot: string;
@@ -34,7 +36,7 @@ export interface IndexResult {
  */
 export async function getOrCreateIndex(options: IndexOptions): Promise<IndexResult> {
   const model = options.model || DEFAULT_EMBEDDING_MODEL;
-  const existing = options.db.findRagIndex(options.repoRoot, options.commitHash, model);
+  const existing = options.db.getRagIndex(options.repoRoot, options.commitHash, model);
 
   if (existing) {
     return {
@@ -84,9 +86,16 @@ export async function indexWorkspace(options: IndexOptions): Promise<{ indexId: 
     return { indexId, chunkCount: 0 };
   }
 
-  // Embed all chunk contents
-  const contents = chunks.map((c) => c.content);
-  const embeddings = await embedTexts(contents, { model, baseUrl });
+  // Embed chunk contents in batches to avoid oversized Ollama requests.
+  const contents = chunks.map((c) =>
+    c.content.length > EMBEDDING_MAX_CHARS ? c.content.slice(0, EMBEDDING_MAX_CHARS) : c.content
+  );
+  const embeddings: Float32Array[] = [];
+  for (let i = 0; i < contents.length; i += EMBEDDING_BATCH_SIZE) {
+    const batch = contents.slice(i, i + EMBEDDING_BATCH_SIZE);
+    const batchEmbeddings = await embedTexts(batch, { model, baseUrl });
+    embeddings.push(...batchEmbeddings);
+  }
 
   // Create index record
   const indexId = options.db.createRagIndex({
@@ -123,7 +132,7 @@ async function buildAndStoreAst(
   db: AppDatabase,
   scopePaths?: string[]
 ): Promise<void> {
-  const files = await walkDir(repoRoot, scopePaths);
+  const files = await walkDir(repoRoot, repoRoot, scopePaths);
   const tsFiles = files.filter((f) => /\.(ts|tsx)$/.test(f));
 
   const nodes: Parameters<AppDatabase["insertAstNodes"]>[1] = [];
@@ -190,7 +199,7 @@ interface Chunk {
  * Walk directory, collect files, chunk them
  */
 async function collectAndChunkFiles(repoRoot: string, scopePaths?: string[]): Promise<Chunk[]> {
-  const files = await walkDir(repoRoot, scopePaths);
+  const files = await walkDir(repoRoot, repoRoot, scopePaths);
   const chunks: Chunk[] = [];
 
   for (const file of files) {
@@ -222,7 +231,35 @@ async function collectAndChunkFiles(repoRoot: string, scopePaths?: string[]): Pr
 /**
  * Recursively walk directory
  */
-async function walkDir(dir: string, scopePaths?: string[]): Promise<string[]> {
+function normalizeScopePath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/^\.?\//, "").replace(/\/+$/, "");
+}
+
+function isInScope(relPath: string, scopePaths?: string[]): boolean {
+  if (!scopePaths || scopePaths.length === 0) return true;
+  const normalizedRel = normalizeScopePath(relPath);
+  const normalizedScopes = scopePaths.map(normalizeScopePath).filter(Boolean);
+  if (normalizedScopes.length === 0) return true;
+  if (normalizedScopes.includes("*")) return true;
+  return normalizedScopes.some((scope) => normalizedRel === scope || normalizedRel.startsWith(`${scope}/`));
+}
+
+function shouldTraverseDir(relDir: string, scopePaths?: string[]): boolean {
+  if (!scopePaths || scopePaths.length === 0) return true;
+  const normalizedDir = normalizeScopePath(relDir);
+  const normalizedScopes = scopePaths.map(normalizeScopePath).filter(Boolean);
+  if (normalizedScopes.length === 0) return true;
+  if (normalizedScopes.includes("*")) return true;
+  // Traverse when this directory is inside a scoped path OR is an ancestor of one.
+  return normalizedScopes.some(
+    (scope) =>
+      normalizedDir === scope ||
+      normalizedDir.startsWith(`${scope}/`) ||
+      scope.startsWith(`${normalizedDir}/`)
+  );
+}
+
+async function walkDir(repoRoot: string, dir: string, scopePaths?: string[]): Promise<string[]> {
   const files: string[] = [];
   const entries = await readdir(dir, { withFileTypes: true });
 
@@ -233,20 +270,14 @@ async function walkDir(dir: string, scopePaths?: string[]): Promise<string[]> {
     if (SKIP_PATTERNS.test(entry.name)) continue;
 
     // Scope filter
-    if (scopePaths && scopePaths.length > 0) {
-      const relPath = relative(dir, fullPath);
-      if (!scopePaths.some((p) => relPath.startsWith(p))) {
-        continue;
-      }
-    }
+    const relPathFromRoot = relative(repoRoot, fullPath).replace(/\\/g, "/");
 
     if (entry.isDirectory()) {
-      files.push(...(await walkDir(fullPath, scopePaths)));
+      if (!shouldTraverseDir(relPathFromRoot, scopePaths)) continue;
+      files.push(...(await walkDir(repoRoot, fullPath, scopePaths)));
     } else if (entry.isFile()) {
-      const stat = await readFile(fullPath, { flag: "r" }).catch(() => null);
-      if (stat) {
-        files.push(fullPath);
-      }
+      if (!isInScope(relPathFromRoot, scopePaths)) continue;
+      files.push(fullPath);
     }
   }
 
@@ -257,7 +288,7 @@ function isCodeFile(path: string): boolean {
   return /\.(ts|tsx|js|jsx|py|go|rs|c|cpp|java)$/.test(path);
 }
 
-function isDocFile(path: string): boolean {
+export function isDocFile(path: string): boolean {
   return /\.(md|markdown|txt|rst)$/i.test(path) || /README|CHANGELOG|AUTHORS/.test(path);
 }
 
@@ -330,7 +361,7 @@ function chunkCodeFile(filePath: string, content: string): Chunk[] {
 /**
  * Chunk Markdown files by headings
  */
-function chunkDocFile(filePath: string, content: string): Chunk[] {
+export function chunkDocFile(filePath: string, content: string): Chunk[] {
   const sections = content.split(/\n(#{1,3} .+)/);
   const chunks: Chunk[] = [];
 

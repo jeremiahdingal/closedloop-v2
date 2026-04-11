@@ -102,6 +102,112 @@ export class RecoveryService {
     return { recovered, failedDuplicates };
   }
 
+  async rescueQueuedTicketStalls(): Promise<string[]> {
+    const rescuedTicketIds: string[] = [];
+    const activeTicketStates = new Set(["queued", "building", "reviewing", "testing"]);
+
+    for (const ticket of this.db.listTickets()) {
+      if (!activeTicketStates.has(ticket.status)) continue;
+      if (!ticket.epicId || !this.db.getEpic(ticket.epicId) || this.db.getEpic(ticket.epicId)?.status === "cancelled") continue;
+
+      const runs = this.db.listRunsForTicket(ticket.id);
+      const activeRun = runs.find((run) => run.status === "queued" || run.status === "running" || run.status === "waiting");
+
+      if (activeRun) {
+        // Ensure queued runs have an actual queued/running job.
+        if (activeRun.status === "queued") {
+          const hasQueuedJob = this.db.listJobRecords().some((job) => {
+            if (job.kind !== "run_ticket") return false;
+            if (job.status !== "queued" && job.status !== "running") return false;
+            const payload = (job.payload ?? {}) as Record<string, unknown>;
+            return String(payload.runId ?? "") === activeRun.id;
+          });
+          if (!hasQueuedJob) {
+            this.db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: activeRun.id });
+            this.db.recordEvent({
+              aggregateType: "ticket",
+              aggregateId: ticket.id,
+              runId: activeRun.id,
+              ticketId: ticket.id,
+              kind: "recovery_requeued",
+              message: "Doctor re-enqueued missing run_ticket job for queued run.",
+              payload: { runId: activeRun.id, reason: "missing_job_for_queued_run" }
+            });
+            this.recordAgentStream({
+              agentRole: "doctor",
+              source: "orchestrator",
+              streamKind: "assistant",
+              content: `Doctor reattached queued job for ${ticket.id} (run ${activeRun.id}).`,
+              runId: activeRun.id,
+              ticketId: ticket.id,
+              epicId: ticket.epicId,
+              done: true
+            });
+            rescuedTicketIds.push(ticket.id);
+          }
+        }
+
+        if (ticket.currentRunId !== activeRun.id) {
+          this.db.updateTicketRunState({
+            ticketId: ticket.id,
+            currentRunId: activeRun.id,
+            status: activeRun.status === "running" ? "building" : "queued",
+            currentNode: activeRun.currentNode,
+            lastHeartbeatAt: nowIso(),
+            lastMessage: "Doctor realigned ticket with active run."
+          });
+        }
+        continue;
+      }
+
+      // No active run: only restart queued tickets whose deps are satisfied.
+      if (ticket.status !== "queued") continue;
+      const epicTickets = this.db.listTickets(ticket.epicId);
+      const supersededIds = new Set(
+        epicTickets
+          .map((t) => (t.metadata as Record<string, unknown>)?.originalTicketId as string | undefined)
+          .filter((id): id is string => Boolean(id))
+      );
+      const depsReady = ticket.dependencies.every((dependencyId) => {
+        const dep = this.db.getTicket(dependencyId);
+        return dep?.status === "approved" || supersededIds.has(dependencyId);
+      });
+      if (!depsReady) continue;
+
+      const runId = await this.ticketRunner.start(ticket.id, ticket.epicId);
+      this.db.updateTicketRunState({
+        ticketId: ticket.id,
+        status: "building",
+        currentRunId: runId,
+        currentNode: "recovery",
+        lastHeartbeatAt: nowIso(),
+        lastMessage: "Doctor moved stalled queued ticket back to building."
+      });
+      this.recordAgentStream({
+        agentRole: "doctor",
+        source: "orchestrator",
+        streamKind: "assistant",
+        content: `Doctor detected queued-ticket stall for ${ticket.id} and restarted execution (run ${runId}).`,
+        runId,
+        ticketId: ticket.id,
+        epicId: ticket.epicId,
+        done: true
+      });
+      this.db.recordEvent({
+        aggregateType: "ticket",
+        aggregateId: ticket.id,
+        runId,
+        ticketId: ticket.id,
+        kind: "recovery_requeued",
+        message: "Doctor restarted stalled queued ticket.",
+        payload: { runId, reason: "queued_ticket_without_active_run" }
+      });
+      rescuedTicketIds.push(ticket.id);
+    }
+
+    return Array.from(new Set(rescuedTicketIds));
+  }
+
   async rerunStaleRuns(
     staleAfterMs = this.config.staleRunAfterMs,
     maxRecoveries = this.config.staleRunMaxRecoveries
@@ -250,6 +356,12 @@ export class RecoveryService {
       const run = this.db.getRun(String(job.payload.runId));
       if (!run || run.status !== "queued") return;
       await this.goalRunner.runManualReviewExisting(run.id);
+      return;
+    }
+    if (job.kind === "run_epic_play_loop") {
+      const run = this.db.getRun(String(job.payload.runId));
+      if (!run || run.status !== "queued") return;
+      await this.goalRunner.runManualPlayLoopExisting(run.id);
       return;
     }
     throw new Error(`Unsupported job kind: ${job.kind}`);

@@ -22,16 +22,102 @@ export interface ContextBuildOptions {
 export interface BuiltContext {
   codeContext: string;
   docContext: string;
+  toolContext?: string;
   totalTokenEstimate: number;
   retrievalMode: "semantic" | "keyword";
   chunkCount: number;
+}
+
+export interface ToolingContextOptions {
+  role: string;
+  availableTools: string[];
+  db: AppDatabase;
+  indexId: number;
+  model?: string;
+  baseUrl?: string;
+  maxTokens?: number;
+  includeRepair?: boolean;
+}
+
+function resolveRagBudget(model: string | undefined, explicitMaxTokens: number | undefined): number {
+  if (typeof explicitMaxTokens === "number" && Number.isFinite(explicitMaxTokens) && explicitMaxTokens > 0) {
+    return explicitMaxTokens;
+  }
+  void model;
+  return 2000;
+}
+
+/**
+ * Build context for tool guidance (playbooks, toolcards, repair hints)
+ */
+export async function buildToolingContext(options: ToolingContextOptions): Promise<string> {
+  const maxTokens = options.maxTokens || 2000;
+  
+  // 1. Retrieve the playbook for the role
+  const playbookQuery = `playbook for ${options.role}`;
+  const playbooks = await retrieveChunks({
+    query: playbookQuery,
+    db: options.db,
+    indexId: options.indexId,
+    topK: 5,
+    scopePaths: ["src/public/tooling/playbooks"],
+    maxTokens: Math.floor(maxTokens * 0.4),
+    model: options.model,
+    baseUrl: options.baseUrl,
+  });
+
+  // 2. Retrieve toolcards for available tools
+  const toolQueries = options.availableTools.map(t => `tool card for ${t}`).join(" OR ");
+  const toolcards = await retrieveChunks({
+    query: toolQueries,
+    db: options.db,
+    indexId: options.indexId,
+    topK: options.availableTools.length,
+    scopePaths: ["src/public/tooling/toolcards"],
+    maxTokens: Math.floor(maxTokens * 0.5),
+    model: options.model,
+    baseUrl: options.baseUrl,
+  });
+
+  // 3. Optional: Retrieve repair hints
+  const repairHints = options.includeRepair 
+    ? await retrieveChunks({
+        query: "common tool call errors and repairs",
+        db: options.db,
+        indexId: options.indexId,
+        topK: 3,
+        scopePaths: ["src/public/tooling/repair"],
+        maxTokens: Math.floor(maxTokens * 0.1),
+        model: options.model,
+        baseUrl: options.baseUrl,
+      })
+    : [];
+
+  const sections = ["=== Tool Guidance ==="];
+  
+  if (playbooks.length > 0) {
+    sections.push("--- Playbook ---");
+    sections.push(...playbooks.map(p => p.content));
+  }
+
+  if (toolcards.length > 0) {
+    sections.push("--- Tool Cards ---");
+    sections.push(...toolcards.map(t => t.content));
+  }
+
+  if (repairHints.length > 0) {
+    sections.push("--- Repair Hints ---");
+    sections.push(...repairHints.map(r => r.content));
+  }
+
+  return sections.join("\n\n");
 }
 
 /**
  * Build pre-computed context for a ticket
  */
 export async function buildContextForTicket(options: ContextBuildOptions): Promise<BuiltContext> {
-  const maxTokens = options.maxTokens || 8000;
+  const maxTokens = resolveRagBudget(options.model, options.maxTokens);
 
   try {
     // Create or retrieve index
@@ -66,12 +152,15 @@ export async function buildContextForTicket(options: ContextBuildOptions): Promi
         .slice(0, 1000); // Cap query at 1000 chars
 
     // Retrieve scoped to allowed paths
-    const primaryBudget = Math.floor(maxTokens * 0.7);
+    const primaryBudget = Math.floor(maxTokens * 0.75);
+    const primaryTopK = maxTokens >= 12000 ? 24 : 14;
+    const secondaryTopK = maxTokens >= 12000 ? 12 : 8;
+
     const primaryChunks = await retrieveChunks({
       query,
       db: options.db,
       indexId: indexResult.id!,
-      topK: 15,
+      topK: primaryTopK,
       scopePaths: options.ticket.allowedPaths,
       maxTokens: primaryBudget,
       model: options.model,
@@ -80,12 +169,12 @@ export async function buildContextForTicket(options: ContextBuildOptions): Promi
 
     // Retrieve broader context (unscoped) if budget allows
     const secondaryBudget = maxTokens - primaryBudget;
-    const secondaryChunks = secondaryBudget > 1000
+    const secondaryChunks = secondaryBudget > 500
       ? await retrieveChunks({
           query,
           db: options.db,
           indexId: indexResult.id!,
-          topK: 10,
+          topK: secondaryTopK,
           scopePaths: undefined,
           maxTokens: secondaryBudget,
           model: options.model,
@@ -151,7 +240,7 @@ export interface QueryContextBuildOptions {
 export async function buildContextForQuery(
   options: QueryContextBuildOptions
 ): Promise<BuiltContext & { indexId: number | null }> {
-  const maxTokens = options.maxTokens || 8000;
+  const maxTokens = resolveRagBudget(options.model, options.maxTokens);
 
   try {
     const indexResult = await getOrCreateIndex({
@@ -180,7 +269,7 @@ export async function buildContextForQuery(
       query,
       db: options.db,
       indexId: indexResult.id!,
-      topK: 20,
+      topK: maxTokens >= 12000 ? 22 : 14,
       scopePaths: options.scopePaths,
       maxTokens,
       model: options.model,

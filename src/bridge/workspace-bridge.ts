@@ -24,6 +24,7 @@ export class WorkspaceBridge {
   readonly config = loadConfig();
   readonly auditDir = path.join(this.config.dataDir, "audit");
   private readonly db: AppDatabase;
+  private readonly protectedBranches = new Set(["main", "master"]);
 
   constructor(db: AppDatabase) {
     this.db = db;
@@ -38,11 +39,12 @@ export class WorkspaceBridge {
     await stat(gitDir);
   }
 
-  async createWorkspace(input: { ticketId: string; runId: string; baseRef?: string; owner: string; targetDir: string }): Promise<WorkspaceRecord> {
+  async createWorkspace(input: { ticketId: string; runId: string; baseRef?: string; owner: string; targetDir: string; useTargetBranch?: boolean }): Promise<WorkspaceRecord> {
     const isGitRepo = await stat(path.join(input.targetDir, ".git")).then(() => true).catch(() => false);
     
     const workspaceId = randomId("ws");
-    const branchName = `ticket/${input.ticketId}-${workspaceId.slice(-6)}`;
+    const useTargetBranch = input.useTargetBranch ?? false;
+    const branchName = useTargetBranch ? input.baseRef ?? "HEAD" : `ticket/${input.ticketId}-${workspaceId.slice(-6)}`;
     const worktreePath = path.join(this.config.workspacesDir, workspaceId);
     await ensureDir(this.config.workspacesDir);
 
@@ -69,7 +71,11 @@ export class WorkspaceBridge {
           throw resolveError;
         }
       }
-      await git(input.targetDir, ["worktree", "add", "-b", branchName, worktreePath, baseCommit]);
+      if (useTargetBranch) {
+        await git(input.targetDir, ["worktree", "add", worktreePath, baseCommit]);
+      } else {
+        await git(input.targetDir, ["worktree", "add", "-b", branchName, worktreePath, baseCommit]);
+      }
     } else {
       await cp(input.targetDir, worktreePath, { recursive: true });
       await git(worktreePath, ["init"]);
@@ -252,8 +258,39 @@ export class WorkspaceBridge {
   async gitPush(input: { workspaceId: string; remote?: string }): Promise<string> {
     const workspace = this.requireWorkspace(input.workspaceId);
     const remote = input.remote ?? "origin";
+    this.assertAutomationPushAllowed(workspace.branchName, "gitPush");
     await git(workspace.worktreePath, ["push", "-u", remote, workspace.branchName]);
     return `${remote}/${workspace.branchName}`;
+  }
+
+  async gitPushToBranch(input: { workspaceId: string; targetBranch: string; remote?: string }): Promise<string> {
+    const workspace = this.requireWorkspace(input.workspaceId);
+    const remote = input.remote ?? "origin";
+    this.assertAutomationPushAllowed(input.targetBranch, "gitPushToBranch");
+    const pushArgs = ["push", remote, `HEAD:refs/heads/${input.targetBranch}`];
+    try {
+      await git(workspace.worktreePath, pushArgs);
+    } catch (error) {
+      const errText = error instanceof Error ? error.message : String(error);
+      const isNonFastForward = /non-fast-forward|fetch first|rejected/i.test(errText);
+      if (!isNonFastForward) {
+        throw error;
+      }
+
+      try {
+        await git(workspace.worktreePath, ["fetch", remote, input.targetBranch]);
+        await git(workspace.worktreePath, ["rebase", `${remote}/${input.targetBranch}`]);
+      } catch (rebaseError) {
+        await git(workspace.worktreePath, ["rebase", "--abort"]).catch(() => undefined);
+        const rebaseText = rebaseError instanceof Error ? rebaseError.message : String(rebaseError);
+        throw new Error(
+          `Push to '${input.targetBranch}' was non-fast-forward and automatic rebase failed: ${rebaseText}`
+        );
+      }
+
+      await git(workspace.worktreePath, pushArgs);
+    }
+    return `${remote}/${input.targetBranch}`;
   }
 
   async gitCreatePr(input: { workspaceId: string; title: string; body?: string; base?: string }): Promise<string | null> {
@@ -321,20 +358,23 @@ export class WorkspaceBridge {
   async getDiffStats(workspaceId: string): Promise<{ path: string; additions: number; deletions: number }[]> {
     const workspace = this.requireWorkspace(workspaceId);
     await this.stageTicketChanges(workspace.worktreePath);
-    const result = await git(workspace.worktreePath, ["diff", "--staged", "--stat", "--", "."]);
-    const lines = result.stdout.trim().split("\n").filter(l => l.includes("|"));
-    return lines.map(line => {
-      const parts = line.split("|");
-      const filePath = parts[0].trim();
-      const stats = parts[1].trim();
-      const addMatch = stats.match(/(\d+)\s+\+/);
-      const delMatch = stats.match(/(\d+)\s+-/);
-      return {
-        path: filePath,
-        additions: addMatch ? parseInt(addMatch[1]) : 0,
-        deletions: delMatch ? parseInt(delMatch[1]) : 0
-      };
-    });
+    const result = await git(workspace.worktreePath, ["diff", "--staged", "--numstat", "--", "."]);
+    return result.stdout
+      .trim()
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const parts = line.split("\t");
+        const additions = Number.parseInt(parts[0] ?? "", 10);
+        const deletions = Number.parseInt(parts[1] ?? "", 10);
+        return {
+          path: parts.slice(2).join("\t"),
+          additions: Number.isFinite(additions) ? additions : 0,
+          deletions: Number.isFinite(deletions) ? deletions : 0
+        };
+      })
+      .filter((row) => row.path.length > 0);
   }
 
   private async stageTicketChanges(worktreePath: string): Promise<void> {
@@ -499,14 +539,43 @@ export class WorkspaceBridge {
   /**
    * Create a temporary worktree from an existing branch (without adding it to the database)
    */
-  async createTempWorktreeFromBranch(repoRoot: string, branchName: string): Promise<string> {
+  async createTempWorktreeFromBranch(repoRoot: string, branchName: string, fallbackRef?: string | null): Promise<string> {
     const tempId = randomId("tmp");
     const tempWorktreePath = path.join(this.config.workspacesDir, tempId);
     await ensureDir(this.config.workspacesDir);
 
     // Use detached HEAD pointing at the branch tip — avoids "already in use" error
     // when the branch is currently checked out in another active worktree.
-    await git(repoRoot, ["worktree", "add", "--detach", tempWorktreePath, branchName]);
+    const candidateRefs = [
+      branchName,
+      `origin/${branchName}`,
+      `refs/remotes/origin/${branchName}`,
+      fallbackRef ?? ""
+    ]
+      .map((value) => value.trim())
+      .filter(Boolean);
+
+    let resolvedRef: string | null = null;
+    for (const candidate of candidateRefs) {
+      try {
+        const parsed = await git(repoRoot, ["rev-parse", "--verify", `${candidate}^{commit}`]);
+        const commit = parsed.stdout.trim();
+        if (commit) {
+          resolvedRef = commit;
+          break;
+        }
+      } catch {
+        // Try next ref candidate.
+      }
+    }
+
+    if (!resolvedRef) {
+      throw new Error(
+        `Cannot resolve branch '${branchName}' for temp worktree (tried local, origin, remote ref${fallbackRef ? ", and fallback commit" : ""}).`
+      );
+    }
+
+    await git(repoRoot, ["worktree", "add", "--detach", tempWorktreePath, resolvedRef]);
     return tempWorktreePath;
   }
 
@@ -532,6 +601,7 @@ export class WorkspaceBridge {
    * Commit and push changes from a worktree path (used for temp worktrees)
    */
   async commitAndPushFromPath(worktreePath: string, branchName: string, message: string): Promise<string> {
+    this.assertAutomationPushAllowed(branchName, "commitAndPushFromPath");
     // Stage all changes
     await git(worktreePath, ["add", "-A"]);
 
@@ -544,12 +614,49 @@ export class WorkspaceBridge {
       return head.stdout.trim();
     }
 
-    // Push
-    await git(worktreePath, ["push", "-u", "origin", branchName]);
+    const pushArgs = ["push", "-u", "origin", `HEAD:refs/heads/${branchName}`];
+    try {
+      // Push detached HEAD explicitly to the target branch name.
+      await git(worktreePath, pushArgs);
+    } catch (error) {
+      const errText = error instanceof Error ? error.message : String(error);
+      const isNonFastForward = /non-fast-forward|fetch first|rejected/i.test(errText);
+      if (!isNonFastForward) {
+        throw error;
+      }
+
+      // Another process likely updated the same remote branch.
+      // Rebase our commit on top of latest remote branch and retry once.
+      try {
+        await git(worktreePath, ["fetch", "origin", branchName]);
+        await git(worktreePath, ["rebase", `origin/${branchName}`]);
+      } catch (rebaseError) {
+        // Best effort cleanup before surfacing a clearer failure.
+        await git(worktreePath, ["rebase", "--abort"]).catch(() => undefined);
+        const rebaseText = rebaseError instanceof Error ? rebaseError.message : String(rebaseError);
+        throw new Error(
+          `Push to '${branchName}' was non-fast-forward and automatic rebase failed: ${rebaseText}`
+        );
+      }
+
+      await git(worktreePath, pushArgs);
+    }
 
     // Return commit SHA
     const head = await git(worktreePath, ["rev-parse", "HEAD"]);
     return head.stdout.trim();
+  }
+
+  private assertAutomationPushAllowed(branchName: string, operation: string): void {
+    const normalized = String(branchName || "").trim().replace(/^refs\/heads\//, "");
+    const allowProtected = process.env.ALLOW_AUTOMATION_PUSH_TO_PROTECTED_BRANCH === "1";
+    if (!allowProtected && this.protectedBranches.has(normalized)) {
+      throw new Error(
+        `[${operation}] Refusing automated push to protected branch '${normalized}'. ` +
+        `Push to a feature/target branch and merge manually. ` +
+        `Set ALLOW_AUTOMATION_PUSH_TO_PROTECTED_BRANCH=1 to override.`
+      );
+    }
   }
 
   /**

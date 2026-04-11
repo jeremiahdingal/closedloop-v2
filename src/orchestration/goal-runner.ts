@@ -13,9 +13,10 @@ import { formatCodexFailure } from "./codex.ts";
 import { formatQwenFailure } from "./qwen.ts";
 import { LifecycleService } from "./lifecycle.ts";
 import { WorkspaceBridge } from "../bridge/workspace-bridge.ts";
-import { buildContextForQuery } from "../rag/context-builder.ts";
+import { buildContextForQuery, type BuiltContext } from "../rag/context-builder.ts";
 import { git } from "../bridge/git.ts";
 import { ensureProjectStructureFile } from "./project-structure.ts";
+import { PlayLoopService } from "./play-loop.ts";
 
 type GoalGraphState = {
   runId: string;
@@ -87,6 +88,7 @@ export class GoalRunner {
   private readonly gateway: ModelGateway;
   private readonly lifecycle: LifecycleService;
   private readonly bridge: WorkspaceBridge;
+  private readonly playLoop: PlayLoopService;
 
   constructor(db: AppDatabase, ticketRunner: TicketRunner, gateway: ModelGateway, lifecycle: LifecycleService, bridge?: WorkspaceBridge) {
     this.db = db;
@@ -94,6 +96,66 @@ export class GoalRunner {
     this.gateway = gateway;
     this.lifecycle = lifecycle;
     this.bridge = bridge ?? new WorkspaceBridge(db);
+    this.playLoop = new PlayLoopService(db, this.bridge, gateway, ticketRunner, lifecycle, {
+      runEpicDecoder: this.runEpicDecoder.bind(this),
+      executeTickets: this.executeTickets.bind(this),
+      runEpicReview: this.runEpicReview.bind(this)
+    }, this.epicReviewTimeoutMs, this.heartbeatIntervalMs);
+  }
+
+  private async executeTickets(epic: EpicRecord, tickets: TicketRecord[], runId: string): Promise<void> {
+    this.assertNotCancelled(epic.id);
+    this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Executing ${tickets.length} repair tickets`, runId, epicId: epic.id, sequence: 0 });
+
+    const workQueue: TicketRecord[] = [...tickets];
+
+    // Start root tickets (no deps)
+    for (const ticket of workQueue.filter((item) => item.dependencies.length === 0)) {
+      this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting repair ticket: ${ticket.id}`, runId, epicId: epic.id, ticketId: ticket.id, sequence: 1 });
+      if (!ticket.currentRunId) await this.ticketRunner.start(ticket.id, epic.id);
+    }
+
+    // Execute each ticket
+    for (let qi = 0; qi < workQueue.length; qi++) {
+      const ticket = workQueue[qi];
+      this.assertNotCancelled(epic.id);
+
+      let current = this.db.getTicket(ticket.id);
+      while (current && (current.status === "queued" || current.status === "building" || current.status === "reviewing" || current.status === "testing")) {
+        const queuedRun = this.db.listRuns().find((record) => record.ticketId === ticket.id && (record.status === "queued" || record.status === "running"));
+        if (!queuedRun) break;
+        if (queuedRun.status === "queued") {
+          try {
+            await this.ticketRunner.runExisting(queuedRun.id);
+          } catch {
+            break;
+          }
+        }
+        current = this.db.getTicket(ticket.id);
+      }
+
+      // Start dependents whose deps are now all approved
+      for (const dependent of workQueue.filter((candidate) => candidate.dependencies.includes(ticket.id))) {
+        const depCurrent = this.db.getTicket(dependent.id);
+        const depsReady = dependent.dependencies.every((dependencyId: string) => {
+          const dep = this.db.getTicket(dependencyId);
+          return dep?.status === "approved";
+        });
+        if (depCurrent?.status === "queued" && depsReady && !depCurrent.currentRunId) {
+          await this.ticketRunner.start(depCurrent.id, epic.id);
+          const depRun = this.db.listRuns().find((record) => record.ticketId === depCurrent.id && record.status === "queued");
+          if (depRun) {
+            try {
+              await this.ticketRunner.runExisting(depRun.id);
+            } catch {
+              // dependent ticket crashed — continue
+            }
+          }
+        }
+      }
+    }
+
+    this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Repair tickets execution complete`, runId, epicId: epic.id, sequence: 0 });
   }
 
   private materializeTickets(epicId: string, plans: GoalTicketPlan[]) {
@@ -210,6 +272,31 @@ export class GoalRunner {
     return runId;
   }
 
+  async enqueueManualPlayLoop(epicId: string): Promise<string> {
+    const runId = randomId("run");
+    this.db.createRun({
+      id: runId,
+      kind: "epic",
+      epicId,
+      ticketId: null,
+      status: "queued",
+      currentNode: "manual_play_loop",
+      attempt: 0,
+      heartbeatAt: null,
+      lastMessage: "Queued manual play loop run.",
+      errorText: null
+    });
+    this.db.enqueueJob("run_epic_play_loop", { epicId, runId });
+    this.db.recordEvent({
+      aggregateType: "epic",
+      aggregateId: epicId,
+      runId,
+      kind: "epic_manual_play_loop_queued",
+      message: "Manual play loop queued."
+    });
+    return runId;
+  }
+
   async runExisting(runId: string): Promise<void> {
     if (!this.config.useLangGraph) return this.runExistingLegacy(runId);
     const runtime = await loadLangGraphRuntime();
@@ -312,14 +399,16 @@ export class GoalRunner {
       this.db.updateRun({ runId, status: "failed", currentNode: "error", heartbeatAt: nowIso(), lastMessage: msg, errorText: msg });
       throw error;
     }
-    this.db.updateEpicStatus(epic.id, review.verdict === "approved" ? "done" : "failed");
+
+    const approved = review.verdict === "approved";
+    this.db.updateEpicStatus(epic.id, approved ? "done" : "failed");
     this.db.updateRun({
       runId,
-      status: review.verdict === "approved" ? "succeeded" : "failed",
+      status: approved ? "succeeded" : "failed",
       currentNode: "complete",
       heartbeatAt: nowIso(),
       lastMessage: review.summary,
-      errorText: review.verdict === "approved" ? null : review.summary
+      errorText: approved ? null : review.summary
     });
     this.db.recordEvent({
       aggregateType: "epic",
@@ -327,7 +416,93 @@ export class GoalRunner {
       runId,
       kind: "epic_manual_reviewed",
       message: review.summary,
-      payload: review as any
+      payload: review
+    });
+  }
+
+  async runManualPlayLoopExisting(runId: string): Promise<void> {
+    const run = this.db.getRun(runId);
+    if (!run || !run.epicId) throw new Error(`Epic run not found: ${runId}`);
+    const epic = this.db.getEpic(run.epicId);
+    if (!epic) throw new Error(`Epic not found: ${run.epicId}`);
+    this.assertNotCancelled(epic.id);
+
+    this.db.updateRun({
+      runId,
+      status: "running",
+      currentNode: "play_loop",
+      heartbeatAt: nowIso(),
+      lastMessage: "Running manual play loop."
+    });
+    this.recordAgentStream({
+      agentRole: "system",
+      source: "orchestrator",
+      streamKind: "status",
+      content: `Manual play loop requested for ${epic.id}.`,
+      runId,
+      epicId: epic.id,
+      sequence: 0
+    });
+
+    const tickets = this.db.listTickets(epic.id);
+    if (!tickets.length) {
+      const summary = "Manual play loop blocked: no tickets found for this epic.";
+      this.db.updateRun({
+        runId,
+        status: "failed",
+        currentNode: "complete",
+        heartbeatAt: nowIso(),
+        lastMessage: summary,
+        errorText: summary
+      });
+      this.recordAgentStream({
+        agentRole: "playTester",
+        source: "orchestrator",
+        streamKind: "assistant",
+        content: summary,
+        runId,
+        epicId: epic.id,
+        sequence: 1,
+        done: true
+      });
+      return;
+    }
+
+    let playLoopPassed = false;
+    try {
+      playLoopPassed = await this.withEpicHeartbeat(runId, epic.id, "play_loop", "Running Playwright loop.", () =>
+        this.playLoop.runPlayLoop(epic, tickets, runId)
+      );
+    } catch (error) {
+      if (error instanceof EpicCancelledError) return;
+      const msg = error instanceof Error ? error.message : String(error);
+      this.db.updateRun({
+        runId,
+        status: "failed",
+        currentNode: "error",
+        heartbeatAt: nowIso(),
+        lastMessage: msg,
+        errorText: msg
+      });
+      throw error;
+    }
+
+    this.db.updateEpicStatus(epic.id, playLoopPassed ? "done" : "failed");
+    this.db.updateRun({
+      runId,
+      status: playLoopPassed ? "succeeded" : "failed",
+      currentNode: "complete",
+      heartbeatAt: nowIso(),
+      lastMessage: playLoopPassed ? "Play loop passed." : "Play loop failed.",
+      errorText: playLoopPassed ? null : "Play loop failed."
+    });
+    this.db.recordEvent({
+      aggregateType: "epic",
+      aggregateId: epic.id,
+      runId,
+      kind: "epic_manual_play_loop",
+      message: playLoopPassed ? "Play loop passed." : "Play loop failed.",
+      payload: { playLoopPassed }
     });
   }
 
@@ -400,76 +575,78 @@ export class GoalRunner {
       this.assertNotCancelled(epic.id);
       this.db.updateRun({ runId, status: "running", currentNode: "execute_tickets", heartbeatAt: nowIso(), lastMessage: "Executing tickets." });
       this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Found ${state.ticketIds.length} tickets to execute`, runId, epicId: epic.id, sequence: 0 });
-      const initialTickets = state.ticketIds.map((ticketId) => this.db.getTicket(ticketId)).filter((t): t is TicketRecord => t !== null);
-      const workQueue: TicketRecord[] = [...initialTickets];
-      const summaries: string[] = [];
 
-      // Start root tickets (no deps)
-      for (const ticket of workQueue.filter((item) => item.dependencies.length === 0)) {
-        this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting ticket: ${ticket.id}`, runId, epicId: epic.id, ticketId: ticket.id, sequence: 1 });
-        if (!ticket.currentRunId) await this.ticketRunner.start(ticket.id, epic.id);
-      }
+      return await this.withEpicHeartbeat(runId, epic.id, "execute_tickets", "Executing tickets.", async () => {
+        const initialTickets = state.ticketIds.map((ticketId) => this.db.getTicket(ticketId)).filter((t): t is TicketRecord => t !== null);
+        const workQueue: TicketRecord[] = [...initialTickets];
+        const summaries: string[] = [];
 
-      for (let qi = 0; qi < workQueue.length; qi++) {
-        const ticket = workQueue[qi];
-        this.assertNotCancelled(epic.id);
-        let current = this.db.getTicket(ticket.id);
-        while (current && (current.status === "queued" || current.status === "building" || current.status === "reviewing" || current.status === "testing")) {
-          const queuedRun = this.db.listRuns().find((record) => record.ticketId === ticket.id && (record.status === "queued" || record.status === "running"));
-          if (!queuedRun) break;
-          if (queuedRun.status === "queued") {
-            try {
-              await this.ticketRunner.runExisting(queuedRun.id);
-            } catch {
-              break;
-            }
-          }
-          current = this.db.getTicket(ticket.id);
+        // Start root tickets (no deps)
+        for (const ticket of workQueue.filter((item) => item.dependencies.length === 0)) {
+          this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting ticket: ${ticket.id}`, runId, epicId: epic.id, ticketId: ticket.id, sequence: 1 });
+          if (!ticket.currentRunId) await this.ticketRunner.start(ticket.id, epic.id);
         }
 
-        // Re-decompose if this ticket failed or was escalated (doctor gave up) and hasn't been split before
-        if (current?.status === "failed" || current?.status === "escalated") {
-          const subTickets = await this.redecomposeFailedTicket(epic, current, runId);
-          if (subTickets.length > 0) {
-            workQueue.push(...subTickets);
-            for (const st of subTickets.filter((t) => t.dependencies.length === 0)) {
-              await this.ticketRunner.start(st.id, epic.id);
-            }
-          }
-        }
-
-        summaries.push(`${ticket.id}:${current?.status ?? "unknown"}`);
-
-        // Start dependents whose deps are now all approved.
-        // A superseded ticket (re-decomposed) is not "approved" itself, but its sub-tickets will
-        // unlock dependents once they complete — so we also treat superseded as unblocking here.
-        const supersededNow = new Set(
-          this.db.listTickets(epic.id)
-            .map((t) => (t.metadata as Record<string, unknown>)?.originalTicketId as string | undefined)
-            .filter((id): id is string => Boolean(id))
-        );
-        for (const dependent of workQueue.filter((candidate) => candidate.dependencies.includes(ticket.id))) {
-          const depCurrent = this.db.getTicket(dependent.id);
-          const depsReady = dependent.dependencies.every((dependencyId: string) => {
-            const dep = this.db.getTicket(dependencyId);
-            return dep?.status === "approved" || supersededNow.has(dependencyId);
-          });
-          if (depCurrent?.status === "queued" && depsReady && !depCurrent.currentRunId) {
-            await this.ticketRunner.start(depCurrent.id, epic.id);
-            const depRun = this.db.listRuns().find((record) => record.ticketId === depCurrent.id && record.status === "queued");
-            if (depRun) {
+        for (let qi = 0; qi < workQueue.length; qi++) {
+          const ticket = workQueue[qi];
+          this.assertNotCancelled(epic.id);
+          let current = this.db.getTicket(ticket.id);
+          while (current && (current.status === "queued" || current.status === "building" || current.status === "reviewing" || current.status === "testing")) {
+            const queuedRun = this.db.listRuns().find((record) => record.ticketId === ticket.id && (record.status === "queued" || record.status === "running"));
+            if (!queuedRun) break;
+            if (queuedRun.status === "queued") {
               try {
-                await this.ticketRunner.runExisting(depRun.id);
+                await this.ticketRunner.runExisting(queuedRun.id);
               } catch {
-                // dependent ticket crashed — continue
+                break;
+              }
+            }
+            current = this.db.getTicket(ticket.id);
+          }
+
+          // Re-decompose if this ticket failed or was escalated (doctor gave up) and hasn't been split before
+          if (current?.status === "failed" || current?.status === "escalated") {
+            const subTickets = await this.redecomposeFailedTicket(epic, current, runId);
+            if (subTickets.length > 0) {
+              workQueue.push(...subTickets);
+              for (const st of subTickets.filter((t) => t.dependencies.length === 0)) {
+                await this.ticketRunner.start(st.id, epic.id);
+              }
+            }
+          }
+
+          summaries.push(`${ticket.id}:${current?.status ?? "unknown"}`);
+
+          // Start dependents whose deps are now all approved.
+          // A superseded ticket (re-decomposed) is not "approved" itself, but its sub-tickets will
+          // unlock dependents once they complete — so we also treat superseded as unblocking here.
+          const supersededNow = new Set(
+            this.db.listTickets(epic.id)
+              .map((t) => (t.metadata as Record<string, unknown>)?.originalTicketId as string | undefined)
+              .filter((id): id is string => Boolean(id))
+          );
+          for (const dependent of workQueue.filter((candidate) => candidate.dependencies.includes(ticket.id))) {
+            const depCurrent = this.db.getTicket(dependent.id);
+            const depsReady = dependent.dependencies.every((dependencyId: string) => {
+              const dep = this.db.getTicket(dependencyId);
+              return dep?.status === "approved" || supersededNow.has(dependencyId);
+            });
+            if (depCurrent?.status === "queued" && depsReady && !depCurrent.currentRunId) {
+              await this.ticketRunner.start(depCurrent.id, epic.id);
+              const depRun = this.db.listRuns().find((record) => record.ticketId === depCurrent.id && record.status === "queued");
+              if (depRun) {
+                try {
+                  await this.ticketRunner.runExisting(depRun.id);
+                } catch {
+                  // dependent ticket crashed — continue
+                }
               }
             }
           }
         }
-      }
-      return { ticketSummaries: summaries, status: "reviewing" } satisfies Partial<GoalGraphState>;
+        return { ticketSummaries: summaries, status: "reviewing" } satisfies Partial<GoalGraphState>;
+      });
     };
-
     const reviewGoal = async (state: GoalGraphState) => {
       this.assertNotCancelled(epic.id);
       this.db.updateRun({ runId, status: "running", currentNode: "goal_review", heartbeatAt: nowIso(), lastMessage: "Reviewing epic." });
@@ -608,63 +785,65 @@ export class GoalRunner {
 
     const workQueue: TicketRecord[] = [...(createdTickets as TicketRecord[])];
 
-    for (const ticket of workQueue.filter((item) => item.dependencies.length === 0)) {
-      this.assertNotCancelled(epic.id);
-      await this.ticketRunner.start(ticket.id, epic.id);
-    }
-
-    for (let qi = 0; qi < workQueue.length; qi++) {
-      const ticket = workQueue[qi];
-      this.assertNotCancelled(epic.id);
-      let current = this.db.getTicket(ticket.id);
-      while (current && (current.status === "queued" || current.status === "building" || current.status === "reviewing" || current.status === "testing")) {
-        const queuedRun = this.db.listRuns().find((record) => record.ticketId === ticket.id && (record.status === "queued" || record.status === "running"));
-        if (!queuedRun) break;
-        if (queuedRun.status === "queued") {
-          try {
-            await this.ticketRunner.runExisting(queuedRun.id);
-          } catch {
-            break;
-          }
-        }
-        current = this.db.getTicket(ticket.id);
+    await this.withEpicHeartbeat(runId, epic.id, "execute_tickets", "Executing tickets.", async () => {
+      for (const ticket of workQueue.filter((item) => item.dependencies.length === 0)) {
+        this.assertNotCancelled(epic.id);
+        await this.ticketRunner.start(ticket.id, epic.id);
       }
 
-      // Re-decompose if this ticket failed or was escalated (doctor gave up) and hasn't been split before
-      if (current?.status === "failed" || current?.status === "escalated") {
-        const subTickets = await this.redecomposeFailedTicket(epic, current, runId);
-        if (subTickets.length > 0) {
-          workQueue.push(...subTickets);
-          for (const st of subTickets.filter((t) => t.dependencies.length === 0)) {
-            await this.ticketRunner.start(st.id, epic.id);
-          }
-        }
-      }
-
-      const supersededNow2 = new Set(
-        this.db.listTickets(epic.id)
-          .map((t) => (t.metadata as Record<string, unknown>)?.originalTicketId as string | undefined)
-          .filter((id): id is string => Boolean(id))
-      );
-      for (const dependent of workQueue.filter((candidate) => candidate.dependencies.includes(ticket.id))) {
-        const depCurrent = this.db.getTicket(dependent.id);
-        const depsReady = dependent.dependencies.every((dependencyId) => {
-          const depTicket = this.db.getTicket(dependencyId);
-          return depTicket?.status === "approved" || supersededNow2.has(dependencyId);
-        });
-        if (depCurrent?.status === "queued" && depsReady && !depCurrent.currentRunId) {
-          await this.ticketRunner.start(depCurrent.id, epic.id);
-          const depRun = this.db.listRuns().find((record) => record.ticketId === depCurrent.id && record.status === "queued");
-          if (depRun) {
+      for (let qi = 0; qi < workQueue.length; qi++) {
+        const ticket = workQueue[qi];
+        this.assertNotCancelled(epic.id);
+        let current = this.db.getTicket(ticket.id);
+        while (current && (current.status === "queued" || current.status === "building" || current.status === "reviewing" || current.status === "testing")) {
+          const queuedRun = this.db.listRuns().find((record) => record.ticketId === ticket.id && (record.status === "queued" || record.status === "running"));
+          if (!queuedRun) break;
+          if (queuedRun.status === "queued") {
             try {
-              await this.ticketRunner.runExisting(depRun.id);
+              await this.ticketRunner.runExisting(queuedRun.id);
             } catch {
-              // continue
+              break;
+            }
+          }
+          current = this.db.getTicket(ticket.id);
+        }
+
+        // Re-decompose if this ticket failed or was escalated (doctor gave up) and hasn't been split before
+        if (current?.status === "failed" || current?.status === "escalated") {
+          const subTickets = await this.redecomposeFailedTicket(epic, current, runId);
+          if (subTickets.length > 0) {
+            workQueue.push(...subTickets);
+            for (const st of subTickets.filter((t) => t.dependencies.length === 0)) {
+              await this.ticketRunner.start(st.id, epic.id);
+            }
+          }
+        }
+
+        const supersededNow2 = new Set(
+          this.db.listTickets(epic.id)
+            .map((t) => (t.metadata as Record<string, unknown>)?.originalTicketId as string | undefined)
+            .filter((id): id is string => Boolean(id))
+        );
+        for (const dependent of workQueue.filter((candidate) => candidate.dependencies.includes(ticket.id))) {
+          const depCurrent = this.db.getTicket(dependent.id);
+          const depsReady = dependent.dependencies.every((dependencyId) => {
+            const depTicket = this.db.getTicket(dependencyId);
+            return depTicket?.status === "approved" || supersededNow2.has(dependencyId);
+          });
+          if (depCurrent?.status === "queued" && depsReady && !depCurrent.currentRunId) {
+            await this.ticketRunner.start(depCurrent.id, epic.id);
+            const depRun = this.db.listRuns().find((record) => record.ticketId === depCurrent.id && record.status === "queued");
+            if (depRun) {
+              try {
+                await this.ticketRunner.runExisting(depRun.id);
+              } catch {
+                // continue
+              }
             }
           }
         }
       }
-    }
+    });
 
     this.db.updateRun({ runId, currentNode: "goal_review", heartbeatAt: nowIso(), lastMessage: "Reviewing epic." });
     // Drain any tickets still actively running/queued (e.g. user-triggered rerun)
@@ -706,6 +885,7 @@ export class GoalRunner {
       this.runEpicReview(epic, tickets, runId)
     );
     legacyFinalized = true;
+
     this.db.updateEpicStatus(epic.id, review.verdict === "approved" ? "done" : "failed");
     this.db.updateRun({
       runId,
@@ -1103,7 +1283,7 @@ export class GoalRunner {
     });
     await this.bridge.acquireWorkspaceLease(reviewWorkspace.id, runId);
     const reviewEpic: EpicRecord = { ...epic, targetDir: reviewWorkspace.worktreePath };
-    const ragCtx = await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`);
+    const ragCtx = await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`, "epic-reviewer");
     const projectStructure = await ensureProjectStructureFile(epic.targetDir).catch(() => null);
     let cleaned = false;
     const cleanupWorkspace = async () => {
@@ -1151,53 +1331,8 @@ export class GoalRunner {
         ollamaPrompt: epicReviewerPrompt(reviewEpic, tickets)
       });
 
-      // Build-check loop
-      for (let round = 1; round <= MAX_BUILD_FIX_ROUNDS; round++) {
-        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: `Running build checks (round ${round})...`, runId, epicId: epic.id });
-        const { passed, output } = await this.runBuildChecks(reviewWorkspace.id, reviewWorkspace.worktreePath, epic.targetDir, runId, epic.id);
-
-        if (passed) {
-          this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: "Build checks passed.", runId, epicId: epic.id });
-          break;
-        }
-
-        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "stderr", content: `Build checks failed (round ${round}):\n${output}`, runId, epicId: epic.id });
-
-        if (round === MAX_BUILD_FIX_ROUNDS) {
-          // Exhausted rounds — force needs_followups
-          currentReview = {
-            verdict: "needs_followups",
-            summary: `${currentReview.summary}\nBuild checks failed after ${MAX_BUILD_FIX_ROUNDS} fix round(s):\n${output}`,
-            followupTickets: [
-              ...(currentReview.followupTickets ?? []),
-              {
-                id: "BUILD-FIX-REMAINING",
-                title: "Fix remaining build/typecheck errors",
-                description: `The epic reviewer could not resolve all build errors within ${MAX_BUILD_FIX_ROUNDS} rounds.\n\nErrors:\n${output}`,
-                acceptanceCriteria: ["All typecheck errors are resolved", "npm run typecheck exits with code 0"],
-                priority: "high" as const,
-                dependencies: [],
-                allowedPaths: ["src/"]
-              }
-            ]
-          };
-          break;
-        }
-
-        // Ask the model to fix the errors
-        const fixPrompt = epicReviewerBuildFixPrompt(epic, tickets, output, round);
-        currentReview = await this.callEpicReviewerModel({
-          reviewEpic,
-          tickets,
-          ragCtx,
-          projectStructure,
-          runId,
-          epicId: epic.id,
-          codexPrompt: fixPrompt,
-          toolingPrompt: fixPrompt,
-          ollamaPrompt: fixPrompt
-        });
-      }
+      // Build checks moved to Play Writer - no build validation here
+      // Play Writer will fix any build errors before generating tests
 
       return await finalizeReview(currentReview);
     } catch (error) {
@@ -1252,8 +1387,9 @@ export class GoalRunner {
 
   private async buildRagContext(
     repoPath: string,
-    query: string
-  ): Promise<{ codeContext: string; docContext: string; indexId: number | null } | null> {
+    query: string,
+    role?: string
+  ): Promise<(BuiltContext & { indexId: number | null }) | null> {
     try {
       const headResult = await git(repoPath, ["rev-parse", "HEAD"]);
       const commitHash = headResult.stdout.trim();
@@ -1263,7 +1399,18 @@ export class GoalRunner {
         repoRoot: repoPath,
         commitHash,
       });
-      return { codeContext: ctx.codeContext, docContext: ctx.docContext, indexId: ctx.indexId };
+      let toolContext: string | undefined;
+      if (role && ctx.indexId) {
+        const { buildToolingContext } = await import("../rag/context-builder.ts");
+        const { getAvailableToolsList } = await import("../mediated-agent-harness/tools.ts");
+        toolContext = await buildToolingContext({
+          role,
+          availableTools: getAvailableToolsList(role),
+          db: this.db,
+          indexId: ctx.indexId,
+        });
+      }
+      return { ...ctx, toolContext };
     } catch (err) {
       console.warn(`[RAG] buildRagContext failed: ${err}`);
       return null;
@@ -1370,7 +1517,11 @@ export class GoalRunner {
         const branchName = ticketWorkspace.branchName;
 
         // Create a temporary worktree for the ticket's branch
-        const tempWorktreePath = await this.bridge.createTempWorktreeFromBranch(reviewWorkspace.repoRoot, branchName);
+        const tempWorktreePath = await this.bridge.createTempWorktreeFromBranch(
+          reviewWorkspace.repoRoot,
+          branchName,
+          ticketWorkspace.headCommit ?? ticketWorkspace.baseCommit
+        );
         try {
           // Copy changed files from review workspace to temp worktree
           for (const filePath of changedFiles) {

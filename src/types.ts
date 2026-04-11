@@ -16,6 +16,8 @@ export type AgentRole =
   | "reviewer"
   | "tester"
   | "epicReviewer"
+  | "playWriter"
+  | "playTester"
   | "doctor"
   | "system";
 
@@ -157,12 +159,14 @@ export type TicketContextPacket = {
   retrievedContext?: {
     codeContext: string;
     docContext: string;
+    toolContext?: string;
+    projectStructure?: string;
     retrievalMode: "semantic" | "keyword";
     chunkCount: number;
   } | null;
 };
 
-export type CommandName = "test" | "lint" | "typecheck" | "status";
+export type CommandName = "test" | "lint" | "typecheck" | "build" | "status";
 
 export type CommandCatalog = Record<CommandName, string>;
 

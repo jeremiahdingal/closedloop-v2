@@ -5,6 +5,8 @@ import type {
   TicketContextPacket,
   TicketRecord
 } from "../types.ts";
+import { getCompactToolContract, getAvailableToolsList } from "../mediated-agent-harness/tools.ts";
+import type { BuiltContext } from "../rag/context-builder.ts";
 
 export function epicDecoderPrompt(epic: EpicRecord): string {
   return [
@@ -60,7 +62,10 @@ export function builderPrompt(ticket: TicketRecord, packet: TicketContextPacket)
     `Allowed paths: ${ticket.allowedPaths.join(", ") || "(none)"}`,
     `Review blockers: ${packet.reviewBlockers.join("; ") || "(none)"}`,
     `Prior test failures: ${packet.priorTestFailures.join("; ") || "(none)"}`,
-    ...(packet.retrievedContext ? [] : [`Read PROJECT_STRUCTURE.md first.`]),
+    "Read PROJECT_STRUCTURE.md first.",
+    ...(packet.retrievedContext?.projectStructure
+      ? [`## Project Structure\n${packet.retrievedContext.projectStructure}`]
+      : []),
     "Generate only minimal targeted changes."
   );
 
@@ -68,15 +73,25 @@ export function builderPrompt(ticket: TicketRecord, packet: TicketContextPacket)
 }
 
 export function builderToolingPrompt(ticket: TicketRecord, packet: TicketContextPacket): string {
+  const role = "builder";
+  const availableTools = getAvailableToolsList(role);
+  const toolContract = getCompactToolContract(availableTools);
+
   const sections = [
     "Work inside the current repository using the tools that are actually available in this session.",
-    "Use read, glob, grep, edit, write, task, todowrite, and skill as sparingly.",
-    ...(!packet.retrievedContext ? [`Read PROJECT_STRUCTURE.md first.`] : []),
+    toolContract,
+    "Read PROJECT_STRUCTURE.md first.",
+    ...(packet.retrievedContext?.projectStructure
+      ? [`## Project Structure\n${packet.retrievedContext.projectStructure}`]
+      : []),
     "Do not ask the user for clarification or request unavailable tools. Just inspect the workspace and make the change.",
   ];
 
   // Inject RAG context if available
   if (packet.retrievedContext) {
+    if (packet.retrievedContext.toolContext) {
+      sections.push(packet.retrievedContext.toolContext);
+    }
     if (packet.retrievedContext.docContext) {
       sections.push(packet.retrievedContext.docContext);
     }
@@ -106,6 +121,8 @@ export function builderToolingPrompt(ticket: TicketRecord, packet: TicketContext
 export function reviewerPrompt(ticket: TicketRecord, diff: string): string {
   return [
     "You are the Local Reviewer.",
+    "A deterministic guard has already checked destructive changes, allowed paths, and project-structure invariants.",
+    "Focus on semantic correctness, obvious regressions, and whether the diff satisfies the ticket.",
     "IMPORTANT: The diff below shows changes in an isolated ticket workspace (a copy of the repo), NOT the original repo.",
     "Files being created/modified ARE in the correct location if they appear in the diff.",
     "Do NOT reject changes because files 'don't exist in project root' - they are being created in this workspace.",
@@ -131,6 +148,25 @@ export function reviewerPrompt(ticket: TicketRecord, diff: string): string {
   ].join("\n\n");
 }
 
+export function reviewerToolingPrompt(ticket: TicketRecord): string {
+  return [
+    "You are the Local Reviewer.",
+    "Structural rules have already been checked by a deterministic guard.",
+    "Review the current workspace diff using the available review tools.",
+    "Do not ask for clarification. Inspect the diff, decide, and finish.",
+    "Return JSON via the finish tool with shape:",
+    JSON.stringify({
+      approved: true,
+      blockers: ["string"],
+      suggestions: ["string"],
+      riskLevel: "low"
+    }, null, 2),
+    `Ticket: ${ticket.title}`,
+    `Description: ${ticket.description}`,
+    `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`
+  ].join("\n\n");
+}
+
 export function epicReviewerPrompt(epic: EpicRecord, tickets: TicketRecord[]): string {
   // Build structured ticket listing with ALL tickets
   const ticketListing = tickets
@@ -146,6 +182,7 @@ export function epicReviewerPrompt(epic: EpicRecord, tickets: TicketRecord[]): s
 
   return [
     "You are the Goal Reviewer.",
+    "MODEL TARGET: Assume downstream ticket execution is done by ~14B parameter models. Keep recommendations and followups simple, explicit, and narrowly scoped.",
     "CRITICAL: All tickets in this epic have been reviewed and approved.",
     "Check each ticket's changes for destructive or risky patterns:",
     "- Large file deletions (>10 files or >1000 lines)",
@@ -194,6 +231,7 @@ export function epicReviewerToolingPrompt(
 
   const sections: string[] = [
     "Review the overall epic result using the repository, ticket information, and any available artifacts.",
+    "MODEL TARGET: Assume downstream ticket execution is done by ~14B parameter models. Any remediation guidance must be atomic, explicit, and file-scoped.",
     "CRITICAL: All tickets in this epic have been reviewed and approved. Proceed confidently to check integration.",
     "Your role is to check for destructive changes and cross-ticket integration issues.",
   ];
@@ -258,12 +296,16 @@ export function doctorPrompt(input: {
 
 export function epicDecoderToolingPrompt(
   epic: EpicRecord,
-  ragContext?: { codeContext: string; docContext: string } | null,
+  ragContext?: BuiltContext | null,
   projectStructure?: string | null
 ): string {
+  const role = "epic-decoder";
+  const availableTools = getAvailableToolsList(role);
+  const toolContract = getCompactToolContract(availableTools);
+
   const sections: string[] = [
     "You are the Epic Decoder agent. Explore the repository using the OpenCode tools that are actually available in-session.",
-    "Use read, glob, grep, edit, write, task, todowrite, and skill.",
+    toolContract,
     "Do not try to call bash, ls, find, run, or any other unavailable shell tool.",
     "Understand the codebase structure, existing patterns, and conventions before decomposing the epic.",
     `Epic: ${epic.title}`,
@@ -284,8 +326,11 @@ export function epicDecoderToolingPrompt(
   if (projectStructure) {
     sections.push(`## Project Structure\n\`\`\`\n${projectStructure.slice(0, 6000)}\n\`\`\``);
   }
-  if (ragContext?.docContext) sections.push(ragContext.docContext);
-  if (ragContext?.codeContext) sections.push(ragContext.codeContext);
+  if (ragContext) {
+    if (ragContext.toolContext) sections.push(ragContext.toolContext);
+    if (ragContext.docContext) sections.push(ragContext.docContext);
+    if (ragContext.codeContext) sections.push(ragContext.codeContext);
+  }
 
   sections.push(
     "Steps:",
@@ -336,6 +381,7 @@ export function epicReviewerCodexPrompt(
 
   const sections: string[] = [
     "You are the Epic Reviewer agent. Review the overall epic result quickly and efficiently.",
+    "MODEL TARGET: Assume downstream ticket execution is done by ~14B parameter models. Keep any fixes/followups trivially implementable in one pass.",
     "CRITICAL: All tickets in this epic have been reviewed and approved. Proceed confidently.",
     "Your role is to check for cross-ticket integration issues and fix any destructive or risky changes.",
     "IMPORTANT: Be concise. Check git log and diffs for the ticket changes, verify they look safe, then output FINAL_JSON. Do NOT explore the entire repo.",
@@ -514,7 +560,7 @@ export function epicDecoderPlanModePrompt(
     "Think carefully. Be specific about what each ticket changes and why.",
     [
       "⚠️ EXECUTOR CONSTRAINT — critical for ticket design:",
-      "Each ticket in the FINAL_JSON will be handed to a 20–30B parameter model with limited reasoning and a short context window.",
+      "Each ticket in the FINAL_JSON will be handed to an approximately 14B parameter model with limited reasoning and a short context window.",
       "Design every ticket so that model can succeed without needing to explore the broader codebase.",
       "Rules for each ticket:",
       "  • Atomic: one coherent change only — no 'and also' tickets",
@@ -541,4 +587,187 @@ export function epicDecoderPlanModePrompt(
   );
 
   return sections.join("\n\n");
+}
+
+export function playWriterPrompt(
+  epic: EpicRecord,
+  tickets: TicketRecord[],
+  existingTestFiles: string[],
+  buildErrors: string | null,
+  ragContext?: { codeContext: string; docContext: string } | null
+): string {
+  const ticketSummary = tickets
+    .map(t => `  - ${t.id}: ${t.title}\n    Files: ${(t.allowedPaths ?? []).join(", ")}`)
+    .join("\n");
+
+  const existingTestsBlock = existingTestFiles.length > 0
+    ? existingTestFiles.map(f => `  - ${f}`).join("\n")
+    : "  (none found)";
+
+  const buildErrorsBlock = buildErrors
+    ? `## Build Errors to Fix First\n\nThe codebase currently has build/typecheck errors. Fix these BEFORE generating tests:\n\`\`\`\n${buildErrors}\n\`\`\``
+    : `## Build Status\n\nThe build is clean. No build errors to fix.`;
+
+  const sections: string[] = [
+    "You are Play Writer — an autonomous coding agent.",
+    "",
+    "Your job has TWO parts:",
+    "  1. Fix any remaining build errors in the codebase (if any exist).",
+    "  2. Generate Playwright e2e test files that test the features this epic implemented.",
+    "",
+    `## Epic: ${epic.title}`,
+    epic.goalText,
+    "",
+    "## Tickets Completed in This Epic",
+    "(These are the changes that were made to the codebase. Your tests must cover them.)",
+    ticketSummary,
+    "",
+    buildErrorsBlock,
+    "",
+    "## Existing Test Files in tests/ Directory",
+    "(Look at these for style, structure, and import patterns to follow.)",
+    existingTestsBlock,
+  ];
+
+  if (ragContext?.codeContext) sections.push("\n## Relevant Code Context\n" + ragContext.codeContext);
+
+  sections.push(
+    "",
+    "## Your Instructions",
+    "",
+    "### Part 1: Fix Build Errors (ALL - No Scope Limits)",
+    "You MUST fix ALL build/typecheck errors in the codebase, regardless of file scope.",
+    "The Epic Reviewer did NOT fix build errors - you are responsible for ALL of them.",
+    "If there are build errors listed above:",
+    "  1. Read each file mentioned in the errors.",
+    "  2. Fix the errors by editing those files.",
+    "  3. You may edit ANY file in the codebase to fix the errors — no scope limits.",
+    "  4. Do not skip this — tests cannot run if the build is broken.",
+    "  5. Continue fixing until `npm run typecheck` passes.",
+    "",
+    "If there are no build errors, skip to Part 2.",
+    "",
+    "### Part 2: Generate SCOPED Playwright Tests",
+    "Write tests that are SCOPED to this epic's changes - NOT full app tests.",
+    "  1. Read 2-3 of the existing test files to understand the project's testing patterns.",
+    "  2. Understand what each completed ticket actually changed in the codebase.",
+    "  3. Generate Playwright test files in the `tests/` directory.",
+    "  4. Tests must be SCOPED to epic features - test only what this epic introduced.",
+    "  5. Each test file should test the user-visible behaviour of the epic's features.",
+    "  6. Tests must use `import { test, expect } from '@playwright/test'`.",
+    "  7. Each test must navigate to a real URL and interact with the actual UI.",
+    "  8. Give each test file a descriptive name, e.g. `tests/epic-theming.spec.ts`.",
+    "  9. Write at least 1 test per major feature the epic introduced.",
+    "",
+    "### Important Constraints",
+    "  - Do NOT use `page.waitForTimeout()` — use `page.waitForSelector()` or `expect(locator).toBeVisible()` instead.",
+    "  - Do NOT hardcode credentials — read from environment variables if needed.",
+    "  - Do NOT write tests that depend on specific database state — tests should work on a fresh app.",
+    "  - Tests will be run by a separate agent using Playwright MCP browser tools, so write standard Playwright syntax.",
+    "",
+    "## Required Output",
+    "",
+    "After completing both parts, you MUST output exactly one FINAL_JSON block.",
+    "The FINAL_JSON must list every test file you created (relative paths from repo root).",
+    "Do not list files you did not create. Do not list pre-existing test files.",
+    "",
+    "Format:",
+    '<FINAL_JSON>{"testsCreated":["tests/epic-theming.spec.ts","tests/epic-theming-cashier.spec.ts"],"buildFixed":true,"summary":"Fixed 2 import errors. Generated 2 test files covering dynamic theming and cashier gradient."}</FINAL_JSON>',
+    "",
+    "If you could not fix the build errors, still output FINAL_JSON but set testsCreated to empty array:",
+    '<FINAL_JSON>{"testsCreated":[],"buildFixed":false,"summary":"Could not resolve circular import in src/theme/shopTheme.ts. Tests not generated."}</FINAL_JSON>',
+  );
+
+  return sections.join("\n");
+}
+
+export function playTesterPrompt(
+  epic: EpicRecord,
+  testFiles: string[],
+  devServerUrl: string,
+  devServerCommand: string,
+  loopAttempt: number,
+  previousFailures?: string | null
+): string {
+  const testFilesList = testFiles.map(f => `  - ${f}`).join("\n");
+
+  const previousFailuresBlock = previousFailures
+    ? `## Previous Loop Failures (Attempt ${loopAttempt - 1})\n\nThese tests failed in the previous attempt. Pay attention to them:\n${previousFailures}`
+    : "";
+
+  return [
+    "You are Play Tester — an autonomous test execution agent.",
+    "",
+    `This is loop attempt ${loopAttempt} of 3.`,
+    "",
+    "## Your Job",
+    "Run each Playwright test file listed below using Playwright MCP browser tools.",
+    "The dev servers are already running. You do NOT need to start them.",
+    `The app is available at: ${devServerUrl}`,
+    "",
+    "## Test Files to Run",
+    "(These were generated by Play Writer specifically for this epic. Run ALL of them.)",
+    testFilesList,
+    "",
+    previousFailuresBlock,
+    "",
+    `## Epic: ${epic.title}`,
+    epic.goalText,
+    "",
+    "## How to Execute Each Test",
+    "",
+    "For each test file:",
+    "  1. Read the test file content using your read_file tool.",
+    "  2. Identify each `test(...)` block and what it does.",
+    "  3. For each test:",
+    "     a. Use `browser_navigate` to go to the page under test.",
+    "     b. Use `browser_click`, `browser_type`, `browser_snapshot` etc. to perform the test steps.",
+    "     c. Use `browser_snapshot` to capture the page state for assertions.",
+    "     d. Compare the actual UI state to what the test expects.",
+    "     e. Mark the test as PASSED if everything matches expectations.",
+    "     f. Mark the test as FAILED if any step fails, with the exact error.",
+    "",
+    "## Critical Rules",
+    "  - Do NOT run `npx playwright test` or any shell command to run tests.",
+    "  - Do NOT use the `run_command` tool to execute tests.",
+    "  - Use ONLY Playwright MCP browser tools: `browser_navigate`, `browser_click`,",
+    "    `browser_type`, `browser_fill`, `browser_snapshot`, `browser_evaluate`,",
+    "    `browser_get_text`, `browser_wait_for`.",
+    "  - Run every test file listed above. Do not skip any.",
+    "  - If a test file has multiple `test(...)` blocks, run ALL of them.",
+    "  - Do not suggest fixes. Do not edit any files. Only report results.",
+    "",
+    "## Required Output Format",
+    "",
+    "After running ALL tests, output exactly one FINAL_JSON block.",
+    "Include every test you ran, whether it passed or failed.",
+    "",
+    "Format:",
+    `<FINAL_JSON>{
+  "status": "passed",
+  "summary": { "total": 4, "passed": 4, "failed": 0 },
+  "results": [
+    {
+      "testFile": "tests/epic-theming.spec.ts",
+      "testName": "dashboard has correct gradient background",
+      "status": "passed",
+      "steps": 5,
+      "error": null
+    },
+    {
+      "testFile": "tests/epic-theming.spec.ts",
+      "testName": "cashier splash shows correct theme",
+      "status": "failed",
+      "steps": 3,
+      "error": "Expected element .cashier-splash to have background #FF5500 but got transparent"
+    }
+  ]
+}</FINAL_JSON>`,
+    "",
+    "Rules for FINAL_JSON:",
+    "  - `status` at the top level is `passed` only if ALL tests passed, otherwise `failed`.",
+    "  - `error` is null for passing tests.",
+    "  - `error` must be the exact failure message for failing tests — be specific.",
+    "  - Include every test. Do not omit passing tests from the results array.",
+  ].join("\n");
 }

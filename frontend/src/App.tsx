@@ -11,6 +11,9 @@ type AgentEvent = { id: number; created_at: string; message: string; run_id: str
 type ModelAdapterOption = { id: string; label: string; description: string };
 type AgentModelInfo = { currentModel: string; adapters: ModelAdapterOption[]; switchable: boolean };
 type AgentModelsConfig = Record<string, AgentModelInfo>;
+type TicketDiffResponse = { ticketId: string; diff: string; artifactName: string | null; createdAt: string | null };
+type ParsedDiffHunk = { header: string; lines: string[] };
+type ParsedDiffFile = { path: string; additions: number; deletions: number; hunks: ParsedDiffHunk[] };
 
 type Dashboard = { epics: Epic[]; tickets: Ticket[]; runs: Run[]; agentEvents: AgentEvent[] };
 
@@ -51,6 +54,66 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (!response.ok) throw new Error(await response.text());
   return response.json() as Promise<T>;
+}
+
+function parseUnifiedDiff(diffText: string): ParsedDiffFile[] {
+  if (!diffText.trim()) return [];
+  const files: ParsedDiffFile[] = [];
+  let currentFile: ParsedDiffFile | null = null;
+  let currentHunk: ParsedDiffHunk | null = null;
+
+  const flushHunk = () => {
+    if (currentFile && currentHunk) {
+      currentFile.hunks.push(currentHunk);
+    }
+    currentHunk = null;
+  };
+
+  const flushFile = () => {
+    flushHunk();
+    if (currentFile) files.push(currentFile);
+    currentFile = null;
+  };
+
+  for (const rawLine of diffText.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
+
+    if (line.startsWith("diff --git ")) {
+      flushFile();
+      currentFile = { path: "(unknown file)", additions: 0, deletions: 0, hunks: [] };
+      continue;
+    }
+
+    if (!currentFile) continue;
+
+    if (line.startsWith("+++ ")) {
+      const filePath = line.slice(4).trim();
+      currentFile.path = filePath.startsWith("b/") ? filePath.slice(2) : filePath;
+      continue;
+    }
+
+    if (line.startsWith("@@")) {
+      flushHunk();
+      currentHunk = { header: line, lines: [] };
+      continue;
+    }
+
+    if (!currentHunk) continue;
+
+    currentHunk.lines.push(line);
+    if (line.startsWith("+") && !line.startsWith("+++")) currentFile.additions += 1;
+    if (line.startsWith("-") && !line.startsWith("---")) currentFile.deletions += 1;
+  }
+
+  flushFile();
+  return files.filter((file) => file.path !== "(unknown file)" || file.hunks.length > 0);
+}
+
+function diffLineClass(line: string): string {
+  if (line.startsWith("+") && !line.startsWith("+++")) return "pr-diff-line-add";
+  if (line.startsWith("-") && !line.startsWith("---")) return "pr-diff-line-del";
+  if (line.startsWith("\\")) return "pr-diff-line-meta";
+  return "pr-diff-line-ctx";
 }
 
 function confirmToast(input: {
@@ -96,6 +159,8 @@ const AGENT_GLYPHS: Record<string, string> = {
   epicReviewer: "🔎",
   doctor: "🩺",
   planner: "📐",
+  playWriter: "✍️",
+  playTester: "🎭",
   unknown: "❓"
 };
 
@@ -494,6 +559,7 @@ function AgentModal(props: { role: string; items: AgentEvent[]; open: boolean; o
 const ROLE_ICONS: Record<string, string> = {
   builder: "🔨", reviewer: "🔍", tester: "🧪",
   epicDecoder: "🗺", epicReviewer: "📋", doctor: "🩺", system: "⚙️",
+  playWriter: "✍️", playTester: "🎭"
 };
 const SOURCE_SHORT: Record<string, string> = {
   "mediated-harness": "harness", opencode: "oc", orchestrator: "orch",
@@ -555,9 +621,44 @@ function TicketModal(props: { ticket: Ticket; events: AgentEvent[]; runs: Run[];
   const ticketEvents = props.events.filter((e) => e.ticket_id === props.ticket.id || e.run_id === props.ticket.currentRunId);
   const streamScope = props.ticket.currentRunId ? "ticket + current run" : "ticket only";
   const feedEndRef = useRef<HTMLDivElement>(null);
+  const [ticketDiff, setTicketDiff] = useState<TicketDiffResponse | null>(null);
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const [expandedDiffFiles, setExpandedDiffFiles] = useState<Record<string, boolean>>({});
   useEffect(() => {
     feedEndRef.current?.scrollIntoView({ behavior: "instant" });
   }, [ticketEvents.length]);
+  useEffect(() => {
+    let cancelled = false;
+    setDiffLoading(true);
+    setDiffError(null);
+    setExpandedDiffFiles({});
+    fetchJson<TicketDiffResponse>(`/api/tickets/${encodeURIComponent(props.ticket.id)}/diff`)
+      .then((payload) => {
+        if (!cancelled) setTicketDiff(payload);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setTicketDiff(null);
+          setDiffError((error as Error).message);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setDiffLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [props.ticket.id]);
+
+  const parsedDiffFiles = useMemo(() => parseUnifiedDiff(ticketDiff?.diff ?? ""), [ticketDiff?.diff]);
+  const fileRows = parsedDiffFiles.length
+    ? parsedDiffFiles.map((file) => ({ path: file.path, additions: file.additions, deletions: file.deletions }))
+    : props.ticket.diffFiles ?? [];
+  const totals = fileRows.reduce(
+    (sum, file) => ({ additions: sum.additions + file.additions, deletions: sum.deletions + file.deletions }),
+    { additions: 0, deletions: 0 }
+  );
   
   return (
     <div className="modal-backdrop" onClick={props.onClose}>
@@ -627,27 +728,66 @@ function TicketModal(props: { ticket: Ticket; events: AgentEvent[]; runs: Run[];
               </div>
             </div>
 
-            {(props.ticket.diffFiles?.length ?? 0) > 0 && (
+            {(fileRows.length > 0 || diffLoading || diffError) && (
               <div className="pr-changes-card">
                 <div className="pr-changes-header">
                   <span className="pr-changes-icon">📄</span>
                   <span className="pr-changes-title">Changes</span>
+                  {ticketDiff?.artifactName && (
+                    <span className="pr-changes-source" title={ticketDiff.createdAt ?? undefined}>
+                      {ticketDiff.artifactName}
+                    </span>
+                  )}
                 </div>
-                <div className="pr-files">
-                  {props.ticket.diffFiles!.map((file, idx) => (
-                    <div key={idx} className="pr-file-row">
-                      <span className="pr-file-name">{file.path}</span>
-                      <span className="pr-file-stats">
-                        <span className="pr-add">+{file.additions}</span>
-                        <span className="pr-del">-{file.deletions}</span>
-                      </span>
+                {diffLoading && <div className="pr-diff-loading">Loading diff snippet…</div>}
+                {diffError && <div className="pr-diff-error">Unable to load diff snippet: {diffError}</div>}
+                {fileRows.length > 0 && (
+                  <>
+                    <div className="pr-files">
+                      {fileRows.map((file, idx) => {
+                        const parsedFile = parsedDiffFiles.find((entry) => entry.path === file.path);
+                        const key = `${file.path}-${idx}`;
+                        const expanded = Boolean(expandedDiffFiles[key]);
+                        return (
+                          <div key={key} className="pr-file-with-snippet">
+                            <button
+                              type="button"
+                              className="pr-file-row pr-file-row-button"
+                              onClick={() =>
+                                setExpandedDiffFiles((prev) => ({ ...prev, [key]: !expanded }))
+                              }
+                            >
+                              <span className="pr-file-name">{file.path}</span>
+                              <span className="pr-file-stats">
+                                <span className="pr-add">+{file.additions}</span>
+                                <span className="pr-del">-{file.deletions}</span>
+                              </span>
+                            </button>
+                            {expanded && parsedFile && parsedFile.hunks.length > 0 && (
+                              <div className="pr-file-snippets">
+                                {parsedFile.hunks.slice(0, 3).map((hunk, hunkIdx) => (
+                                  <div className="pr-file-hunk" key={`${key}-hunk-${hunkIdx}`}>
+                                    <div className="pr-file-hunk-header">{hunk.header}</div>
+                                    <div className="pr-file-hunk-body">
+                                      {hunk.lines.slice(0, 32).map((line, lineIdx) => (
+                                        <div className={`pr-diff-line ${diffLineClass(line)}`} key={`${key}-hunk-${hunkIdx}-line-${lineIdx}`}>
+                                          {line || " "}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
-                  ))}
-                </div>
-                <div className="pr-changes-footer">
-                  {props.ticket.diffFiles!.reduce((sum, f) => sum + f.additions, 0)} additions,{" "}
-                  {props.ticket.diffFiles!.reduce((sum, f) => sum + f.deletions, 0)} deletions
-                </div>
+                    <div className="pr-changes-footer">
+                      {totals.additions} additions, {totals.deletions} deletions
+                    </div>
+                  </>
+                )}
               </div>
             )}
 
@@ -699,7 +839,7 @@ function TicketModal(props: { ticket: Ticket; events: AgentEvent[]; runs: Run[];
   );
 }
 
-function EpicModal(props: { epic: Epic; open: boolean; onClose: () => void; onRetry: () => void; onReview: () => void; onCancel: () => void; onDelete: () => void; actionBusy: boolean; epicEvents: AgentEvent[]; epicTickets: Ticket[] }) {
+function EpicModal(props: { epic: Epic; open: boolean; onClose: () => void; onRetry: () => void; onReview: () => void; onPlayLoop: () => void; onCancel: () => void; onDelete: () => void; actionBusy: boolean; epicEvents: AgentEvent[]; epicTickets: Ticket[] }) {
   const headings = useMemo(() => {
     const result: Array<{ id: string; text: string; level: number }> = [];
     for (const event of props.epicEvents) {
@@ -862,6 +1002,7 @@ function EpicModal(props: { epic: Epic; open: boolean; onClose: () => void; onRe
             <button className="btn btn-modal-retry" onClick={props.onRetry} disabled={props.actionBusy}>▶ Retry Epic</button>
           )}
           <button className="btn btn-modal-review" onClick={props.onReview} disabled={props.actionBusy}>🔍 Review</button>
+          <button className="btn" onClick={props.onPlayLoop} disabled={props.actionBusy}>🧪 Play Loop</button>
           <button className="btn btn-modal-cancel" onClick={props.onCancel} disabled={props.actionBusy}>⏹ Cancel</button>
           <button className="btn btn-modal-delete" onClick={props.onDelete} disabled={props.actionBusy}>🗑 Delete</button>
           <button className="btn btn-modal-ok" onClick={props.onClose}>✓ Close</button>
@@ -1055,12 +1196,19 @@ export function App() {
     const fromEvents = [...eventsByRole.keys()];
     const all = new Set([...fromConfig, ...fromEvents]);
     return [...all].sort((a, b) => {
-      const order = ["epicDecoder", "builder", "reviewer", "tester", "epicReviewer", "doctor"];
+      const order = ["playWriter", "playTester", "epicDecoder", "builder", "reviewer", "tester", "epicReviewer", "doctor"];
       const ia = order.indexOf(a);
       const ib = order.indexOf(b);
       return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
     });
   }, [modelsConfig, eventsByRole]);
+
+  const agentSections = useMemo(() => {
+    const buildAgents = ["playWriter", "playTester"];
+    const test = agentRoles.filter(r => buildAgents.includes(r));
+    const build = agentRoles.filter(r => !buildAgents.includes(r));
+    return { test, build };
+  }, [agentRoles]);
 
   const agentStatusByRole = useMemo(() => {
     const status = new Map<string, AgentStreamStatus>();
@@ -1227,6 +1375,23 @@ export function App() {
   }
 
   async function reviewEpic(epicId: string) {
+    const epic = data.epics.find((e) => e.id === epicId);
+    if (epic?.status === "done") {
+      toast.info("Epic is already approved. Skipping review.");
+      return;
+    }
+
+    const activeReviewRun = data.runs.find((run) => {
+      if (run.epicId !== epicId) return false;
+      if (run.status !== "queued" && run.status !== "running" && run.status !== "waiting") return false;
+      const node = String(run.currentNode ?? "").toLowerCase();
+      return node.includes("review");
+    });
+    if (activeReviewRun) {
+      toast.info(`Review already in progress (${truncateId(activeReviewRun.id)}).`);
+      return;
+    }
+
     const confirmed = await confirmToast({
       title: "Run epic review now?",
       description: "This runs checks across approved tickets, then manually runs the epic reviewer.",
@@ -1236,12 +1401,45 @@ export function App() {
     const toastId = toast.loading("Queuing epic review...");
     try {
       setActionBusy(`review-epic-${epicId}`);
-      await fetchJson(`/api/epics/${encodeURIComponent(epicId)}/review`, { method: "POST" });
+      const result = await fetchJson<{
+        ok: boolean;
+        runId?: string;
+        skipped?: boolean;
+        deduped?: boolean;
+        message?: string;
+      }>(`/api/epics/${encodeURIComponent(epicId)}/review`, { method: "POST" });
       await refresh();
-      toast.success("Epic review queued.", { id: toastId });
+      if (result.skipped) {
+        toast.info(result.message || "Epic already approved. Skipping review.", { id: toastId });
+      } else if (result.deduped) {
+        toast.info(result.message || "Review already queued/running.", { id: toastId });
+      } else {
+        toast.success("Epic review queued.", { id: toastId });
+      }
     } catch (err) {
       setError((err as Error).message);
       toast.error(`Failed to queue epic review: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function playLoopEpic(epicId: string) {
+    const confirmed = await confirmToast({
+      title: "Run play loop now?",
+      description: "This runs Play Writer and Play Tester for the selected epic.",
+      confirmLabel: "Run Play Loop"
+    });
+    if (!confirmed) return;
+    const toastId = toast.loading("Queuing play loop...");
+    try {
+      setActionBusy(`play-loop-epic-${epicId}`);
+      await fetchJson(`/api/epics/${encodeURIComponent(epicId)}/play-loop`, { method: "POST" });
+      await refresh();
+      toast.success("Play loop queued.", { id: toastId });
+    } catch (err) {
+      setError((err as Error).message);
+      toast.error(`Failed to queue play loop: ${(err as Error).message}`, { id: toastId });
     } finally {
       setActionBusy(null);
     }
@@ -1459,7 +1657,7 @@ export function App() {
         <div className="win-titlebar">
           <div className="win-titlebar-text">
             <span>🎮</span>
-            <span>All Agent Streams ({agentRoles.length})</span>
+            <span>All Agent Streams ({agentSections.test.length + agentSections.build.length})</span>
           </div>
           <div className="win-titlebar-buttons">
             <div className="win-btn-box" onClick={() => togglePanel("agents")}>_</div>
@@ -1467,25 +1665,192 @@ export function App() {
           </div>
         </div>
         <div className={`win-content ${collapsedPanels.has("agents") ? "collapsed" : ""}`}>
-          <div className="agent-stats-grid two-cols">
-            {agentRoles.map((role) => (
-              <button key={role} className="agent-stat-box" onClick={() => setOpenRole(role)}>
-                <span className={`agent-stat-icon ${isAgentActive.get(role) ? "active" : ""}`}>◆</span>
-                <span className="agent-stat-name">{role}</span>
-                <span className={`agent-stat-status status-${agentStatusByRole.get(role) || "idle"}`}>{agentStatusByRole.get(role) || "idle"}</span>
-                <span className="agent-stat-glyph">{AGENT_GLYPHS[role] || AGENT_GLYPHS.unknown}</span>
-                <span className="agent-stat-count">{eventsByRole.get(role)?.length ?? 0}</span>
-                <span className="agent-stat-label">msgs</span>
-              </button>
-            ))}
-            {!agentRoles.length ? <p className="no-agents">📭 No agent stream yet.</p> : null}
+          <div className="agent-sections-row">
+            {/* BUILD Section */}
+            <div className="agent-section-box build-section">
+              <div className="agent-section-header">
+                <span className="agent-section-icon">🔧</span>
+                <span className="agent-section-title">BUILD</span>
+              </div>
+              <div className="agent-stats-grid">
+                {agentSections.build.map((role) => (
+                  <button key={role} className="agent-stat-box" onClick={() => setOpenRole(role)}>
+                    <span className={`agent-stat-icon ${isAgentActive.get(role) ? "active" : ""}`}>◆</span>
+                    <span className="agent-stat-name">{role}</span>
+                    <span className={`agent-stat-status status-${agentStatusByRole.get(role) || "idle"}`}>{agentStatusByRole.get(role) || "idle"}</span>
+                    <span className="agent-stat-glyph">{AGENT_GLYPHS[role] || AGENT_GLYPHS.unknown}</span>
+                    <span className="agent-stat-count">{eventsByRole.get(role)?.length ?? 0}</span>
+                    <span className="agent-stat-label">msgs</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            
+            {/* TEST Section */}
+            <div className="agent-section-box test-section">
+              <div className="agent-section-header">
+                <span className="agent-section-icon">🧪</span>
+                <span className="agent-section-title">TEST</span>
+              </div>
+              <div className="agent-stats-grid">
+                {agentSections.test.map((role) => (
+                  <button key={role} className="agent-stat-box" onClick={() => setOpenRole(role)}>
+                    <span className={`agent-stat-icon ${isAgentActive.get(role) ? "active" : ""}`}>◆</span>
+                    <span className="agent-stat-name">{role}</span>
+                    <span className={`agent-stat-status status-${agentStatusByRole.get(role) || "idle"}`}>{agentStatusByRole.get(role) || "idle"}</span>
+                    <span className="agent-stat-glyph">{AGENT_GLYPHS[role] || AGENT_GLYPHS.unknown}</span>
+                    <span className="agent-stat-count">{eventsByRole.get(role)?.length ?? 0}</span>
+                    <span className="agent-stat-label">msgs</span>
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
+          {(agentSections.test.length + agentSections.build.length) === 0 && <p className="no-agents">📭 No agent stream yet.</p>}
         </div>
       </div>
 
       {/* Main Grid */}
       <div className="main-grid">
-        {/* Left Column */}
+        {/* Mobile Stacked View */}
+        <div className="mobile-stacked">
+          {/* Epics */}
+          <div className="win-panel">
+            <div className="win-titlebar">
+              <div className="win-titlebar-text">
+                <span>📁</span>
+                <span>Epics ({data.epics.length})</span>
+                {selectedEpic && <span className="filter-badge">🔍 {truncateId(selectedEpic)}</span>}
+              </div>
+              <div className="win-titlebar-buttons">
+                <div className="win-btn-box" onClick={() => togglePanel("epics")}>_</div>
+                <div className="win-btn-box">×</div>
+              </div>
+            </div>
+            <div className={`win-content win-inset ${collapsedPanels.has("epics") ? "collapsed" : ""}`}>
+              <div className="epic-list">
+                {data.epics.length ? data.epics.map((epic) => (
+                  <div
+                    key={epic.id}
+                    className={`epic-item ${selectedEpic === epic.id ? "selected" : epic.status}`}
+                    onClick={() => setSelectedEpic(selectedEpic === epic.id ? null : epic.id)}
+                  >
+                    <div className="epic-top">
+                      <div>
+                        <span className="epic-id">{epic.id}</span>
+                        <span className="epic-title">{epic.title}</span>
+                      </div>
+                      <div className="item-actions">
+                        <span className={`pill pill-${epic.status}`}>{epic.status}</span>
+                        <button className="mini-btn" onClick={(e) => { e.stopPropagation(); void playLoopEpic(epic.id); }} disabled={actionBusy !== null}>
+                          Play
+                        </button>
+                        <button className="mini-btn" onClick={(e) => { e.stopPropagation(); setSelectedEpicDetails(epic); }} disabled={actionBusy !== null}>
+                          View
+                        </button>
+                      </div>
+                    </div>
+                    <p className="epic-goal">{epic.goalText.length > 100 ? epic.goalText.slice(0, 100) + "…" : epic.goalText}</p>
+                    <p className="epic-meta">Updated: {formatTime(epic.updatedAt)}</p>
+                  </div>
+                )) : <p className="epic-empty">📭 Create your first epic to kick off the workflow.</p>}
+              </div>
+            </div>
+          </div>
+
+          {/* Tickets */}
+          <div className="win-panel">
+            <div className="win-titlebar">
+              <div className="win-titlebar-text">
+                <span>📋</span>
+                <span>Tickets ({filteredTickets.length})</span>
+                {selectedEpic && <span className="filter-badge">🔍 {truncateId(selectedEpic)}</span>}
+              </div>
+              <div className="win-titlebar-buttons">
+                <div className="win-btn-box" onClick={() => togglePanel("tickets")}>_</div>
+                <div className="win-btn-box">×</div>
+              </div>
+            </div>
+            <div className={`win-content win-inset ${collapsedPanels.has("tickets") ? "collapsed" : ""}`}>
+              <div className="ticket-list">
+                {filteredTickets.length ? filteredTickets.map((ticket) => (
+                  <div className="ticket-item" key={ticket.id} onClick={() => setSelectedTicket(ticket)}>
+                    <div className="ticket-top">
+                      <div style={{ flex: 1 }}>
+                        <div className="ticket-id-row">
+                          <span className="ticket-id">{truncateId(ticket.id)}</span>
+                          {ticket.priority && <span className={`priority-${ticket.priority}`}>{ticket.priority}</span>}
+                        </div>
+                        <p className="ticket-title">{ticket.title}</p>
+                      </div>
+                      <div className="item-actions">
+                        <span className={`pill pill-${ticket.status}`}>{ticket.status}</span>
+                      </div>
+                    </div>
+                    {ticket.lastMessage && (
+                      <p className="ticket-last-msg">"{ticket.lastMessage}"</p>
+                    )}
+                    <div className="ticket-footer">
+                      {ticket.dependencies.length > 0 && (
+                        <span>
+                          <span className="editorial-spacing">Depends:</span>
+                          {ticket.dependencies.map((d) => d.split("__").pop()).join(", ")}
+                        </span>
+                      )}
+                      {ticket.currentNode && (
+                        <span>
+                          <span className="editorial-spacing">Node:</span>
+                          {ticket.currentNode}
+                        </span>
+                      )}
+                      {(ticketsByEpic.get(ticket.epicId) ?? []).length > 0 && (
+                        <span>
+                          <span className="editorial-spacing">Epic:</span>
+                          {truncateId(ticket.epicId)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )) : (
+                  <p className="ticket-empty">📭 {selectedEpic ? "No tickets for this epic yet." : "No tickets yet."}</p>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Recent Runs */}
+          <div className="win-panel">
+            <div className="win-titlebar">
+              <div className="win-titlebar-text">
+                <span>📺</span>
+                <span>Recent Runs</span>
+              </div>
+              <div className="win-titlebar-buttons">
+                <div className="win-btn-box" onClick={() => togglePanel("runs")}>_</div>
+                <div className="win-btn-box">×</div>
+              </div>
+            </div>
+            <div className={`win-content ${collapsedPanels.has("runs") ? "collapsed" : ""}`}>
+              <div className="run-list">
+                {data.runs.slice(0, 10).map((run) => (
+                  <div className="run-row" key={run.id}>
+                    <div>
+                      <span className="run-kind">{run.kind}</span>
+                      <span style={{ marginLeft: "0.5rem" }} className="run-id">{truncateId(run.id)}</span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                      <span className={`pill pill-${run.status}`}>{run.status}</span>
+                      <span className="run-node">{run.currentNode ?? "queued"}</span>
+                    </div>
+                  </div>
+                ))}
+                {!data.runs.length ? <p className="run-empty">📭 No runs yet.</p> : null}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Desktop Left Column */}
         <div className="left-col">
           {/* Mission Status */}
           <div className="win-panel">
@@ -1656,6 +2021,9 @@ export function App() {
                       </div>
                       <div className="item-actions">
                         <span className={`pill pill-${epic.status}`}>{epic.status}</span>
+                        <button className="mini-btn" onClick={(e) => { e.stopPropagation(); void playLoopEpic(epic.id); }} disabled={actionBusy !== null}>
+                          Play
+                        </button>
                         <button className="mini-btn" onClick={(e) => { e.stopPropagation(); setSelectedEpicDetails(epic); }} disabled={actionBusy !== null}>
                           View
                         </button>
@@ -1800,6 +2168,7 @@ export function App() {
         onClose={() => setSelectedEpicDetails(null)}
         onRetry={() => { if (selectedEpicDetails) void retryEpic(selectedEpicDetails.id); }}
         onReview={() => { if (selectedEpicDetails) void reviewEpic(selectedEpicDetails.id); }}
+        onPlayLoop={() => { if (selectedEpicDetails) void playLoopEpic(selectedEpicDetails.id); }}
         onCancel={() => { if (selectedEpicDetails) void cancelEpic(selectedEpicDetails.id); }}
         onDelete={() => { if (selectedEpicDetails) void deleteEpic(selectedEpicDetails.id); }}
         actionBusy={actionBusy !== null}

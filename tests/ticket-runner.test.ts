@@ -6,6 +6,8 @@ import { GoalRunner } from "../src/orchestration/goal-runner.ts";
 import { MediatedAgentHarnessGateway, MockGateway } from "../src/orchestration/models.ts";
 import { TicketRunner } from "../src/orchestration/ticket-runner.ts";
 import { OpenCodeLaunchError } from "../src/orchestration/opencode.ts";
+import { readModelsFile, writeModelsFile } from "../src/config.ts";
+import type { ReviewerVerdict } from "../src/types.ts";
 
 test("ticket runner completes a successful build-review-test loop", async () => {
   const repoRoot = await makeTempDir("repo-");
@@ -65,6 +67,66 @@ test("ticket runner completes a successful build-review-test loop", async () => 
     const ticket = services.db.getTicket("ticket_success");
     assert.equal(ticket?.status, "approved");
     assert.ok(services.db.listArtifacts("ticket_success").length >= 3);
+  } finally {
+    services.restore();
+  }
+});
+
+test("ticket runner approves via guard-only path when reviewer mode is off", async () => {
+  const repoRoot = await makeTempDir("repo-");
+  const dataDir = await makeTempDir("data-");
+  await initGitRepo(repoRoot);
+
+  const services = await bootstrapForTest({
+    REPO_ROOT: repoRoot,
+    DATA_DIR: dataDir,
+    REVIEWER_MODE: "off",
+    TEST_COMMAND: 'node --eval "process.exit(0)"',
+    LINT_COMMAND: 'node --eval "process.exit(0)"',
+    TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
+  }, { dryRun: true });
+
+  try {
+    const epic = GoalRunner.createEpic(services.db, {
+      id: "epic_reviewer_off",
+      title: "Reviewer off epic",
+      goalText: "Use guard-only reviewer path.",
+      targetDir: repoRoot
+    });
+    services.db.createTicket({
+      id: "ticket_reviewer_off",
+      epicId: epic.id,
+      title: "Update README",
+      description: "Append a controlled change.",
+      acceptanceCriteria: ["README updated"],
+      dependencies: [],
+      allowedPaths: ["README.md"],
+      priority: "high",
+      status: "queued",
+      metadata: { maxBuildAttempts: 2 }
+    });
+
+    class GuardOnlyGateway extends MockGateway {
+      override async getReviewerVerdict(): Promise<never> {
+        throw new Error("reviewer model should not be called in off mode");
+      }
+    }
+
+    const gateway = new GuardOnlyGateway({
+      builderPlans: [
+        {
+          summary: "Append line to README",
+          intendedFiles: ["README.md"],
+          operations: [{ kind: "append_file", path: "README.md", content: "\nGuard only\n" }]
+        }
+      ]
+    });
+
+    const runner = new TicketRunner(services.db, services.bridge, gateway as any, services.lifecycle);
+    const runId = await runner.start("ticket_reviewer_off", epic.id);
+    const result = await runner.runExisting(runId);
+
+    assert.equal(result.status, "approved");
   } finally {
     services.restore();
   }
@@ -147,6 +209,7 @@ test("ticket runner records agent stream events for opencode-backed builder", as
   const services = await bootstrapForTest({
     REPO_ROOT: repoRoot,
     DATA_DIR: dataDir,
+    REVIEWER_MODE: "mediated-deep",
     TEST_COMMAND: 'node --eval "process.exit(0)"',
     LINT_COMMAND: 'node --eval "process.exit(0)"',
     TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
@@ -206,6 +269,7 @@ test("ticket runner records structured OpenCode launch failures before falling b
   const services = await bootstrapForTest({
     REPO_ROOT: repoRoot,
     DATA_DIR: dataDir,
+    REVIEWER_MODE: "mediated-deep",
     TEST_COMMAND: 'node --eval "process.exit(0)"',
     LINT_COMMAND: 'node --eval "process.exit(0)"',
     TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
@@ -300,6 +364,7 @@ test("ticket runner passes the workspace path to the mediated tester", async () 
   const services = await bootstrapForTest({
     REPO_ROOT: repoRoot,
     DATA_DIR: dataDir,
+    REVIEWER_MODE: "mediated-deep",
     TEST_COMMAND: 'node --eval "process.exit(0)"',
     LINT_COMMAND: 'node --eval "process.exit(0)"',
     TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
@@ -384,6 +449,7 @@ test("ticket runner retries transient reviewer infrastructure failures", async (
   const services = await bootstrapForTest({
     REPO_ROOT: repoRoot,
     DATA_DIR: dataDir,
+    REVIEWER_MODE: "mediated-deep",
     TEST_COMMAND: 'node --eval "process.exit(0)"',
     LINT_COMMAND: 'node --eval "process.exit(0)"',
     TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
@@ -456,6 +522,7 @@ test("ticket runner surfaces clearer reviewer infrastructure errors", async () =
   const services = await bootstrapForTest({
     REPO_ROOT: repoRoot,
     DATA_DIR: dataDir,
+    REVIEWER_MODE: "mediated-deep",
     TEST_COMMAND: 'node --eval "process.exit(0)"',
     LINT_COMMAND: 'node --eval "process.exit(0)"',
     TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
@@ -583,6 +650,7 @@ test("reviewer destructive diff guard blocks unsafe approved diffs", async () =>
   const services = await bootstrapForTest({
     REPO_ROOT: repoRoot,
     DATA_DIR: dataDir,
+    REVIEWER_MODE: "mediated-deep",
     TEST_COMMAND: 'node --eval "process.exit(0)"',
     LINT_COMMAND: 'node --eval "process.exit(0)"',
     TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
@@ -680,4 +748,78 @@ test("mediated builder retries a native failure in XML compatibility mode", asyn
   assert.equal(result.rawOutput, "xml success");
   assert.deepEqual(gateway.attempts, ["native", "xml"]);
   assert.ok(events.some((event) => event.streamKind === "stderr" && event.content.includes("Retrying in XML compatibility mode")));
+});
+
+test("ticket runner uses mediated reviewer path when reviewer model is mediated", async () => {
+  const repoRoot = await makeTempDir("repo-");
+  const dataDir = await makeTempDir("data-");
+  await initGitRepo(repoRoot);
+
+  const services = await bootstrapForTest({
+    REPO_ROOT: repoRoot,
+    DATA_DIR: dataDir,
+    REVIEWER_MODE: "mediated-deep",
+    TEST_COMMAND: 'node --eval "process.exit(0)"',
+    LINT_COMMAND: 'node --eval "process.exit(0)"',
+    TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
+  }, { dryRun: true });
+  const originalModels = readModelsFile();
+  writeModelsFile({ ...originalModels, reviewer: "mediated:qwen3.5:9b" });
+
+  try {
+    const epic = GoalRunner.createEpic(services.db, {
+      id: "epic_mediated_reviewer",
+      title: "Mediated reviewer epic",
+      goalText: "Use mediated reviewer path.",
+      targetDir: repoRoot
+    });
+    services.db.createTicket({
+      id: "ticket_mediated_reviewer",
+      epicId: epic.id,
+      title: "Update README",
+      description: "Append a controlled change.",
+      acceptanceCriteria: ["README updated"],
+      dependencies: [],
+      allowedPaths: ["README.md"],
+      priority: "high",
+      status: "queued",
+      metadata: { maxBuildAttempts: 2 }
+    });
+
+    class MediatedReviewerGateway extends MockGateway {
+      override async getReviewerVerdict(_prompt: string): Promise<ReviewerVerdict> {
+        throw new Error("plain reviewer path should not be used");
+      }
+
+      async runReviewerInWorkspace(input: any): Promise<ReviewerVerdict> {
+        assert.equal(path.isAbsolute(input.cwd), true);
+        assert.equal(input.cwd.includes("ws_"), true);
+        return {
+          approved: true,
+          blockers: [],
+          suggestions: [],
+          riskLevel: "low"
+        };
+      }
+    }
+
+    const gateway = new MediatedReviewerGateway({
+      builderPlans: [
+        {
+          summary: "Append line to README",
+          intendedFiles: ["README.md"],
+          operations: [{ kind: "append_file", path: "README.md", content: "\nMediated reviewer path\n" }]
+        }
+      ]
+    });
+
+    const runner = new TicketRunner(services.db, services.bridge, gateway as any, services.lifecycle);
+    const runId = await runner.start("ticket_mediated_reviewer", epic.id);
+    const result = await runner.runExisting(runId);
+
+    assert.equal(result.status, "approved");
+  } finally {
+    writeModelsFile(originalModels);
+    services.restore();
+  }
 });

@@ -20,6 +20,7 @@ async function main() {
     recovery.recoverExpiredLeases();
     recovery.healQueueState();
     await recovery.rerunStaleRuns(config.staleRunAfterMs, config.staleRunMaxRecoveries);
+    await recovery.rescueQueuedTicketStalls();
     await bridge.cleanupArchivedWorkspaces();
 
     const jobs = db.nextQueuedJobs(concurrency);

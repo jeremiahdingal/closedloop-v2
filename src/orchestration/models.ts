@@ -35,6 +35,7 @@ export interface ModelGateway {
   getGoalReview(prompt: string): Promise<GoalReview>;
   getFailureDecision(prompt: string): Promise<FailureDecision>;
   runBuilderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<OpenCodeBuilderResult>;
+  runReviewerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ReviewerVerdict>;
   runTesterInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<TesterResult>;
   runGoalReviewInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any }): Promise<GoalReview>;
   runEpicDecoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any }): Promise<GoalDecomposition>;
@@ -45,6 +46,15 @@ export interface ModelGateway {
 const DEFAULT_TEMPERATURE = 1.0;
 const DEFAULT_TOP_P = 0.95;
 const DEFAULT_TOP_K = 64;
+
+function resolveOllamaContextWindow(model: string): number {
+  if (model.startsWith("glm-4.7-flash")) return 4096;
+  if (model.startsWith("qwen3.5:9b")) return 16384;
+  if (model.startsWith("qwen3.5:27b")) return 4096;
+  if (model.startsWith("devstral-small-2:24b")) return 393216;
+  if (model.startsWith("qwen2.5-coder:14b")) return 65536;
+  return 32768;
+}
 
 function buildZodSchemas(z: any) {
   const GoalTicketPlanSchema = z.object({
@@ -118,6 +128,7 @@ export class OllamaGateway implements ModelGateway {
 
   async rawPrompt(role: AgentRole, prompt: string): Promise<string> {
     const model = resolveOllamaModel(role, this.models);
+    const numCtx = resolveOllamaContextWindow(model);
     const response = await fetch(`${this.baseUrl}/api/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -128,7 +139,8 @@ export class OllamaGateway implements ModelGateway {
         options: {
           temperature: DEFAULT_TEMPERATURE,
           top_p: DEFAULT_TOP_P,
-          top_k: DEFAULT_TOP_K
+          top_k: DEFAULT_TOP_K,
+          num_ctx: numCtx
         }
       })
     });
@@ -148,12 +160,14 @@ export class OllamaGateway implements ModelGateway {
       const z = (zodPkg as any).z ?? zodPkg;
       const schemas = buildZodSchemas(z);
       const resolvedModel = resolveOllamaModel(role, this.models);
+      const numCtx = resolveOllamaContextWindow(resolvedModel);
       const model = new ChatOllama({
         model: resolvedModel,
         temperature: DEFAULT_TEMPERATURE,
         topP: DEFAULT_TOP_P,
         topK: DEFAULT_TOP_K,
-        baseUrl: this.baseUrl
+        baseUrl: this.baseUrl,
+        numCtx
       });
       const structured = model.withStructuredOutput((schemas as any)[schemaName]);
       return await structured.invoke(prompt) as T;
@@ -439,6 +453,98 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
   getReviewerVerdict(prompt: string): Promise<ReviewerVerdict> {
     return this.ollama.getReviewerVerdict(prompt);
+  }
+
+  async runReviewerInWorkspace(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    ticketId?: string | null;
+    epicId?: string | null;
+    onStream?: StreamHook;
+  }): Promise<ReviewerVerdict> {
+    const model = this.resolveHarnessModel("reviewer");
+    input.onStream?.({
+      agentRole: "reviewer",
+      source: "orchestrator",
+      streamKind: "status",
+      content: "Reviewing via mediated agent harness...",
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+    });
+
+    const toolContext = this.buildToolContext(input.cwd, "reviewer");
+    const harness = new MediatedAgentHarness({
+      baseURL: `${this.ollamaBaseURL}/v1`,
+      apiKey: "ollama",
+      model,
+      braveApiKey: this.braveApiKey,
+      toolContext,
+    });
+
+    const result = await harness.run("reviewer", input.prompt, {
+      maxIterations: 10,
+      timeoutMs: 300_000,
+      onEvent: (event) => {
+        if (event.kind === "text" || event.kind === "thinking") {
+          input.onStream?.({
+            agentRole: "reviewer",
+            source: "mediated-harness",
+            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
+            content: event.text,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+            metadata: { model },
+          });
+        }
+        if (event.kind === "tool_call") {
+          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
+          input.onStream?.({
+            agentRole: "reviewer",
+            source: "mediated-harness",
+            streamKind: "tool_call",
+            content: `${event.call.name}(${argsPreview})`,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
+          });
+        }
+        if (event.kind === "tool_error") {
+          input.onStream?.({
+            agentRole: "reviewer",
+            source: "mediated-harness",
+            streamKind: "stderr",
+            content: `Tool error: ${event.error}`,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+            metadata: { model },
+          });
+        }
+        if (event.kind === "complete") {
+          input.onStream?.({
+            agentRole: "reviewer",
+            source: "mediated-harness",
+            streamKind: "status",
+            content: `Completed in ${event.iterations} iterations`,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+            metadata: { model },
+          });
+        }
+      },
+    });
+
+    return validateReviewerVerdict(parseJsonText(result.text));
   }
 
   getGoalReview(prompt: string): Promise<GoalReview> {

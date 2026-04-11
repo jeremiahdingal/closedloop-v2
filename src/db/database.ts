@@ -72,6 +72,124 @@ export class AppDatabase {
       // Column already exists
     }
 
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tickets (
+        id TEXT PRIMARY KEY,
+        epic_id TEXT NOT NULL REFERENCES epics(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        acceptance_criteria_json TEXT NOT NULL,
+        dependencies_json TEXT NOT NULL,
+        allowed_paths_json TEXT NOT NULL,
+        priority TEXT NOT NULL,
+        status TEXT NOT NULL,
+        current_run_id TEXT,
+        current_node TEXT,
+        last_heartbeat_at TEXT,
+        last_message TEXT,
+        diff_files_json TEXT,
+        pr_url TEXT,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        epic_id TEXT,
+        ticket_id TEXT,
+        status TEXT NOT NULL,
+        current_node TEXT,
+        attempt INTEGER NOT NULL,
+        heartbeat_at TEXT,
+        last_message TEXT,
+        error_text TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS workspaces (
+        id TEXT PRIMARY KEY,
+        ticket_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        repo_root TEXT NOT NULL,
+        worktree_path TEXT NOT NULL,
+        branch_name TEXT NOT NULL,
+        base_commit TEXT NOT NULL,
+        head_commit TEXT,
+        status TEXT NOT NULL,
+        lease_owner TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        available_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        aggregate_type TEXT NOT NULL,
+        aggregate_id TEXT NOT NULL,
+        run_id TEXT,
+        ticket_id TEXT,
+        kind TEXT NOT NULL,
+        message TEXT NOT NULL,
+        payload_json TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS leases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_type TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        UNIQUE(resource_type, resource_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS artifacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT,
+        ticket_id TEXT,
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL,
+        path TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS tool_invocations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT,
+        ticket_id TEXT,
+        node_name TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        input_json TEXT NOT NULL,
+        exit_code INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        stdout_path TEXT,
+        stderr_path TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_jobs_status_available ON jobs(status, available_at);
+      CREATE INDEX IF NOT EXISTS idx_runs_ticket_status ON runs(ticket_id, status);
+      CREATE INDEX IF NOT EXISTS idx_events_aggregate ON events(aggregate_type, aggregate_id);
+    `);
+
     // RAG tables
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS rag_index_meta (
@@ -272,6 +390,14 @@ export class AppDatabase {
       nowIso(),
       input.ticketId
     );
+  }
+
+  updateTicketAllowedPaths(ticketId: string, allowedPaths: string[]): void {
+    this.db.prepare(`
+      UPDATE tickets
+      SET allowed_paths_json = ?, updated_at = ?
+      WHERE id = ?
+    `).run(JSON.stringify(allowedPaths), nowIso(), ticketId);
   }
 
   deleteTicket(id: string): void {
@@ -770,7 +896,7 @@ export class AppDatabase {
   }
 
   // RAG Index Methods
-  findRagIndex(
+  getRagIndex(
     repoRoot: string,
     commitHash: string,
     modelName: string
@@ -780,6 +906,14 @@ export class AppDatabase {
     ).get(repoRoot, commitHash, modelName) as any;
     return row ? { id: row.id, chunkCount: row.chunk_count } : null;
   }
+
+  getRagIndexByCommit(commitHash: string): { id: number; chunkCount: number } | null {
+    const row = this.db.prepare(
+      `SELECT id, chunk_count FROM rag_index_meta WHERE commit_hash = ? ORDER BY id DESC LIMIT 1`
+    ).get(commitHash) as any;
+    return row ? { id: row.id, chunkCount: row.chunk_count } : null;
+  }
+
 
   createRagIndex(input: {
     repoRoot: string;
