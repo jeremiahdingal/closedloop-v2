@@ -1,13 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { AgentEvent, Run, Ticket, TicketDiffResponse } from "../types";
+import { AgentEvent, Run, Ticket, TicketDiffResponse } from "../types.ts";
 import {
   diffLineClass,
   fetchJson,
   normalizeCompareUrl,
   parseUnifiedDiff,
   truncateId,
-} from "../utils";
-import { AgentEventCard } from "./AgentEventCard";
+} from "../utils.ts";
+import { AgentEventCard } from "./AgentEventCard.tsx";
 
 export function TicketModal(props: {
   ticket: Ticket;

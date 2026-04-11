@@ -10,7 +10,7 @@ import {
   Epic,
   Run,
   Ticket,
-} from "./types";
+} from "./types.ts";
 
 import {
   AGENT_GLYPHS,
@@ -19,17 +19,18 @@ import {
   confirmToast,
   fetchJson,
   formatTime,
+  isCompletedEvent,
   isRunActiveForRole,
   normalizeAgentRole,
   normalizeTicketTitleKey,
   ticketStatusScore,
   truncateId,
-} from "./utils";
+} from "./utils.ts";
 
-import { AgentModal } from "./components/AgentModal";
-import { EpicModal } from "./components/EpicModal";
-import { PlanningModal } from "./components/PlanningModal";
-import { TicketModal } from "./components/TicketModal";
+import { AgentModal } from "./components/AgentModal.tsx";
+import { EpicModal } from "./components/EpicModal.tsx";
+import { PlanningModal } from "./components/PlanningModal.tsx";
+import { TicketModal } from "./components/TicketModal.tsx";
 
 export function App() {
   const [data, setData] = useState<Dashboard>({ epics: [], tickets: [], runs: [], agentEvents: [] });

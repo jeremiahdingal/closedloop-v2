@@ -1,6 +1,6 @@
 import React from "react";
-import { AgentEvent } from "../types";
-import { formatTime, normalizeAgentRole } from "../utils";
+import { AgentEvent } from "../types.ts";
+import { formatTime, normalizeAgentRole } from "../utils.ts";
 
 const ROLE_ICONS: Record<string, string> = {
   builder: "🔨",

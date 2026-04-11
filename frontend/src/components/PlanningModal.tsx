@@ -2,8 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { GoalDecomposition } from "../types";
-import { fetchJson, headingSlug, nodeText } from "../utils";
+import { GoalDecomposition } from "../types.ts";
+import { fetchJson, headingSlug, nodeText } from "../utils.ts";
 
 const mdComponents = {
   h1: ({ children }: { children?: React.ReactNode }) => <h1 id={headingSlug(nodeText(children))}>{children}</h1>,

@@ -1,6 +1,6 @@
 import React from "react";
-import { AgentEvent, AgentModelInfo, AgentStreamStatus } from "../types";
-import { formatTime } from "../utils";
+import { AgentEvent, AgentModelInfo, AgentStreamStatus } from "../types.ts";
+import { formatTime } from "../utils.ts";
 
 export function AgentModal(props: {
   role: string;

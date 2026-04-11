@@ -1,5 +1,5 @@
 import { toast } from "sonner";
-import { AgentEvent, ParsedDiffFile, ParsedDiffHunk, Run } from "./types";
+import { AgentEvent, ParsedDiffFile, ParsedDiffHunk, Run } from "./types.ts";
 
 export const WORKSPACES_DIR = "/data/workspaces";
 export const LIVE_THRESHOLD_MS = 5000;

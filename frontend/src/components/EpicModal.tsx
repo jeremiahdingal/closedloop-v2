@@ -1,8 +1,8 @@
 import React, { useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AgentEvent, Epic, Ticket } from "../types";
-import { headingSlug, nodeText } from "../utils";
+import { AgentEvent, Epic, Ticket } from "../types.ts";
+import { headingSlug, nodeText } from "../utils.ts";
 
 const mdComponents = {
   h1: ({ children }: { children?: React.ReactNode }) => (
