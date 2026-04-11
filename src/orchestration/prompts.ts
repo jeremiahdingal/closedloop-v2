@@ -80,6 +80,7 @@ export function builderToolingPrompt(ticket: TicketRecord, packet: TicketContext
   const sections = [
     "Work inside the current repository using the tools that are actually available in this session.",
     toolContract,
+    "Start by using the 'explore_mode' tool to rapidly gather context from the repository structure and key files.",
     "Read PROJECT_STRUCTURE.md first.",
     ...(packet.retrievedContext?.projectStructure
       ? [`## Project Structure\n${packet.retrievedContext.projectStructure}`]
