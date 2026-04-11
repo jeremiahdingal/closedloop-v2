@@ -60,6 +60,7 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
               db: input.db!,
               repoRoot: input.cwd,
               commitHash: stdout.trim(),
+              onProgress: (msg) => emit(msg),
             });
           })
           .catch(() => null)

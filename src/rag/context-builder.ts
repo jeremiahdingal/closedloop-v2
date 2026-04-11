@@ -232,6 +232,7 @@ export interface QueryContextBuildOptions {
   baseUrl?: string;
   maxTokens?: number;
   scopePaths?: string[];
+  onProgress?: (message: string) => void;
 }
 
 /**
@@ -250,6 +251,7 @@ export async function buildContextForQuery(
       model: options.model,
       baseUrl: options.baseUrl,
       scopePaths: options.scopePaths,
+      onProgress: options.onProgress,
     });
 
     if (indexResult.chunkCount === 0) {

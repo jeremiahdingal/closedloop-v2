@@ -23,6 +23,7 @@ export interface IndexOptions {
   model?: string;
   baseUrl?: string;
   scopePaths?: string[];
+  onProgress?: (message: string) => void;
 }
 
 export interface IndexResult {
@@ -75,6 +76,7 @@ export async function indexWorkspace(options: IndexOptions): Promise<{ indexId: 
   }
 
   const chunks = await collectAndChunkFiles(options.repoRoot, options.scopePaths);
+  if (options.onProgress) options.onProgress(`Chunked ${chunks.length} files.`);
 
   if (chunks.length === 0) {
     const indexId = options.db.createRagIndex({
@@ -91,7 +93,12 @@ export async function indexWorkspace(options: IndexOptions): Promise<{ indexId: 
     c.content.length > EMBEDDING_MAX_CHARS ? c.content.slice(0, EMBEDDING_MAX_CHARS) : c.content
   );
   const embeddings: Float32Array[] = [];
+  const totalBatches = Math.ceil(contents.length / EMBEDDING_BATCH_SIZE);
+  
   for (let i = 0; i < contents.length; i += EMBEDDING_BATCH_SIZE) {
+    const currentBatch = Math.floor(i / EMBEDDING_BATCH_SIZE) + 1;
+    if (options.onProgress) options.onProgress(`Embedding batch ${currentBatch}/${totalBatches}...`);
+    
     const batch = contents.slice(i, i + EMBEDDING_BATCH_SIZE);
     const batchEmbeddings = await embedTexts(batch, { model, baseUrl });
     embeddings.push(...batchEmbeddings);

@@ -559,34 +559,8 @@ async function main() {
         return json(res, 200, content);
       }
 
-      // -----------------------------------------------------------------------
-      // Plan Session routes (detached from main build pipeline)
-      // -----------------------------------------------------------------------
-      if (url.pathname === "/api/plan-session" && req.method === "POST") {
-        const body = await readBody(req);
-        const epicTitle = String(body.epicTitle || "Untitled Plan");
-        const epicDescription = String(body.epicDescription || "");
-        const targetDir = String(body.targetDir || process.cwd());
-
-        const targetBranch = body.targetBranch ? String(body.targetBranch) : null;
-        const sessionId = randomId("plan");
-        const session: PlanSession = {
-          id: sessionId,
-          epicTitle,
-          epicDescription,
-          targetDir,
-          targetBranch,
-          userMessages: [],
-          latestPlan: null,
-          status: "running",
-          streamChunks: [],
-          textChunks: [],
-          pendingMessages: [],
-        };
-        planSessions.set(sessionId, session);
-
-        // Fire off plan decoder asynchronously — never awaited here
-        const runSession = async (sess: PlanSession) => {
+        // Fire off plan decoder asynchronously
+        async function runSession(sess: PlanSession) {
           try {
             const gateway = (goalRunner as any).gateway;
             const result = await runPlanDecoder({
@@ -620,6 +594,7 @@ async function main() {
               }
             }
           } catch (err) {
+            console.error(`[PlanSession] Session ${sess.id} failed:`, err);
             sess.streamChunks.push({
               agentRole: "epicDecoder",
               source: "orchestrator",
@@ -630,22 +605,51 @@ async function main() {
             sess.status = "error";
             return;
           }
-          // Drain any pending user messages as a re-run
+          
           sess.status = "idle";
           if (sess.pendingMessages.length > 0) {
+            console.log(`[PlanSession] Session ${sess.id} has ${sess.pendingMessages.length} pending messages. Re-running...`);
             sess.userMessages.push(...sess.pendingMessages);
             sess.pendingMessages = [];
             sess.textChunks = [];
             sess.latestPlan = null;
-            sess.streamChunks.push({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "plan_cleared", content: "", sequence: sess.streamChunks.length });
+            sess.streamChunks.push({ 
+              agentRole: "epicDecoder", 
+              source: "orchestrator", 
+              streamKind: "plan_cleared", 
+              content: "", 
+              sequence: sess.streamChunks.length 
+            });
             sess.status = "running";
             void runSession(sess);
           }
-        };
-        void runSession(session);
+        }
 
-        return json(res, 201, { sessionId });
-      }
+        if (url.pathname === "/api/plan-session" && req.method === "POST") {
+          const body = await readBody(req);
+          const epicTitle = String(body.epicTitle || "Untitled Plan");
+          const epicDescription = String(body.epicDescription || "");
+          const targetDir = String(body.targetDir || process.cwd());
+
+          const targetBranch = body.targetBranch ? String(body.targetBranch) : null;
+          const sessionId = randomId("plan");
+          const session: PlanSession = {
+            id: sessionId,
+            epicTitle,
+            epicDescription,
+            targetDir,
+            targetBranch,
+            userMessages: [],
+            latestPlan: null,
+            status: "running",
+            streamChunks: [],
+            textChunks: [],
+            pendingMessages: [],
+          };
+          planSessions.set(sessionId, session);
+          void runSession(session);
+          return json(res, 201, { sessionId });
+        }
 
       const planStreamMatch = /^\/api\/plan-session\/([^/]+)\/stream$/.exec(url.pathname);
       if (planStreamMatch && req.method === "GET") {
@@ -700,60 +704,6 @@ async function main() {
         session.streamChunks.push({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "plan_cleared", content: "", sequence: session.streamChunks.length });
         session.latestPlan = null;
         session.status = "running";
-        const gateway = (goalRunner as any).gateway;
-        const runSession = async (sess: PlanSession) => {
-          try {
-            const result = await runPlanDecoder({
-              cwd: sess.targetDir,
-              epicTitle: sess.epicTitle,
-              epicDescription: sess.epicDescription,
-              userMessages: sess.userMessages,
-              sessionId: sess.id,
-              db,
-              gateway,
-              onStream: (event: AgentStreamPayload) => {
-                sess.streamChunks.push(event);
-                if (event.streamKind === "assistant" && event.content) {
-                  sess.textChunks.push(event.content);
-                  const plan = extractPlanFromStream(sess.textChunks);
-                  if (plan) sess.latestPlan = plan;
-                }
-              },
-            });
-            if (!sess.latestPlan) {
-              sess.latestPlan = result.plan;
-              if (result.rawText) {
-                sess.streamChunks.push({
-                  agentRole: "epicDecoder",
-                  source: "orchestrator",
-                  streamKind: "assistant",
-                  content: result.rawText,
-                  sequence: sess.streamChunks.length,
-                });
-              }
-            }
-          } catch (err) {
-            sess.streamChunks.push({
-              agentRole: "epicDecoder",
-              source: "orchestrator",
-              streamKind: "stderr",
-              content: `Plan decoder error: ${err instanceof Error ? err.message : String(err)}`,
-              sequence: sess.streamChunks.length,
-            });
-            sess.status = "error";
-            return;
-          }
-          sess.status = "idle";
-          if (sess.pendingMessages.length > 0) {
-            sess.userMessages.push(...sess.pendingMessages);
-            sess.pendingMessages = [];
-            sess.textChunks = [];
-            sess.latestPlan = null;
-            sess.streamChunks.push({ agentRole: "epicDecoder", source: "orchestrator", streamKind: "plan_cleared", content: "", sequence: sess.streamChunks.length });
-            sess.status = "running";
-            void runSession(sess);
-          }
-        };
         void runSession(session);
         return json(res, 200, { ok: true, restarted: true });
       }
