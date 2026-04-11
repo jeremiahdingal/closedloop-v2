@@ -47,21 +47,62 @@ function toPreview(text: string, max = 220): string {
 function extractXmlCall(text: string): { name: string; args: Record<string, unknown> } | null {
   const fnMatch = /<function=([^>]+)>([\s\S]*?)<\/function(?:=[^>]+)?>/i.exec(text);
   if (!fnMatch) return null;
-  const [, name, body] = fnMatch;
-  const args: Record<string, unknown> = {};
-  const paramRegex = /<parameter(?:=([^>]+)|\s+name="([^"]+)")>([\s\S]*?)<\/parameter(?:=[^>]+)?>/gi;
-  let paramMatch: RegExpExecArray | null;
-  while ((paramMatch = paramRegex.exec(body)) !== null) {
-    const paramName = paramMatch[1] || paramMatch[2];
-    const rawValue = paramMatch[3];
-    if (!paramName) continue;
+  const name = fnMatch[1].trim();
+  const body = fnMatch[2];
+  let args: Record<string, unknown> = {};
+
+  // Regex to find ANY tags or parameters
+  const tagRegex = /<(parameter(?:=([^>]+)|\s+name="([^"]+)")|([^>=\s\/]+)(?:=[^>]+|[^>]*?))>([\s\S]*?)<\/\3|\1|\4>/gi;
+  
+  // Simpler approach: extract all <tag>content</tag> or <tag=name>content</tag>
+  const genericRegex = /<([^=>\s\/]+)(?:=([^>]+))?>([\s\S]*?)<\/\1(?:=[^>]+)?>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = genericRegex.exec(body)) !== null) {
+    const rawTag = match[1].toLowerCase();
+    const attr = match[2];
+    const content = match[3].trim();
+    
+    let key = rawTag;
+    if (rawTag === "parameter" && attr) key = attr;
+
     try {
-      args[paramName] = JSON.parse(rawValue);
+      // Try to parse content as JSON (handles arrays and objects)
+      args[key] = JSON.parse(content);
     } catch {
-      args[paramName] = rawValue;
+      args[key] = content;
     }
   }
-  return { name: name.trim(), args };
+
+  // Robust unwrap for models that nest everything under 'args', 'calls', etc.
+  const keys = Object.keys(args);
+  if (keys.length === 1) {
+    const k = keys[0];
+    const v = args[k];
+    if (v && typeof v === "object") {
+       if (k === "calls" || k === "args" || k === "payload" || k === "parameters" || k === "arguments") {
+          if (name === "explore_mode" && !Array.isArray(v) && (v as any).calls) {
+             args = v as any;
+          } else if (name === "explore_mode" && Array.isArray(v)) {
+             args = { calls: v };
+          } else if (!Array.isArray(v)) {
+             args = v as any;
+          }
+       }
+    }
+  }
+  
+  // One more check: if args is empty but body contains a JSON object, try parsing body
+  if (Object.keys(args).length === 0) {
+    const jsonMatch = /{[\s\S]*}/.exec(body);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (parsed && typeof parsed === "object") args = parsed;
+      } catch {}
+    }
+  }
+
+  return { name, args };
 }
 
 async function queryGemmaForToolCall(toolName: string, expectedArgs: Record<string, unknown>, instruction: string): Promise<string> {
@@ -211,6 +252,16 @@ async function buildWorkspace(): Promise<{ root: string; ctx: ToolExecutionConte
 
 function buildScenarios(allTools: string[]): ToolScenario[] {
   const scenarios: Record<string, ToolScenario> = {
+    explore_mode: {
+      name: "explore_mode",
+      expectedArgs: {
+        calls: [
+          { tool: "list_dir", args: { path: "." } },
+          { tool: "read_file", args: { path: "package.json" } }
+        ]
+      },
+      instruction: "Explore the project by listing root and reading package.json."
+    },
     glob_files: {
       name: "glob_files",
       expectedArgs: { pattern: "*.json" },

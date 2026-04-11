@@ -44,6 +44,7 @@ type AgentModelInfo = {
 const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
   epicDecoder: [
     { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
+    { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" },
@@ -53,6 +54,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
   ],
   epicReviewer: [
     { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
+    { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" },
@@ -60,6 +62,9 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" }
   ],
   reviewer: [
+    { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:qwen3.5:9b", label: "Mediated (qwen3.5:9b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:gemma4:e4b", label: "Mediated (gemma4:e4b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
     { id: "qwen3.5:9b", label: "Ollama (qwen3.5:9b)", description: "Pure LLM via local Ollama, no workspace tools" },
@@ -68,16 +73,31 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
   ],
   tester: [
     { id: "skip", label: "Skip Tester", description: "Bypass tester step and mark tests as skipped" },
+    { id: "mediated:gemma4:e4b", label: "Mediated (gemma4:e4b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" }
   ],
   builder: [
+    { id: "mediated:qwen3.5:9b", label: "Mediated (qwen3.5:9b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:gemma4:e4b", label: "Mediated (gemma4:e4b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:qwen3:14b", label: "Mediated (qwen3:14b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen2.5-coder:14b", label: "Mediated (qwen2.5-coder:14b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen2.5-coder:7b", label: "Mediated (qwen2.5-coder:7b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:devstral-small-2:24b", label: "Mediated (devstral-small-2:24b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" }
+  ],
+  playWriter: [
+    { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
+    { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" }
+  ],
+  playTester: [
+    { id: "mediated:qwen3:4b", label: "Mediated (qwen3:4b)", description: "Runs Playwright MCP tools via local Ollama" },
+    { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Runs Playwright MCP tools via local Ollama" },
+    { id: "mediated:qwen3.5:9b", label: "Mediated (qwen3.5:9b)", description: "Runs Playwright MCP tools via local Ollama" },
+    { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Runs Playwright MCP tools via local Ollama" }
   ]
 };
 
@@ -121,7 +141,7 @@ function getAgentModelsConfig(): Record<string, AgentModelInfo> {
 }
 
 function isAgentRole(value: string): value is AgentRole {
-  return ["epicDecoder", "builder", "reviewer", "tester", "epicReviewer", "doctor", "system"].includes(value);
+  return ["epicDecoder", "builder", "reviewer", "tester", "epicReviewer", "playWriter", "playTester", "doctor", "system"].includes(value);
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -228,7 +248,45 @@ async function main() {
         const epicId = decodeURIComponent(reviewEpicMatch[1]);
         const epic = db.getEpic(epicId);
         if (!epic) return json(res, 404, { error: "epic_not_found" });
+
+        // If epic is already approved/completed, do not queue another review run.
+        if (epic.status === "done") {
+          return json(res, 200, {
+            ok: true,
+            epicId,
+            skipped: true,
+            reason: "already_approved",
+            message: "Epic is already approved (status=done)."
+          });
+        }
+
+        // Dedupe manual/active review runs for the same epic.
+        const activeReviewRun = db
+          .listRunsForEpic(epicId)
+          .find((run) => {
+            if (run.status !== "queued" && run.status !== "running" && run.status !== "waiting") return false;
+            const node = String(run.currentNode ?? "").toLowerCase();
+            return node.includes("review");
+          });
+        if (activeReviewRun) {
+          return json(res, 200, {
+            ok: true,
+            epicId,
+            runId: activeReviewRun.id,
+            deduped: true,
+            message: "Review is already queued/running for this epic."
+          });
+        }
+
         const runId = await goalRunner.enqueueManualReview(epicId);
+        return json(res, 200, { ok: true, epicId, runId });
+      }
+      const playLoopEpicMatch = /^\/api\/epics\/([^/]+)\/play-loop$/.exec(url.pathname);
+      if (playLoopEpicMatch && req.method === "POST") {
+        const epicId = decodeURIComponent(playLoopEpicMatch[1]);
+        const epic = db.getEpic(epicId);
+        if (!epic) return json(res, 404, { error: "epic_not_found" });
+        const runId = await goalRunner.enqueueManualPlayLoop(epicId);
         return json(res, 200, { ok: true, epicId, runId });
       }
       const retryEpicMatch = /^\/api\/epics\/([^/]+)\/retry$/.exec(url.pathname);
@@ -246,6 +304,23 @@ async function main() {
         return json(res, 200, { ok: true, ...summary });
       }
       const cancelTicketMatch = /^\/api\/tickets\/([^/]+)\/cancel$/.exec(url.pathname);
+      const ticketDiffMatch = /^\/api\/tickets\/([^/]+)\/diff$/.exec(url.pathname);
+      if (ticketDiffMatch && req.method === "GET") {
+        const ticketId = decodeURIComponent(ticketDiffMatch[1]);
+        const artifacts = db.listArtifacts(ticketId);
+        const diffArtifact = artifacts.find((artifact) => String(artifact.kind ?? "") === "diff");
+        if (!diffArtifact) {
+          return json(res, 200, { ticketId, diff: "", artifactName: null, createdAt: null });
+        }
+        const diffPath = String(diffArtifact.path ?? "");
+        const diff = diffPath ? await readFile(diffPath, "utf8").catch(() => "") : "";
+        return json(res, 200, {
+          ticketId,
+          diff,
+          artifactName: String(diffArtifact.name ?? ""),
+          createdAt: String(diffArtifact.created_at ?? "")
+        });
+      }
       if (cancelTicketMatch && req.method === "POST") {
         const summary = await lifecycle.cancelTicket(decodeURIComponent(cancelTicketMatch[1]));
         return json(res, 200, { ok: true, ...summary });

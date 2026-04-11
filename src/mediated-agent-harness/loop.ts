@@ -12,8 +12,16 @@ import type {
 } from "./types.ts";
 import { StagnationError, ModelConnectionError, LoopTimeoutError } from "./errors.ts";
 import { StreamParser } from "./stream-parser.ts";
-import { WORKSPACE_TOOLS, executeToolCall } from "./tools.ts";
+import { WORKSPACE_TOOLS, BROWSER_TOOLS, executeToolCall } from "./tools.ts";
 import { CallHistory, validateAndRepair } from "./validator.ts";
+
+const KNOWN_TOOL_NAMES = new Set([
+  "explore_mode",
+  "glob_files", "grep_files", "list_dir", "read_file", "read_files",
+  "write_file", "write_files", "git_diff", "git_diff_staged",
+  "git_status", "list_changed_files", "run_command", "finish",
+  "web_search", "semantic_search", "read_artifact", "save_artifact"
+]);
 
 // ─── Main loop ──────────────────────────────────────────────────────────────
 
@@ -22,6 +30,15 @@ export interface LoopInput {
   userPrompt: string;
   config: MediatedHarnessConfig;
   toolContext: ToolExecutionContext;
+}
+
+function resolveModelContextWindow(model: string): number {
+  if (model.startsWith("glm-4.7-flash")) return 4096;
+  if (model.startsWith("qwen3.5:9b")) return 16384;
+  if (model.startsWith("qwen3.5:27b")) return 4096;
+  if (model.startsWith("devstral-small-2:24b")) return 393216;
+  if (model.startsWith("qwen2.5-coder:14b")) return 65536;
+  return 32768;
 }
 
 export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarnessResult> {
@@ -40,6 +57,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
   const temperature = config.temperature ?? 1.0;
   const topP = config.topP ?? 0.95;
   const topK = config.topK ?? 64;
+  const numCtx = resolveModelContextWindow(config.model);
   const emit = config.onEvent ?? (() => {});
 
   // Augment tool context with braveApiKey from config if not already set
@@ -52,7 +70,11 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     { role: "user", content: userPrompt },
   ];
 
-  const tools = WORKSPACE_TOOLS;
+  // Include browser tools for playTester and tester roles
+  const needsBrowser = (role: string) => role === "playTester" || role === "tester";
+  const tools = config.role && needsBrowser(config.role) 
+    ? [...WORKSPACE_TOOLS, ...BROWSER_TOOLS] 
+    : WORKSPACE_TOOLS;
   const toolSchemaMap = new Map(tools.map(t => [t.function.name, t]));
   const history = new CallHistory();
   const collectedToolCalls: ToolCall[] = [];
@@ -120,6 +142,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
           temperature,
           top_p: topP,
           top_k: topK,
+          num_ctx: numCtx,
         }),
       });
     } catch (err) {
@@ -174,20 +197,11 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     }
 
     const state = parser.drain();
-
-    // Emit thinking if present (opportunistic)
-    if (state.thinking) {
-      emit({ kind: "thinking", text: state.thinking });
-    }
-
-    // Emit text content
-    if (state.content) {
-      emit({ kind: "text", text: state.content });
-    }
+    let assistantText = state.content;
 
     // If no API tool calls, check for XML-style tool calls or termination
     if (state.toolCalls.length === 0) {
-      const text = state.content.trim();
+      const text = assistantText.trim();
 
       // Check for XML-style tool calls (common with qwen models)
       if (text) {
@@ -195,9 +209,23 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         if (xmlCalls.length > 0) {
           // Treat XML tool calls as if they were API tool calls
           state.toolCalls = xmlCalls;
+          assistantText = stripXmlToolCalls(text);
           // Fall through to the tool call processing below
         } else {
           // No tool calls at all — try to accept as JSON
+          if (state.thinking) {
+            emit({ kind: "thinking", text: state.thinking });
+          }
+
+          if (assistantText) {
+            emit({ kind: "text", text: assistantText });
+          }
+
+          const jsonCalls = extractJsonToolCalls(text);
+          if (jsonCalls.length > 0) {
+            state.toolCalls = jsonCalls;
+            assistantText = "";
+          } else {
           const jsonResult = extractJson(text);
           if (jsonResult) {
             emit({
@@ -226,7 +254,9 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       }
 
       // Empty response — force a tool call
-      if (iteration === 0) {
+      if (state.toolCalls.length > 0) {
+        // XML extraction succeeded above; continue to normal tool handling below.
+      } else if (iteration === 0) {
         messages.push({ role: "assistant", content: null });
         messages.push({
           role: "user",
@@ -235,7 +265,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         continue;
       }
 
-      if (!emptyResponseRetryUsed) {
+      if (state.toolCalls.length === 0 && !emptyResponseRetryUsed) {
         emptyResponseRetryUsed = true;
         messages.push({ role: "assistant", content: state.content || "" });
         messages.push({
@@ -247,11 +277,22 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         continue;
       }
 
-      throw new StagnationError(
-        "Model produced empty response",
-        iteration + 1,
-        "no_progress"
-      );
+      if (state.toolCalls.length === 0) {
+        throw new StagnationError(
+          "Model produced empty response",
+          iteration + 1,
+          "no_progress"
+        );
+      }
+      }
+    }
+
+    if (state.thinking) {
+      emit({ kind: "thinking", text: state.thinking });
+    }
+
+    if (assistantText.trim()) {
+      emit({ kind: "text", text: assistantText });
     }
 
     // Process tool calls
@@ -293,9 +334,29 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
           },
         });
 
+        let hintSuffix = validated.remediation ? ` Hint: ${validated.remediation}` : "";
+        if (ctx.db && ctx.ragIndexId) {
+          try {
+            const { buildToolingContext } = await import("../rag/context-builder.ts");
+            const repairHint = await buildToolingContext({
+              role: config.role || "builder",
+              availableTools: [], // We only want repair hints here
+              db: ctx.db,
+              indexId: ctx.ragIndexId,
+              includeRepair: true,
+              maxTokens: 500,
+            });
+            if (repairHint) {
+              hintSuffix += `\n\n${repairHint}`;
+            }
+          } catch (err) {
+            console.warn(`[Harness] Failed to fetch repair hint: ${err}`);
+          }
+        }
+
         toolResults.push({
           role: "tool",
-          content: `Error: ${validated.message}${validated.remediation ? ` Hint: ${validated.remediation}` : ""}`,
+          content: `Error: ${validated.message}${hintSuffix}`,
           tool_call_id: completeCall.id,
         });
 
@@ -360,7 +421,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     // Append assistant message with tool calls
     messages.push({
       role: "assistant",
-      content: state.content || "",
+      content: assistantText || "",
       tool_calls: assistantToolCalls.length > 0 ? assistantToolCalls : undefined,
     });
 
@@ -411,36 +472,289 @@ function extractJson(text: string): unknown | null {
   return null;
 }
 
-// ─── XML tool call extraction (qwen-style) ───────────────────────────────────
+// ─── XML and Python-style tool call extraction ──────────────────────────────
 
 function extractXmlToolCalls(text: string): CompleteToolCall[] {
   const calls: CompleteToolCall[] = [];
-  const fnRegex = /<function=([^>]+)>([\s\S]*?)<\/function(?:=[^>]+)?>/g;
-  let fnMatch: RegExpExecArray | null;
 
-  while ((fnMatch = fnRegex.exec(text)) !== null) {
-    const fnName = fnMatch[1];
-    const fnBody = fnMatch[2] ?? "";
-    const args: Record<string, unknown> = {};
-    const paramRegex = /<parameter(?:=([^>]+)|\s+name="([^"]+)")>([\s\S]*?)<\/parameter(?:=[^>]+)?>/g;
-    let paramMatch: RegExpExecArray | null;
+  // 1. Stage 1: Find "Anchors" (XML tags that signal a tool call)
+  // Matches <tag=val>, <tag name=val>, or <tool_name>
+  // Extremely permissive closing tag support to handle GLM quirks
+  const anchorRegex = /<(function|invoke|function_call|call_tool|tool_name|[\w_-]+)(?:[=\s](?:name|tool_name)="?([\w_-]+)"?|="?([\w_-]+)"?)?([\s\S]*?)>([\s\S]*?)(?:<\/\1(?:=[^>]+)?>|<\/\1>|<\/function>|<\/invoke>|$)/gi;
+  
+  let match: RegExpExecArray | null;
+  while ((match = anchorRegex.exec(text)) !== null) {
+    const tagName = match[1].toLowerCase();
+    const attrName = (match[2] || match[3] || "").toLowerCase();
+    const body = match[5].trim();
+    
+    let fnName = "";
+    let fnBody = body;
 
-    while ((paramMatch = paramRegex.exec(fnBody)) !== null) {
-      const paramName = paramMatch[1] || paramMatch[2];
-      const rawValue = paramMatch[3];
-      try {
-        args[paramName] = JSON.parse(rawValue);
-      } catch {
-        args[paramName] = rawValue;
+    // Resolve the intended function name
+    if (KNOWN_TOOL_NAMES.has(attrName)) {
+      fnName = attrName;
+    } else if (KNOWN_TOOL_NAMES.has(tagName)) {
+      fnName = tagName;
+    } else {
+      // Handles content-as-name (e.g. <function>read_file</function>)
+      const firstWord = body.split(/[<\s\n]/)[0].trim().toLowerCase();
+      if (KNOWN_TOOL_NAMES.has(firstWord)) {
+        fnName = firstWord;
+        fnBody = body.substring(fnName.length).trim();
       }
     }
 
-    calls.push({
-      id: "xml_call_" + calls.length,
-      name: fnName,
-      arguments: JSON.stringify(args),
-    });
+    if (!fnName) continue;
+
+    // Resolve Arguments
+    const args: Record<string, unknown> = {};
+    
+    // Support sequential fragments: look ahead in text if body is short
+    let searchSpace = fnBody;
+    if (fnBody.length < 50) {
+      searchSpace += "\n" + text.substring(match.index + match[0].length, match.index + match[0].length + 400);
+    }
+
+    // A. Sub-tag extraction (<parameter>, <arg>, <path>, etc.)
+    const argRegex = /<(parameter|arg|argument|args|arguments|path|pattern|name|[\w_-]+)(?:[=\s]name="?([\w_-]+)"?|="?([\w_-]+)"?)?>([\s\S]*?)<\/\1>/gi;
+    let argMatch: RegExpExecArray | null;
+    while ((argMatch = argRegex.exec(searchSpace)) !== null) {
+      const pTagName = argMatch[1].toLowerCase();
+      const pAttrName = argMatch[2] || argMatch[3];
+      const pVal = argMatch[4].trim();
+      
+      if (KNOWN_TOOL_NAMES.has(pTagName) && pTagName !== fnName) continue;
+
+      const pName = pAttrName || (["parameter", "arg", "argument", "args", "arguments"].includes(pTagName) ? null : pTagName);
+
+      if (pName) {
+        args[pName] = parseXmlParameterValue(fnName, pName, pVal);
+      } else {
+        // Robust KV split: handles "path>val", "path:val", "path=val"
+        const kvMatch = /^([\w_-]+)[:=>]([\s\S]*)$/.exec(pVal);
+        if (kvMatch) {
+          const key = kvMatch[1], val = kvMatch[2].trim();
+          args[key] = parseXmlParameterValue(fnName, key, val);
+        } else {
+          // Positional mapping
+          if (["read_file", "list_dir"].includes(fnName)) args["path"] = pVal;
+          else if (["glob_files", "grep_files"].includes(fnName)) args["pattern"] = pVal;
+          else if (fnName === "run_command") args["name"] = pVal;
+          else if (["web_search", "semantic_search"].includes(fnName)) args["query"] = pVal;
+        }
+      }
+    }
+
+    // B. Bare JSON inside search space
+    if (Object.keys(args).length === 0) {
+      const jsonMatch = /\{[\s\S]*?\}/.exec(searchSpace);
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[0].replace(/'/g, '"'));
+          if (typeof parsed === "object" && parsed !== null) Object.assign(args, parsed);
+        } catch {}
+      }
+    }
+
+    // C. Attribute-based arguments
+    const attributes = match[4] ?? "";
+    const argsAttrMatch = /(?:args|arguments|parameters)=(?:'([^']+)'|"([^"]+)")/.exec(attributes);
+    if (argsAttrMatch) {
+      try {
+        const decoded = (argsAttrMatch[1] || argsAttrMatch[2]).replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+        Object.assign(args, JSON.parse(decoded));
+      } catch {}
+    }
+
+    calls.push({ id: "unified_" + calls.length, name: fnName, arguments: JSON.stringify(args) });
+    anchorRegex.lastIndex = match.index + match[0].length;
+  }
+
+  // 2. Python-style Fallback (Only if Stage 1 found nothing)
+  if (calls.length === 0) {
+    const pyRegex = /([\w_-]+)\(([\s\S]*?)\)/g;
+    let pyMatch: RegExpExecArray | null;
+    while ((pyMatch = pyRegex.exec(text)) !== null) {
+      const name = pyMatch[1].toLowerCase();
+      if (!KNOWN_TOOL_NAMES.has(name)) continue;
+      const pyBody = pyMatch[2].trim();
+      const pyArgs: Record<string, unknown> = {};
+      if (pyBody && !pyBody.includes("=") && !pyBody.includes(":")) {
+        if (["read_file", "list_dir"].includes(name)) pyArgs["path"] = pyBody.replace(/^["']|["']$/g, "");
+      } else {
+        const argMatchRegex = /([\w_-]+)\s*[:=]\s*("[^"]*"|'[^']*'|[^,)]+)/g;
+        let am: RegExpExecArray | null;
+        while ((am = argMatchRegex.exec(pyBody)) !== null) {
+          const k = am[1], v = am[2].trim().replace(/^["']|["']$/g, "");
+          try { pyArgs[k] = JSON.parse(v); } catch { pyArgs[k] = v; }
+        }
+      }
+      calls.push({ id: "py_" + calls.length, name, arguments: JSON.stringify(pyArgs) });
+    }
   }
 
   return calls;
+}
+
+function stripXmlToolCalls(text: string): string {
+  return text
+    .replace(/<(function|invoke|function_call|call_tool|tool_name|[\w_-]+)(?:[\s=][^>]*)?>[\s\S]*?(?:<\/\1(?:=[^>]+)?>|<\/function>|<\/invoke>|$)/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractJsonToolCalls(text: string): CompleteToolCall[] {
+  const normalizeArgs = (raw: unknown): Record<string, unknown> | null => {
+    if (raw === undefined || raw === null) return {};
+    if (typeof raw === "string") {
+      try {
+        const parsedArgs = JSON.parse(raw);
+        if (parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)) {
+          return parsedArgs as Record<string, unknown>;
+        }
+      } catch {
+        return null;
+      }
+      return null;
+    }
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      return raw as Record<string, unknown>;
+    }
+    return null;
+  };
+
+  const toCall = (entry: unknown, idx: number): CompleteToolCall | null => {
+    if (!entry || typeof entry !== "object") return null;
+    const record = entry as Record<string, unknown>;
+    const fn = (record.function && typeof record.function === "object")
+      ? (record.function as Record<string, unknown>)
+      : undefined;
+
+    const nameCandidate =
+      (typeof record.tool_name === "string" ? record.tool_name : "") ||
+      (typeof record.name === "string" ? record.name : "") ||
+      (typeof fn?.name === "string" ? fn.name : "");
+    const name = nameCandidate.trim();
+    if (!name || !KNOWN_TOOL_NAMES.has(name)) return null;
+
+    const argsRaw = record.arguments ?? record.args ?? fn?.arguments ?? {};
+    const args = normalizeArgs(argsRaw);
+    if (!args) return null;
+
+    return {
+      id: `json_${idx}`,
+      name,
+      arguments: JSON.stringify(args),
+    };
+  };
+
+  const calls: CompleteToolCall[] = [];
+
+  const addFromParsed = (parsed: unknown): void => {
+    let entries: unknown[] = [];
+    if (Array.isArray(parsed)) {
+      entries = parsed;
+    } else if (parsed && typeof parsed === "object") {
+      const record = parsed as Record<string, unknown>;
+      entries = Array.isArray(record.tool_calls) ? record.tool_calls : [parsed];
+    }
+
+    for (const entry of entries) {
+      const call = toCall(entry, calls.length);
+      if (call) calls.push(call);
+    }
+  };
+
+  const direct = extractJson(text);
+  if (direct) {
+    addFromParsed(direct);
+  }
+
+  if (calls.length === 0) {
+    const snippets = extractTopLevelJsonObjects(text);
+    for (const snippet of snippets) {
+      try {
+        addFromParsed(JSON.parse(snippet));
+      } catch {
+        // Ignore malformed snippets
+      }
+    }
+  }
+
+  return calls;
+}
+
+function extractTopLevelJsonObjects(text: string): string[] {
+  const snippets: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (ch === "{") {
+      if (depth === 0) start = i;
+      depth++;
+      continue;
+    }
+
+    if (ch === "}") {
+      if (depth > 0) depth--;
+      if (depth === 0 && start >= 0) {
+        snippets.push(text.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+
+  return snippets;
+}
+
+function parseXmlParameterValue(toolName: string, paramName: string, rawValue: string): unknown {
+  const value = rawValue.trim();
+
+  // finish.result is intentionally a JSON string payload, not an object
+  if (toolName === "finish" && (paramName === "result" || paramName === "summary")) {
+    return value;
+  }
+
+  if (!value) {
+    return value;
+  }
+
+  if (value === "true") return true;
+  if (value === "false") return false;
+  if (value === "null") return null;
+  if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value);
+
+  if (
+    (value.startsWith("{") && value.endsWith("}")) ||
+    (value.startsWith("[") && value.endsWith("]")) ||
+    ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    try {
+      return JSON.parse(value.replace(/^'([\s\S]*)'$/, '"$1"'));
+    } catch {
+      return value;
+    }
+  }
+
+  return value;
 }

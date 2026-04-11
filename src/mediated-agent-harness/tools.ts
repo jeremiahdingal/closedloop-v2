@@ -1,16 +1,278 @@
 import path from "node:path";
-import { readFile, readdir, stat, writeFile, mkdir } from "node:fs/promises";
+import { readFile, readdir, stat, writeFile, mkdir, unlink } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ToolDef, ToolExecutionContext, ToolCall, ToolResult } from "./types.ts";
 import { ToolExecutionError } from "./errors.ts";
 import { retrieveChunks } from "../rag/retriever.ts";
+import { chromium, type Browser, type Page, type BrowserContext } from "playwright";
 
 const execFileAsync = promisify(execFile);
+
+// Browser state management
+const browserState = new Map<string, { browser: Browser; context: BrowserContext; page: Page }>();
+
+function getBrowserState(workspaceId: string) {
+  return browserState.get(workspaceId);
+}
+
+function setBrowserState(workspaceId: string, state: { browser: Browser; context: BrowserContext; page: Page }) {
+  browserState.set(workspaceId, state);
+}
+
+function clearBrowserState(workspaceId: string) {
+  const state = browserState.get(workspaceId);
+  if (state) {
+    state.context.close().catch(() => {});
+    state.browser.close().catch(() => {});
+    browserState.delete(workspaceId);
+  }
+}
+
+async function getOrCreateBrowser(workspaceId: string, headless = true): Promise<{ browser: Browser; context: BrowserContext; page: Page }> {
+  let state = browserState.get(workspaceId);
+  if (state) return state;
+
+  const browser = await chromium.launch({ headless });
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  state = { browser, context, page };
+  browserState.set(workspaceId, state);
+  return state;
+}
+
+// Browser tool implementations
+async function execBrowserNavigate(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const url = String(args.url);
+  if (!url) return { callId, name: "browser_navigate", output: "Error: url is required", isError: true };
+  try {
+    const state = await getOrCreateBrowser(ctx.workspaceId);
+    await state.page.goto(url, { waitUntil: "domcontentloaded" });
+    const title = await state.page.title().catch(() => "unknown");
+    return { callId, name: "browser_navigate", output: `Navigated to ${url}. Page title: ${title}`, isError: false };
+  } catch (err) {
+    return { callId, name: "browser_navigate", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserClick(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const selector = String(args.selector);
+  if (!selector) return { callId, name: "browser_click", output: "Error: selector is required", isError: true };
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_click", output: "Error: Browser not initialized. Navigate first.", isError: true };
+    const modifiers = args.modifiers || [];
+    await state.page.click(selector, { modifiers });
+    return { callId, name: "browser_click", output: `Clicked element: ${selector}`, isError: false };
+  } catch (err) {
+    return { callId, name: "browser_click", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserType(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const selector = String(args.selector);
+  const text = String(args.text);
+  if (!selector || !text) return { callId, name: "browser_type", output: "Error: selector and text are required", isError: true };
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_type", output: "Error: Browser not initialized", isError: true };
+    await state.page.type(selector, text);
+    return { callId, name: "browser_type", output: `Typed "${text}" into ${selector}`, isError: false };
+  } catch (err) {
+    return { callId, name: "browser_type", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserFill(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const selector = String(args.selector);
+  const text = String(args.text);
+  if (!selector || !text) return { callId, name: "browser_fill", output: "Error: selector and text are required", isError: true };
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_fill", output: "Error: Browser not initialized", isError: true };
+    await state.page.fill(selector, text);
+    return { callId, name: "browser_fill", output: `Filled ${selector} with "${text}"`, isError: false };
+  } catch (err) {
+    return { callId, name: "browser_fill", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserSnapshot(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_snapshot", output: "Error: Browser not initialized. Navigate first.", isError: true };
+    const element = args.element ? String(args.element) : null;
+    const html = element ? (await state.page.$(element))?.innerHTML() || "Element not found" : await state.page.content();
+    return { callId, name: "browser_snapshot", output: `HTML (truncated): ${String(html).slice(0, 3000)}`, isError: false };
+  } catch (err) {
+    return { callId, name: "browser_snapshot", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserEvaluate(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const expression = String(args.expression);
+  if (!expression) return { callId, name: "browser_evaluate", output: "Error: expression is required", isError: true };
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_evaluate", output: "Error: Browser not initialized", isError: true };
+    const result = await state.page.evaluate(expression);
+    return { callId, name: "browser_evaluate", output: `Result: ${JSON.stringify(result).slice(0, 1000)}`, isError: false };
+  } catch (err) {
+    return { callId, name: "browser_evaluate", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserGetText(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const selector = String(args.selector);
+  if (!selector) return { callId, name: "browser_get_text", output: "Error: selector is required", isError: true };
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_get_text", output: "Error: Browser not initialized", isError: true };
+    const text = await state.page.textContent(selector);
+    return { callId, name: "browser_get_text", output: text || "(no text)", isError: false };
+  } catch (err) {
+    return { callId, name: "browser_get_text", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserWaitFor(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const text = args.text ? String(args.text) : null;
+  const selector = args.selector ? String(args.selector) : null;
+  const time = args.time ? Number(args.time) : 10;
+  if (!text && !selector) return { callId, name: "browser_wait_for", output: "Error: text or selector is required", isError: true };
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_wait_for", output: "Error: Browser not initialized", isError: true };
+    if (selector) await state.page.waitForSelector(selector, { timeout: time * 1000 });
+    if (text) await state.page.waitForSelector(`text=${text}`, { timeout: time * 1000 });
+    return { callId, name: "browser_wait_for", output: `Waited for ${selector || text}`, isError: false };
+  } catch (err) {
+    return { callId, name: "browser_wait_for", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserSelectOption(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const selector = String(args.selector);
+  const value = String(args.value);
+  if (!selector || !value) return { callId, name: "browser_select_option", output: "Error: selector and value are required", isError: true };
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_select_option", output: "Error: Browser not initialized", isError: true };
+    await state.page.selectOption(selector, value);
+    return { callId, name: "browser_select_option", output: `Selected ${value} in ${selector}`, isError: false };
+  } catch (err) {
+    return { callId, name: "browser_select_option", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserTabs(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const action = String(args.action);
+  const index = args.index !== undefined ? Number(args.index) : 0;
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_tabs", output: "Error: Browser not initialized", isError: true };
+    if (action === "list") {
+      const pages = state.context.pages();
+      return { callId, name: "browser_tabs", output: `Tabs: ${pages.map((p, i) => `${i}: ${p.url()}`).join("\n")}`, isError: false };
+    } else if (action === "switch") {
+      const pages = state.context.pages();
+      if (index >= pages.length) return { callId, name: "browser_tabs", output: `Error: Tab index ${index} out of range`, isError: true };
+      await pages[index].bringToFront();
+      return { callId, name: "browser_tabs", output: `Switched to tab ${index}`, isError: false };
+    }
+    return { callId, name: "browser_tabs", output: "Error: action must be 'list' or 'switch'", isError: true };
+  } catch (err) {
+    return { callId, name: "browser_tabs", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserClose(callId: string, ctx: ToolExecutionContext): Promise<ToolResult> {
+  clearBrowserState(ctx.workspaceId);
+  return { callId, name: "browser_close", output: "Browser closed", isError: false };
+}
+
+async function execBrowserTakeScreenshot(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const filename = String(args.filename);
+  const fullPage = args.fullPage === true;
+  if (!filename) return { callId, name: "browser_take_screenshot", output: "Error: filename is required", isError: true };
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_take_screenshot", output: "Error: Browser not initialized", isError: true };
+    const filepath = path.join(ctx.cwd, filename);
+    await state.page.screenshot({ path: filepath, fullPage });
+    return { callId, name: "browser_take_screenshot", output: `Screenshot saved to ${filename}`, isError: false };
+  } catch (err) {
+    return { callId, name: "browser_take_screenshot", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserHover(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const selector = String(args.selector);
+  if (!selector) return { callId, name: "browser_hover", output: "Error: selector is required", isError: true };
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_hover", output: "Error: Browser not initialized", isError: true };
+    await state.page.hover(selector);
+    return { callId, name: "browser_hover", output: `Hovered over ${selector}`, isError: false };
+  } catch (err) {
+    return { callId, name: "browser_hover", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserPressKey(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const key = String(args.key);
+  if (!key) return { callId, name: "browser_press_key", output: "Error: key is required", isError: true };
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_press_key", output: "Error: Browser not initialized", isError: true };
+    await state.page.keyboard.press(key);
+    return { callId, name: "browser_press_key", output: `Pressed key: ${key}`, isError: false };
+  } catch (err) {
+    return { callId, name: "browser_press_key", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+async function execBrowserNetworkRequests(callId: string, args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
+  const filter = args.filter ? String(args.filter) : null;
+  try {
+    const state = getBrowserState(ctx.workspaceId);
+    if (!state) return { callId, name: "browser_network_requests", output: "Error: Browser not initialized", isError: true };
+    const requests = state.page.url() ? [state.page.url()] : [];
+    return { callId, name: "browser_network_requests", output: `Current URL: ${requests[0] || "(none)"}`, isError: false };
+  } catch (err) {
+    return { callId, name: "browser_network_requests", output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
 
 // ─── Tool definitions (OpenAI function-calling format) ──────────────────────
 
 export const WORKSPACE_TOOLS: ToolDef[] = [
+  {
+    type: "function",
+    function: {
+      name: "explore_mode",
+      description: "Batch multiple read-only tool calls into a single response for rapid context gathering.",
+      parameters: {
+        type: "object",
+        properties: {
+          calls: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                tool: { type: "string", description: "Name of the tool to call (e.g., read_file, list_dir, grep_files)" },
+                args: { type: "object", description: "Arguments for the tool" }
+              },
+              required: ["tool", "args"]
+            },
+            description: "List of tool calls to execute in sequence."
+          }
+        },
+        required: ["calls"],
+        additionalProperties: false
+      }
+    }
+  },
   {
     type: "function",
     function: {
@@ -158,6 +420,24 @@ export const WORKSPACE_TOOLS: ToolDef[] = [
   {
     type: "function",
     function: {
+      name: "remove_file",
+      description: "Delete a single file in the workspace. Only files are allowed (not directories).",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "File path relative to workspace root"
+          }
+        },
+        required: ["path"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "git_diff",
       description: "Show the plain workspace diff (unstaged changes).",
       parameters: {
@@ -211,13 +491,13 @@ export const WORKSPACE_TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "run_command",
-      description: "Run a whitelisted command (e.g. test, lint, typecheck, status). The command name must be in the workspace's available commands.",
+      description: "Run a whitelisted command (e.g. test, lint, typecheck, build, status). The command name must be in the workspace's available commands.",
       parameters: {
         type: "object",
         properties: {
           name: {
             type: "string",
-            description: "Name of the whitelisted command to run (e.g. 'test', 'lint', 'typecheck')"
+            description: "Name of the whitelisted command to run (e.g. 'test', 'lint', 'typecheck', 'build')"
           }
         },
         required: ["name"],
@@ -354,9 +634,44 @@ export const WORKSPACE_TOOLS: ToolDef[] = [
   }
 ];
 
-// ─── Tool name alias map ────────────────────────────────────────────────────
+export const BROWSER_TOOLS: ToolDef[] = [
+  { type: "function", function: { name: "browser_navigate", description: "Navigate to a URL in the browser.", parameters: { type: "object", properties: { url: { type: "string", description: "The URL to navigate to" } }, required: ["url"], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_click", description: "Click an element on the page.", parameters: { type: "object", properties: { selector: { type: "string", description: "CSS selector for the element to click" }, modifiers: { type: "array", items: { type: "string", enum: ["Alt", "Control", "Meta", "Shift"] } } }, required: ["selector"], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_type", description: "Type text into an input field.", parameters: { type: "object", properties: { selector: { type: "string", description: "CSS selector for the input element" }, text: { type: "string", description: "Text to type" } }, required: ["selector", "text"], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_fill", description: "Fill an input field with text.", parameters: { type: "object", properties: { selector: { type: "string", description: "CSS selector for the input element" }, text: { type: "string", description: "Text to fill" } }, required: ["selector", "text"], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_snapshot", description: "Take a snapshot of the current page state.", parameters: { type: "object", properties: { element: { type: "string", description: "Optional: element to snapshot" } }, required: [], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_evaluate", description: "Execute JavaScript in the browser context.", parameters: { type: "object", properties: { expression: { type: "string", description: "JavaScript expression to execute" } }, required: ["expression"], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_get_text", description: "Get text content from an element.", parameters: { type: "object", properties: { selector: { type: "string", description: "CSS selector for the element" } }, required: ["selector"], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_wait_for", description: "Wait for an element or text to be visible.", parameters: { type: "object", properties: { text: { type: "string", description: "Text to wait for" }, selector: { type: "string", description: "Optional: element to wait for" }, time: { type: "number", description: "Optional: max wait time in seconds (default 10)" } }, required: ["text"], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_select_option", description: "Select an option from a dropdown.", parameters: { type: "object", properties: { selector: { type: "string", description: "CSS selector for the select element" }, value: { type: "string", description: "Value to select" } }, required: ["selector", "value"], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_tabs", description: "List or switch between browser tabs.", parameters: { type: "object", properties: { action: { type: "string", enum: ["list", "switch"], description: "Action: list or switch" }, index: { type: "number", description: "Tab index to switch to" } }, required: ["action"], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_close", description: "Close the browser and clean up.", parameters: { type: "object", properties: {}, required: [], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_take_screenshot", description: "Take a screenshot of the current page.", parameters: { type: "object", properties: { filename: { type: "string", description: "Filename to save screenshot" }, fullPage: { type: "boolean", description: "Capture full scrollable page" } }, required: ["filename"], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_hover", description: "Hover over an element.", parameters: { type: "object", properties: { selector: { type: "string", description: "CSS selector for the element" } }, required: ["selector"], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_press_key", description: "Press a keyboard key.", parameters: { type: "object", properties: { key: { type: "string", description: "Key name (Enter, Escape, ArrowDown, etc.)" } }, required: ["key"], additionalProperties: false } } },
+  { type: "function", function: { name: "browser_network_requests", description: "Get network requests made by the page.", parameters: { type: "object", properties: { filter: { type: "string", description: "Optional: regex to filter URLs" } }, required: [], additionalProperties: false } } },
+];
+
+export const BROWSER_TOOL_ALIASES: Record<string, string> = {
+  navigate: "browser_navigate",
+  click: "browser_click",
+  type: "browser_type",
+  fill: "browser_fill",
+  snapshot: "browser_snapshot",
+  evaluate: "browser_evaluate",
+  getText: "browser_get_text",
+  waitFor: "browser_wait_for",
+  select: "browser_select_option",
+  tabs: "browser_tabs",
+  close: "browser_close",
+  screenshot: "browser_take_screenshot",
+  hover: "browser_hover",
+  press: "browser_press_key",
+  network: "browser_network_requests",
+};
 
 export const TOOL_ALIASES: Record<string, string> = {
+  // Standard aliases
   ls: "glob_files",
   find: "glob_files",
   cat: "read_file",
@@ -369,7 +684,8 @@ export const TOOL_ALIASES: Record<string, string> = {
   exec: "run_command",
   run: "run_command",
   mkdir: "write_file",
-  rm: "run_command",
+  rm: "remove_file",
+  unlink: "remove_file",
   cp: "run_command",
   mv: "run_command",
   npm: "run_command",
@@ -390,7 +706,7 @@ export const TOOL_ALIASES: Record<string, string> = {
   edit: "write_file",
   create: "write_file",
   update: "write_file",
-  delete: "run_command",
+  delete: "remove_file",
   search: "grep_files",
   grep: "grep_files",
   rg: "grep_files",
@@ -404,6 +720,25 @@ export const TOOL_ALIASES: Record<string, string> = {
   websearch: "web_search",
   lookup: "web_search",
   google: "web_search",
+  // GLM-4.7 specific variants
+  invoke: "read_file",
+  execute: "read_file",
+  function: "read_file",
+  argument: "read_file",
+  "read-context-packet": "read_context_packet",
+  "save-artifact": "save_artifact",
+  "read-artifact": "read_artifact",
+  finish: "finish",
+  done: "finish",
+  complete: "finish",
+  function_call: "git_diff",
+  "call-tool": "git_diff",
+  "call": "run_command",
+  "function-calls": "git_diff",
+  tool: "git_diff",
+  arguments: "git_diff",
+  tool_name: "git_status",
+  "xsi:type": "git_diff",
 };
 
 // ─── Tool execution ─────────────────────────────────────────────────────────
@@ -417,6 +752,8 @@ export async function executeToolCall(
 
   try {
     switch (name) {
+      case "explore_mode":
+        return await execExploreMode(call.id, args, ctx);
       case "glob_files":
         return await execGlobFiles(call.id, args, ctx);
       case "grep_files":
@@ -431,6 +768,8 @@ export async function executeToolCall(
         return await execWriteFile(call.id, args, ctx);
       case "write_files":
         return await execWriteFiles(call.id, args, ctx);
+      case "remove_file":
+        return await execRemoveFile(call.id, args, ctx);
       case "git_diff":
         return await execGitDiff(call.id, ctx);
       case "git_diff_staged":
@@ -454,6 +793,37 @@ export async function executeToolCall(
       case "finish":
         // finish is handled by the loop, not here
         return { callId: call.id, name, output: JSON.stringify(args), isError: false };
+      // Browser tools
+      case "browser_navigate":
+        return await execBrowserNavigate(call.id, args, ctx);
+      case "browser_click":
+        return await execBrowserClick(call.id, args, ctx);
+      case "browser_type":
+        return await execBrowserType(call.id, args, ctx);
+      case "browser_fill":
+        return await execBrowserFill(call.id, args, ctx);
+      case "browser_snapshot":
+        return await execBrowserSnapshot(call.id, args, ctx);
+      case "browser_evaluate":
+        return await execBrowserEvaluate(call.id, args, ctx);
+      case "browser_get_text":
+        return await execBrowserGetText(call.id, args, ctx);
+      case "browser_wait_for":
+        return await execBrowserWaitFor(call.id, args, ctx);
+      case "browser_select_option":
+        return await execBrowserSelectOption(call.id, args, ctx);
+      case "browser_tabs":
+        return await execBrowserTabs(call.id, args, ctx);
+      case "browser_close":
+        return await execBrowserClose(call.id, ctx);
+      case "browser_take_screenshot":
+        return await execBrowserTakeScreenshot(call.id, args, ctx);
+      case "browser_hover":
+        return await execBrowserHover(call.id, args, ctx);
+      case "browser_press_key":
+        return await execBrowserPressKey(call.id, args, ctx);
+      case "browser_network_requests":
+        return await execBrowserNetworkRequests(call.id, args, ctx);
       default:
         throw new ToolExecutionError(
           `Unknown tool: ${name}`,
@@ -473,6 +843,61 @@ export async function executeToolCall(
 }
 
 // ─── Individual tool implementations ────────────────────────────────────────
+
+async function execExploreMode(
+  callId: string,
+  args: Record<string, unknown>,
+  ctx: ToolExecutionContext
+): Promise<ToolResult> {
+  let calls = (args.calls as Array<{ tool: string; args: Record<string, unknown> }> ?? []);
+
+  // Robustness for nested models
+  if (!Array.isArray(calls) && typeof args.calls === 'object' && args.calls !== null) {
+    const maybeCalls = (args.calls as any).calls;
+    if (Array.isArray(maybeCalls)) {
+      calls = maybeCalls;
+    }
+  }
+
+  // Case 2: args itself is { args: { calls: [...] } } or { parameters: { calls: [...] } }
+  if (calls.length === 0) {
+    const nested = (args.args || args.parameters || args.arguments) as any;
+    if (nested && typeof nested === 'object') {
+      const maybeCalls = nested.calls;
+      if (Array.isArray(maybeCalls)) {
+        calls = maybeCalls;
+      }
+    }
+  }
+
+  if (!Array.isArray(calls) || calls.length === 0) {
+    return { callId, name: "explore_mode", output: "Error: calls array is required", isError: true };
+  }
+
+  const allowedTools = new Set(["glob_files", "grep_files", "list_dir", "read_file", "read_files", "semantic_search", "git_status", "list_changed_files"]);
+  const results: string[] = [];
+
+  for (const [index, call] of calls.entries()) {
+    const toolName = String(call.tool);
+    if (!allowedTools.has(toolName)) {
+      results.push(`--- [${index}] ${toolName} ---\nError: Tool not allowed in explore_mode (read-only only).`);
+      continue;
+    }
+
+    try {
+      const result = await executeToolCall({ id: `${callId}_${index}`, name: toolName, args: call.args }, ctx);
+      results.push(`--- [${index}] ${toolName}(${JSON.stringify(call.args)}) ---\n${result.output}`);
+    } catch (err) {
+      results.push(`--- [${index}] ${toolName} ---\nError: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  return {
+    callId,
+    name: "explore_mode",
+    output: results.join("\n\n")
+  };
+}
 
 async function execGlobFiles(
   callId: string,
@@ -635,8 +1060,26 @@ async function execListDir(
   args: Record<string, unknown>,
   ctx: ToolExecutionContext
 ): Promise<ToolResult> {
-  const dirPath = args.path ? String(args.path) : ".";
-  const fullPath = path.join(ctx.cwd, dirPath);
+  let dirPath = args.path ? String(args.path) : ".";
+  
+  // Strip surrounding or trailing quotes/noise if model included them
+  dirPath = dirPath.replace(/^["']|["']$/g, "").trim();
+  if (dirPath.endsWith('"') || dirPath.endsWith("'")) dirPath = dirPath.slice(0, -1);
+  
+  if (dirPath === "" || dirPath === "/" || dirPath === "./") dirPath = ".";
+  
+  let fullPath: string;
+  if (dirPath === ".") {
+    fullPath = path.resolve(ctx.cwd);
+  } else {
+    fullPath = path.resolve(ctx.cwd, dirPath);
+  }
+  
+  // Safety: ensure within workspace
+  const resolvedCwd = path.resolve(ctx.cwd);
+  if (!fullPath.startsWith(resolvedCwd) && fullPath !== resolvedCwd) {
+     return { callId, name: "list_dir", output: "Error: path is outside workspace", isError: true };
+  }
 
   try {
     const entries = await readdir(fullPath, { withFileTypes: true });
@@ -698,7 +1141,18 @@ async function execReadFiles(
   args: Record<string, unknown>,
   ctx: ToolExecutionContext
 ): Promise<ToolResult> {
-  const filePaths = (args.paths as string[] ?? []).map(String);
+  let filePaths = (args.paths as string[] ?? []);
+  
+  // Robustness for nested models
+  if (!Array.isArray(filePaths) && typeof args.paths === 'object' && args.paths !== null) {
+    const maybePaths = (args.paths as any).paths;
+    if (Array.isArray(maybePaths)) {
+      filePaths = maybePaths;
+    }
+  }
+
+  filePaths = filePaths.map(String);
+
   if (filePaths.length === 0) {
     return { callId, name: "read_files", output: "Error: paths array is required", isError: true };
   }
@@ -758,7 +1212,28 @@ async function execWriteFiles(
   args: Record<string, unknown>,
   ctx: ToolExecutionContext
 ): Promise<ToolResult> {
-  const files = (args.files as Array<{ path: string; content: string }> ?? []);
+  let files = (args.files as Array<{ path: string; content: string }> ?? []);
+
+  // Robustness for nested models
+  // Case 1: args.files is { files: [...] }
+  if (!Array.isArray(files) && typeof args.files === 'object' && args.files !== null) {
+    const maybeFiles = (args.files as any).files;
+    if (Array.isArray(maybeFiles)) {
+      files = maybeFiles;
+    }
+  }
+  
+  // Case 2: args itself is { args: { files: [...] } } or { parameters: { files: [...] } }
+  if (files.length === 0) {
+    const nested = (args.args || args.parameters || args.arguments) as any;
+    if (nested && typeof nested === 'object') {
+      const maybeFiles = nested.files;
+      if (Array.isArray(maybeFiles)) {
+        files = maybeFiles;
+      }
+    }
+  }
+
   if (files.length === 0) {
     return { callId, name: "write_files", output: "Error: files array is required", isError: true };
   }
@@ -783,6 +1258,58 @@ async function execWriteFiles(
     name: "write_files",
     output: `Wrote ${files.length} files: ${summary}`
   };
+}
+
+async function execRemoveFile(
+  callId: string,
+  args: Record<string, unknown>,
+  ctx: ToolExecutionContext
+): Promise<ToolResult> {
+  const filePath = String(args.path ?? "");
+  if (!filePath) {
+    return { callId, name: "remove_file", output: "Error: path is required", isError: true };
+  }
+
+  const normalized = filePath.replace(/\\/g, "/");
+  if (normalized.startsWith(".git/") || normalized.includes("/.git/") ||
+      normalized.startsWith("node_modules/") || normalized.includes("/node_modules/")) {
+    return {
+      callId,
+      name: "remove_file",
+      output: "Error: deletes in .git/ and node_modules/ are forbidden",
+      isError: true
+    };
+  }
+
+  const cwdResolved = path.resolve(ctx.cwd);
+  const targetPath = path.resolve(ctx.cwd, filePath);
+  if (targetPath !== cwdResolved && !targetPath.startsWith(`${cwdResolved}${path.sep}`)) {
+    return { callId, name: "remove_file", output: "Error: path is outside workspace", isError: true };
+  }
+
+  try {
+    const st = await stat(targetPath);
+    if (st.isDirectory()) {
+      return {
+        callId,
+        name: "remove_file",
+        output: `Error: ${filePath} is a directory (use a command tool if recursive deletion is truly intended)`,
+        isError: true
+      };
+    }
+    await unlink(targetPath);
+    return { callId, name: "remove_file", output: `Removed ${filePath}` };
+  } catch (err: any) {
+    if (err?.code === "ENOENT") {
+      return { callId, name: "remove_file", output: `Error: file not found: ${filePath}`, isError: true };
+    }
+    return {
+      callId,
+      name: "remove_file",
+      output: `Error: ${err instanceof Error ? err.message : String(err)}`,
+      isError: true
+    };
+  }
 }
 
 async function execGitDiff(
@@ -856,7 +1383,7 @@ async function execRunCommand(
   args: Record<string, unknown>,
   ctx: ToolExecutionContext
 ): Promise<ToolResult> {
-  const name = String(args.name ?? "");
+  const name = String(args.name ?? args.command ?? "");
   if (!name) {
     return { callId, name: "run_command", output: "Error: name is required", isError: true };
   }
@@ -1073,6 +1600,44 @@ async function execSemanticSearch(
       isError: true
     };
   }
+}
+
+// ─── Tool contract generation ──────────────────────────────────────────────
+
+export function getCompactToolContract(toolNames: string[]): string {
+  const allTools = [...WORKSPACE_TOOLS, ...BROWSER_TOOLS];
+  const selected = allTools.filter((t) => toolNames.includes(t.function.name));
+
+  if (selected.length === 0) return "";
+
+  const lines = ["Available tools this run:"];
+  for (const t of selected) {
+    const f = t.function;
+    const args: Record<string, string> = {};
+    for (const [name, prop] of Object.entries(f.parameters.properties)) {
+      args[name] = (prop as any).type || "any";
+    }
+    const desc = f.description ? ` - ${f.description.split('.')[0]}.` : "";
+    lines.push(`- ${f.name}${JSON.stringify(args)}${desc}`);
+  }
+  return lines.join("\n");
+}
+
+export function getAvailableToolsList(role: string): string[] {
+  const common = ["explore_mode", "read_file", "read_files", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
+  if (role === "builder") {
+    return [...common, "write_file", "write_files", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files"];
+  }
+  if (role === "reviewer") {
+    return ["read_file", "list_dir", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files", "finish"];
+  }
+  if (role === "epic-decoder" || role === "epicDecoder") {
+    return ["read_file", "glob_files", "grep_files", "list_dir", "semantic_search", "web_search", "finish"];
+  }
+  if (role === "epic-reviewer" || role === "epicReviewer") {
+    return ["read_file", "list_dir", "write_file", "write_files", "remove_file", "run_command", "git_diff", "git_diff_staged", "git_status", "list_changed_files", "finish"];
+  }
+  return common;
 }
 
 // ─── Simple glob matching fallback ──────────────────────────────────────────
