@@ -9,6 +9,7 @@
     "api": "nodemon --exec \"node --experimental-strip-types src/apps/api.ts\"",
     "worker": "nodemon --exec \"node --experimental-strip-types src/apps/worker.ts\"",
     "seed": "node --experimental-strip-types src/apps/seed.ts",
+    "project-structure:seed": "node --experimental-strip-types src/apps/write-project-structure.ts",
     "demo": "node --experimental-strip-types src/apps/demo.ts",
     "cleanup:workspaces": "node --experimental-strip-types src/apps/cleanup-workspaces.ts",
     "harness:gemma": "node --experimental-strip-types src/apps/gemma-harness-smoke.ts",

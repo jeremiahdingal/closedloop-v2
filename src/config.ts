@@ -100,7 +100,7 @@ export function loadConfig(): AppConfig {
     reviewGuardEnabled: process.env.REVIEW_GUARD_ENABLED !== "0",
     reviewFastTimeoutMs: Number(process.env.REVIEW_FAST_TIMEOUT_MS || process.env.REVIEWER_TIMEOUT_MS || 180_000),
     reviewDeepTimeoutMs: Number(process.env.REVIEW_DEEP_TIMEOUT_MS || process.env.REVIEWER_TIMEOUT_MS || 420_000),
-    reviewContractPath: process.env.REVIEW_CONTRACT_PATH || "PROJECT_STRUCTURE.md",
+    reviewContractPath: process.env.REVIEW_CONTRACT_PATH || ".closedloop/PROJECT_STRUCTURE.md",
     toolRagEnabled: process.env.TOOL_RAG_ENABLED !== "0",
     toolRagMaxChunks: Number(process.env.TOOL_RAG_MAX_CHUNKS || 10),
     toolRagMaxTokens: Number(process.env.TOOL_RAG_MAX_TOKENS || 1000),

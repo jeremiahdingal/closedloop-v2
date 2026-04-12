@@ -62,7 +62,11 @@ export function builderPrompt(ticket: TicketRecord, packet: TicketContextPacket)
     `Allowed paths: ${ticket.allowedPaths.join(", ") || "(none)"}`,
     `Review blockers: ${packet.reviewBlockers.join("; ") || "(none)"}`,
     `Prior test failures: ${packet.priorTestFailures.join("; ") || "(none)"}`,
-    "Read PROJECT_STRUCTURE.md first.",
+    "Before making changes, read `.closedloop/PROJECT_STRUCTURE.md` from disk if it exists, then use the injected Project Structure snapshot.",
+    "Follow the styling rules, component conventions, and UI elements described there.",
+    "Preserve the existing design system and styling approach; extend it instead of inventing a new one.",
+    "For Tamagui / React Native / mobile code, use Tamagui or existing native primitives and styling patterns. Do NOT introduce raw HTML tags like `div`, `span`, `button`, or `input` in mobile-facing code.",
+    "Do not overwrite `.closedloop/PROJECT_STRUCTURE.md`.",
     ...(packet.retrievedContext?.projectStructure
       ? [`## Project Structure\n${packet.retrievedContext.projectStructure}`]
       : []),
@@ -81,7 +85,11 @@ export function builderToolingPrompt(ticket: TicketRecord, packet: TicketContext
     "Work inside the current repository using the tools that are actually available in this session.",
     toolContract,
     "Start by using the 'explore_mode' tool to rapidly gather context from the repository structure and key files.",
-    "Read PROJECT_STRUCTURE.md first.",
+    "Before editing, read `.closedloop/PROJECT_STRUCTURE.md` from disk if it exists, then use the injected Project Structure snapshot.",
+    "Treat `.closedloop/PROJECT_STRUCTURE.md` as the source of truth for styling, UI elements, and compatibility constraints.",
+    "Preserve the existing design system and styling approach; extend it instead of inventing a new one.",
+    "For Tamagui / React Native / mobile code, use Tamagui or existing native primitives and styling patterns. Do NOT introduce raw HTML tags like `div`, `span`, `button`, or `input` in mobile-facing code.",
+    "Do not overwrite `.closedloop/PROJECT_STRUCTURE.md`.",
     ...(packet.retrievedContext?.projectStructure
       ? [`## Project Structure\n${packet.retrievedContext.projectStructure}`]
       : []),
@@ -124,6 +132,7 @@ export function reviewerPrompt(ticket: TicketRecord, diff: string): string {
     "You are the Local Reviewer.",
     "A deterministic guard has already checked destructive changes, allowed paths, and project-structure invariants.",
     "Focus on semantic correctness, obvious regressions, and whether the diff satisfies the ticket.",
+    "Use `.closedloop/PROJECT_STRUCTURE.md` as the source of truth for styling, UI elements, and compatibility constraints when present.",
     "IMPORTANT: The diff below shows changes in an isolated ticket workspace (a copy of the repo), NOT the original repo.",
     "Files being created/modified ARE in the correct location if they appear in the diff.",
     "Do NOT reject changes because files 'don't exist in project root' - they are being created in this workspace.",
@@ -131,6 +140,8 @@ export function reviewerPrompt(ticket: TicketRecord, diff: string): string {
     "Do NOT invent blockers about files 'not being in the diff' when the diff clearly shows file creation.",
     "BLOCKERS vs SUGGESTIONS:",
     "- Blockers are ONLY: syntax errors, wrong file names (e.g. wrong.js instead of right.js), wrong file paths, security issues, or changes that actively break the codebase.",
+    "- In Tamagui / React Native / mobile-facing code, using raw HTML tags (`div`, `span`, `button`, `input`, etc.) is a BLOCKER unless the file is clearly web-only.",
+    "- Changes that ignore the established styling system or replace existing design primitives with incompatible ones are BLOCKERS.",
     "- Missing type annotations, missing module exports, missing comments, style preferences, or 'best practices' for simple scripts are SUGGESTIONS, NOT blockers.",
     "- For simple files (hello world, scripts, standalone files), do NOT block on missing exports or type annotations. These are optional improvements.",
     "- If the diff shows a file with the expected name being created, that is sufficient evidence the file exists. APPROVE.",
@@ -154,6 +165,8 @@ export function reviewerToolingPrompt(ticket: TicketRecord): string {
     "You are the Local Reviewer.",
     "Structural rules have already been checked by a deterministic guard.",
     "Review the current workspace diff using the available review tools.",
+    "Use `.closedloop/PROJECT_STRUCTURE.md` as the source of truth for styling, UI elements, and compatibility constraints when present.",
+    "Reject diffs that introduce raw HTML tags into Tamagui / React Native / mobile-facing code unless the file is clearly web-only.",
     "Do not ask for clarification. Inspect the diff, decide, and finish.",
     "Return JSON via the finish tool with shape:",
     JSON.stringify({
@@ -235,6 +248,7 @@ export function epicReviewerToolingPrompt(
     "MODEL TARGET: Assume downstream ticket execution is done by ~14B parameter models. Any remediation guidance must be atomic, explicit, and file-scoped.",
     "CRITICAL: All tickets in this epic have been reviewed and approved. Proceed confidently to check integration.",
     "Your role is to check for destructive changes and cross-ticket integration issues.",
+    "If you need the on-disk structure file, use `.closedloop/PROJECT_STRUCTURE.md`.",
   ];
 
   if (ragContext?.docContext) sections.push(ragContext.docContext);
@@ -311,6 +325,7 @@ export function epicDecoderToolingPrompt(
     "You are the Epic Decoder agent. Explore the repository using the OpenCode tools that are actually available in-session.",
     toolContract,
     "Do not try to call bash, ls, find, run, or any other unavailable shell tool.",
+    "If you need the on-disk structure file, use `.closedloop/PROJECT_STRUCTURE.md`.",
     "Understand the codebase structure, existing patterns, and conventions before decomposing the epic.",
     `Epic: ${epic.title}`,
     `Goal: ${epic.goalText}`,
@@ -388,6 +403,7 @@ export function epicReviewerCodexPrompt(
     "MODEL TARGET: Assume downstream ticket execution is done by ~14B parameter models. Keep any fixes/followups trivially implementable in one pass.",
     "CRITICAL: All tickets in this epic have been reviewed and approved. Proceed confidently.",
     "Your role is to check for cross-ticket integration issues and fix any destructive or risky changes.",
+    "If you need the on-disk structure file, use `.closedloop/PROJECT_STRUCTURE.md`.",
     "IMPORTANT: Be concise. Check git log and diffs for the ticket changes, verify they look safe, then output FINAL_JSON. Do NOT explore the entire repo.",
   ];
 
@@ -482,6 +498,7 @@ export function ticketRedecomposerPrompt(
     "Your job is NOT to fix the code yourself. Instead, analyse why the ticket was too broad or ambiguous for a 20–30B executor model, then re-decompose it into 2–4 simpler, strictly atomic sub-tickets.",
     `Epic: ${epic.title}`,
     `Epic Goal: ${epic.goalText}`,
+    `Current Re-decomposition Depth: ${Number((ticket.metadata as any)?.splitDepth ?? 0)} / 2`,
     [
       "## Failed Ticket",
       `Title: ${ticket.title}`,
@@ -538,6 +555,7 @@ export function epicDecoderPlanModePrompt(
     "You are the Epic Planner agent. Your job is to collaboratively explore the repository and produce a thorough, well-scoped implementation plan.",
     "Use read, glob, grep, and any available tools to understand the codebase before committing to a plan.",
     "Do not try to call bash, ls, find, run, or any other unavailable shell tool.",
+    "If you need the on-disk structure file, use `.closedloop/PROJECT_STRUCTURE.md`.",
     `Epic Title: ${epicTitle}`,
     `Epic Description: ${epicDescription}`,
   ];
@@ -631,6 +649,8 @@ export function playWriterPrompt(
     "## Existing Test Files in tests/ Directory",
     "(Look at these for style, structure, and import patterns to follow.)",
     existingTestsBlock,
+    "",
+    "If you need the on-disk structure file, use `.closedloop/PROJECT_STRUCTURE.md`.",
   ];
 
   if (ragContext?.codeContext) sections.push("\n## Relevant Code Context\n" + ragContext.codeContext);
