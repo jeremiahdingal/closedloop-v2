@@ -787,6 +787,10 @@ export class TicketRunner {
 
     const graphBuilder = new StateGraph(TicketState)
       .addNode("prepare_context", prepareContext)
+      .addNode("explorer", explorerNode)
+      .addNode("build_packet", buildPacketNode)
+      .addNode("coder", coderNode)
+      .addNode("verify", verifyNode)
       .addNode("builder", builderNode)
       .addNode("reviewer", reviewerNode)
       .addNode("tester", testerNode)
@@ -795,8 +799,14 @@ export class TicketRunner {
       .addNode("finalize_escalated", finalizeEscalated)
       .addNode("finalize_failed", finalizeFailed)
       .addEdge(START, "prepare_context")
-      .addEdge("prepare_context", "builder")
-      .addConditionalEdges("builder", (state: TicketGraphState) => state.noDiff ? "classify" : "reviewer", ["classify", "reviewer"])
+      .addEdge("prepare_context", "explorer")
+      .addEdge("explorer", "build_packet")
+      .addEdge("build_packet", "coder")
+      .addEdge("coder", "verify")
+      .addConditionalEdges("verify",
+        (state: TicketGraphState) => state.noDiff ? "classify" : "reviewer",
+        ["classify", "reviewer"]
+      )
       .addConditionalEdges("reviewer", (state: TicketGraphState) => state.reviewApproved ? "tester" : "classify", ["tester", "classify"])
       .addConditionalEdges("tester", (state: TicketGraphState) => state.testPassed ? "finalize_success" : "classify", ["finalize_success", "classify"])
       .addConditionalEdges(
