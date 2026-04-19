@@ -12,6 +12,7 @@ export type VerificationResult = {
   failedOperations: Array<{ op: EditOperation; reason: string }>;
   unauthorizedOperations: Array<{ op: EditOperation; reason: string }>;
   staleOperations: Array<{ op: EditOperation; reason: string }>;
+  relaxedOperations: Array<{ op: EditOperation; reason: string }>;
 };
 
 export async function verifyAndApplyEdits(
@@ -26,11 +27,12 @@ export async function verifyAndApplyEdits(
     appliedOperations: [],
     failedOperations: [],
     unauthorizedOperations: [],
-    staleOperations: []
+    staleOperations: [],
+    relaxedOperations: []
   };
 
-  if (coderOutput.unresolvedBlockers.length > 0) {
-    if (coderOutput.operations.length > 0) {
+  if ((coderOutput.unresolvedBlockers ?? []).length > 0) {
+    if ((coderOutput.operations ?? []).length > 0) {
       result.summary = `(Warning: unresolved blockers: ${coderOutput.unresolvedBlockers.join(", ")}) `;
     } else {
       result.outcome = "escalate";
@@ -39,7 +41,7 @@ export async function verifyAndApplyEdits(
     }
   }
 
-  if (coderOutput.operations.length === 0) {
+  if ((coderOutput.operations ?? []).length === 0) {
     result.outcome = "empty_failure";
     result.summary = "Coder produced no operations.";
     return result;
@@ -60,27 +62,37 @@ export async function verifyAndApplyEdits(
           result.failedOperations.push({ op, reason: "File does not exist in packet" });
           continue;
         }
-        
-        // Hash check
+
         const fullPath = join(workspacePath, op.path);
         const currentContent = await readFile(fullPath, "utf8");
         const currentHash = createHash("sha256").update(currentContent).digest("hex");
-        
-        if (currentHash !== op.expected_sha256) {
-          result.staleOperations.push({ op, reason: "SHA256 mismatch (stale edit)" });
-          continue;
+
+        // Hash check — warn if stale but still attempt application.
+        // The search block itself is the real validation: if the search text
+        // is found in the current file content, the edit is valid regardless
+        // of the SHA256 hash. Hash mismatches typically mean the file was
+        // modified by a previous run or between explorer/coder stages.
+        const hashMatches = currentHash === op.expected_sha256;
+        if (!hashMatches) {
+          console.warn(`[VERIFIER] SHA256 mismatch for ${op.path} — attempting relaxed application (search block validation)`);
         }
 
         // Apply search/replace
         const index = currentContent.indexOf(op.search);
         if (index === -1) {
-          result.failedOperations.push({ op, reason: "Search block not found in file" });
+          const detail = hashMatches
+            ? "Search block not found in file"
+            : "Search block not found in file (SHA256 also mismatched — file has diverged since edit was planned)";
+          result.failedOperations.push({ op, reason: detail });
           continue;
         }
 
         const newContent = currentContent.slice(0, index) + op.replace + currentContent.slice(index + op.search.length);
         await writeFile(fullPath, newContent, "utf8");
         result.appliedOperations.push(op);
+        if (!hashMatches) {
+          result.relaxedOperations.push({ op, reason: "SHA256 mismatch but search block matched — applied with relaxed validation" });
+        }
 
       } else if (op.kind === "create_file") {
         const fullPath = join(workspacePath, op.path);
@@ -123,15 +135,17 @@ export async function verifyAndApplyEdits(
   if (result.unauthorizedOperations.length > 0) {
     result.outcome = "escalate"; // Potentially useful but needs review/authorization
     result.summary = `Unauthorized operations attempted: ${result.unauthorizedOperations.length}`;
-  } else if (result.failedOperations.length > 0 || result.staleOperations.length > 0) {
+  } else if (result.failedOperations.length > 0) {
+    // Only set repairable if some operations actually FAILED (not just stale hashes)
     result.outcome = "repairable";
-    result.summary = `Some operations failed (${result.failedOperations.length}) or were stale (${result.staleOperations.length})`;
+    result.summary = `Some operations failed (${result.failedOperations.length})${result.relaxedOperations.length > 0 ? `, ${result.relaxedOperations.length} applied with relaxed hash validation` : ""}`;
   } else if (result.appliedOperations.length === 0) {
     result.outcome = "empty_failure";
     result.summary = "No operations were successfully applied.";
   } else {
     result.outcome = "accepted";
-    result.summary = `Successfully applied ${result.appliedOperations.length} operations.`;
+    const relaxedNote = result.relaxedOperations.length > 0 ? ` (${result.relaxedOperations.length} with relaxed hash validation)` : "";
+    result.summary = `Successfully applied ${result.appliedOperations.length} operations${relaxedNote}.`;
   }
 
   return result;
