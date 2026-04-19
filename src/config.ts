@@ -14,12 +14,14 @@ export type AppConfig = {
   workerPollMs: number;
   workerConcurrency: number;
   staleRunAfterMs: number;
+  staleCoderRunAfterMs: number;
   staleRunMaxRecoveries: number;
   leaseTtlMs: number;
   workspaceRetentionHours: number;
   localOnly: boolean;
   dryRun: boolean;
   useLangGraph: boolean;
+  useExplorerCoderPipeline: boolean;
   commandCatalog: CommandCatalog;
   models: Record<AgentRole, string>;
   playwrightDevServerCommand: string;
@@ -74,13 +76,15 @@ export function loadConfig(): AppConfig {
     apiPort: Number(process.env.API_PORT || 4010),
     workerPollMs: Number(process.env.WORKER_POLL_MS || 1000),
     workerConcurrency: Number(process.env.WORKER_CONCURRENCY || 1),
-    staleRunAfterMs: Number(process.env.STALE_RUN_AFTER_MS || 180_000),
+    staleRunAfterMs: Number(process.env.STALE_RUN_AFTER_MS || 300_000),
+    staleCoderRunAfterMs: Number(process.env.STALE_CODER_RUN_AFTER_MS || 900_000),
     staleRunMaxRecoveries: Number(process.env.STALE_RUN_MAX_RECOVERIES || 3),
     leaseTtlMs: Number(process.env.LEASE_TTL_MS || 60_000),
     workspaceRetentionHours: Number(process.env.WORKSPACE_RETENTION_HOURS || 48),
     localOnly: process.env.LOCAL_ONLY === "1",
     dryRun: process.env.DRY_RUN === "1",
     useLangGraph: process.env.USE_LANGGRAPH !== "0",
+    useExplorerCoderPipeline: true,
     commandCatalog: {
       status: process.env.STATUS_COMMAND || "git status --short",
       test: process.env.TEST_COMMAND || "npm test -- --runInBand",

@@ -1,9 +1,11 @@
 {
-  "epicDecoder": "qwen-cli",
-  "builder": "mediated:gemma4:e4b",
-  "reviewer": "qwen3.5:9b",
+  "epicDecoder": "codex-cli",
+  "builder": "mediated:gemma4:26b-a4b-it-q4_K_M",
+  "reviewer": "mediated:qwen3.5:9b",
   "tester": "skip",
-  "epicReviewer": "qwen-cli",
+  "explorer": "mediated:qwen3.5:9b",
+  "coder": "qwen3-coder:30b",
+  "epicReviewer": "zai:claude-sonnet-4-20250514",
   "playWriter": "qwen-cli",
   "playTester": "mediated:qwen3.5:9b",
   "doctor": "qwen3:8b"

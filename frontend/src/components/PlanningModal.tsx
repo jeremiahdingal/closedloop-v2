@@ -17,7 +17,9 @@ export function PlanningModal(props: {
   initialBranch?: string;
   open: boolean;
   onClose: () => void;
+  onMinimize: () => void;
   onApproved: (epicId: string) => void;
+  onReady?: () => void;
 }) {
   const [streamItems, setStreamItems] = useState<
     Array<{ id: number; agentRole: string; streamKind: string; content: string; source: string }>
@@ -29,11 +31,13 @@ export function PlanningModal(props: {
   const [sending, setSending] = useState(false);
   const [approving, setApproving] = useState(false);
   const [showRawOutput, setShowRawOutput] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
   const terminalRef = useRef<HTMLPreElement>(null);
   const mainAreaRef = useRef<HTMLDivElement>(null);
   const streamEndRef = useRef<HTMLDivElement>(null);
   const afterIndexRef = useRef(0);
   const esRef = useRef<EventSource | null>(null);
+  const hasAutoFocusedPlanRef = useRef(false);
 
   const reasoningText = useMemo(() => {
     return streamItems
@@ -49,15 +53,33 @@ export function PlanningModal(props: {
       .join("");
   }, [streamItems]);
 
+  // Smarter auto-scroll for Phase 1
   useEffect(() => {
-    if (!latestPlan && terminalRef.current) {
+    if (!latestPlan && autoScroll && terminalRef.current) {
       terminalRef.current.scrollTop = terminalRef.current.scrollHeight;
     }
-  }, [reasoningText, latestPlan]);
+  }, [reasoningText, latestPlan, autoScroll]);
+
+  // Detect manual scroll up to disable auto-scroll
+  function handleTerminalScroll() {
+    const el = terminalRef.current;
+    if (!el) return;
+    const isAtBottom = el.scrollHeight - el.scrollTop <= el.clientHeight + 50;
+    if (!isAtBottom && autoScroll) {
+      setAutoScroll(false);
+    } else if (isAtBottom && !autoScroll) {
+      setAutoScroll(true);
+    }
+  }
 
   useEffect(() => {
-    if (latestPlan && mainAreaRef.current) {
+    if (!latestPlan) {
+      hasAutoFocusedPlanRef.current = false;
+      return;
+    }
+    if (!hasAutoFocusedPlanRef.current && mainAreaRef.current) {
       mainAreaRef.current.scrollTop = 0;
+      hasAutoFocusedPlanRef.current = true;
     }
   }, [latestPlan]);
 
@@ -89,6 +111,7 @@ export function PlanningModal(props: {
         setLatestPlan(null);
         setStreamItems([]);
         setShowRawOutput(false);
+        hasAutoFocusedPlanRef.current = false;
         return;
       }
       setStreamItems((prev) => [...prev, data]);
@@ -99,6 +122,7 @@ export function PlanningModal(props: {
     });
     es.addEventListener("plan_ready", (e) => {
       setLatestPlan(JSON.parse(e.data));
+      props.onReady?.();
     });
     return () => {
       es.close();
@@ -168,8 +192,11 @@ export function PlanningModal(props: {
             </div>
           </div>
           <div className="win-titlebar-buttons">
-            <button className="win-btn-box" onClick={props.onClose}>
-              ×
+            <button className="win-btn-box" onClick={props.onMinimize} title="Minimize">
+              &minus;
+            </button>
+            <button className="win-btn-box" onClick={props.onClose} title="Cancel session">
+              &times;
             </button>
           </div>
         </div>
@@ -224,10 +251,17 @@ export function PlanningModal(props: {
                   <span className="plan-terminal-title">◉ Planner output</span>
                   <span className="plan-terminal-chars">{reasoningText.length} chars</span>
                 </div>
-                <pre className="plan-terminal-output" ref={terminalRef}>
+                <pre 
+                  className="plan-terminal-output" 
+                  ref={terminalRef}
+                  onScroll={handleTerminalScroll}
+                >
                   {reasoningText || "Planner is exploring the repository…"}
                   {sessionStatus === "running" && <span className="plan-terminal-cursor"> ▌</span>}
                 </pre>
+                <div className={`plan-autoscroll-status ${autoScroll ? 'on' : 'off'}`}>
+                  {autoScroll ? "● Auto-scroll ON" : "○ Auto-scroll OFF (Scroll to bottom to resume)"}
+                </div>
               </div>
             ) : (
               /* Phase 2: structured plan + optional raw toggle */
@@ -245,36 +279,37 @@ export function PlanningModal(props: {
                   </div>
                 ) : (
                   <div className="modal-stream-list">
-                    {streamItems.length ? (
-                      streamItems.map((item) => (
-                        <div
-                          className={`modal-stream-item plan-stream-item plan-stream-${
-                            item.streamKind || "raw"
-                          }`}
-                          key={item.id}
-                        >
-                          <div className="modal-stream-meta">
-                            <span className={`pill pill-${item.streamKind || "raw"}`}>
-                              {item.streamKind || "raw"}
-                            </span>
-                            <span className="modal-stream-time">{item.source}</span>
-                          </div>
-                          {item.streamKind === "assistant" || item.streamKind === "thinking" ? (
-                            <div className="plan-md-content">
-                              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                                {item.content
-                                  .replace(/<FINAL_JSON>[\s\S]*?<\/FINAL_JSON>/g, "")
-                                  .trim()}
-                              </ReactMarkdown>
-                            </div>
-                          ) : (
-                            <pre className="plan-plain-text">{item.content}</pre>
-                          )}
+                    <div className="epic-main-section">
+                      <div className="epic-main-section-label">Plan Summary</div>
+                      <div className="plan-md-content">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                          {latestPlan.summary}
+                        </ReactMarkdown>
+                      </div>
+                    </div>
+                    {latestPlan.tickets.map((ticket, index) => (
+                      <div className="epic-main-section" key={ticket.id}>
+                        <div className="epic-main-section-label">
+                          Ticket {index + 1} · {ticket.title}
                         </div>
-                      ))
-                    ) : (
-                      <p className="modal-empty">No analysis items.</p>
-                    )}
+                        <div className="plan-md-content">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                            {[
+                              `**ID:** ${ticket.id}`,
+                              `**Priority:** ${ticket.priority}`,
+                              "",
+                              ticket.description,
+                              "",
+                              "**Acceptance Criteria**",
+                              ...ticket.acceptanceCriteria.map((criterion) => `- ${criterion}`),
+                              "",
+                              `**Allowed Paths:** ${ticket.allowedPaths.join(", ") || "(none)"}`,
+                              `**Dependencies:** ${ticket.dependencies.join(", ") || "(none)"}`
+                            ].join("\n")}
+                          </ReactMarkdown>
+                        </div>
+                      </div>
+                    ))}
                     <div ref={streamEndRef} />
                   </div>
                 )}

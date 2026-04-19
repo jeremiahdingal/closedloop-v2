@@ -16,6 +16,8 @@ export function isRunActiveForRole(role: string, run: Run): boolean {
   const node = (run.currentNode || "").toLowerCase();
   if (role === "system") return true;
   if (role === "builder") return run.kind === "ticket" && (node === "builder" || node.includes("build"));
+  if (role === "explorer") return run.kind === "ticket" && (node === "explorer" || node.includes("explore"));
+  if (role === "coder") return run.kind === "ticket" && (node === "coder" || node.includes("code"));
   if (role === "reviewer") return run.kind === "ticket" && (node === "reviewer" || node.includes("review"));
   if (role === "tester") return run.kind === "ticket" && (node === "tester" || node.includes("test"));
   if (role === "doctor") return run.kind === "ticket" && (node === "doctor" || node.includes("classify") || node === "error");
@@ -134,6 +136,8 @@ export function confirmToast(input: {
 export const AGENT_GLYPHS: Record<string, string> = {
   system: "🖥️",
   builder: "🔨",
+  explorer: "🧭",
+  coder: "💻",
   reviewer: "🔍",
   tester: "🧪",
   epicDecoder: "🧬",
@@ -146,6 +150,12 @@ export const AGENT_GLYPHS: Record<string, string> = {
 };
 
 export const truncateId = (id: string) => id.slice(0, 14) + "…";
+
+export function normalizeDisplayedTicketId(id: string): string {
+  return id
+    .replace(/__ANA-(\d+)$/i, "__T-$1")
+    .replace(/__RSUB(\d+)$/i, "__FIX-$1");
+}
 
 export const formatTime = (dateStr: string | null) => {
   if (!dateStr) return "—";

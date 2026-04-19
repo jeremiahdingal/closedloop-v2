@@ -21,6 +21,11 @@ import { LifecycleService } from "./lifecycle.ts";
 import { buildContextForTicket, buildToolingContext } from "../rag/context-builder.ts";
 import { git } from "../bridge/git.ts";
 import { getAvailableToolsList } from "../mediated-agent-harness/tools.ts";
+import { explorerPrompt, coderPrompt } from "./prompts.ts";
+import { buildCanonicalEditPacket } from "./edit-packet.ts";
+import { verifyAndApplyEdits } from "./verifier.ts";
+import { resetExploreModeFiles } from "../mediated-agent-harness/tools.ts";
+
 import { loadReviewContract, runReviewGuard, type ReviewerMode, type ReviewContractLoadResult } from "./review-guard.ts";
 import { ensureProjectStructureFile } from "./project-structure.ts";
 import { createHash } from "node:crypto";
@@ -54,6 +59,10 @@ type TicketGraphState = {
   failureDecision: FailureDecision["decision"];
   failureReason: string;
   noDiff: boolean;
+  explorerOutput: any;
+  canonicalEditPacket: any;
+  coderOutput: any;
+  verificationResult: any;
   repeatedBlockers: boolean;
   repeatedTestFailure: boolean;
   status: "pending" | "building" | "reviewing" | "testing" | "approved" | "escalated" | "failed";
@@ -153,6 +162,10 @@ export class TicketRunner {
       failureDecision: z.enum(["retry_same_node", "retry_builder", "blocked", "todo", "escalate"]).default("retry_builder"),
       failureReason: z.string().default(""),
       noDiff: z.boolean().default(false),
+      explorerOutput: z.any().default(null),
+      canonicalEditPacket: z.any().default(null),
+      coderOutput: z.any().default(null),
+      verificationResult: z.any().default(null),
       repeatedBlockers: z.boolean().default(false),
       repeatedTestFailure: z.boolean().default(false),
       status: z.enum(["pending", "building", "reviewing", "testing", "approved", "escalated", "failed"]).default("pending")
@@ -194,7 +207,149 @@ export class TicketRunner {
       } satisfies Partial<TicketGraphState>;
     };
 
-    const builderNode = async (state: TicketGraphState) => {
+    const explorerNode = async (state: TicketGraphState) => {
+      this.assertNotCancelled(ticket.id, ticket.epicId);
+      const workspace = this.bridge.requireWorkspace(state.workspaceId);
+      this.db.updateRun({ runId, status: "running", currentNode: "explorer", heartbeatAt: nowIso(), lastMessage: "Exploring workspace..." });
+      this.heartbeat(runId, ticket.id, "explorer", "Exploring workspace...");
+      resetExploreModeFiles();
+
+      // Seed: discover related files via keyword glob
+      const seedFiles: string[] = [];
+      try {
+        const { execSync } = require('child_process');
+        const ticketText = `${ticket.description} ${ticket.title} ${ticket.acceptanceCriteria.join(' ')}`.toLowerCase();
+        const kwMatches = [...ticketText.matchAll(/\b([a-z]{4,}(?:s|items|orders|reports|categories|service|route|model|schema|type|query|hook|util)?)\b/g)].map((m: RegExpMatchArray) => m[1]).filter((k: string) => k.length >= 4);
+        const uniqueKw = [...new Set(kwMatches)].slice(0, 8);
+        for (const kw of uniqueKw) {
+          try {
+            const out = execSync(
+              `powershell -Command "Get-ChildItem -Recurse -Include *.ts,*.tsx -Path '${workspace.worktreePath}' | Where-Object { \$_.FullName.ToLower().Contains('${kw}') } | Select-Object -First 10 -ExpandProperty FullName"`,
+              { encoding: 'utf8', timeout: 10000 }
+            ).trim();
+            if (out) {
+              out.split('\n').filter(Boolean).forEach((f: string) => {
+                const rel = f.replace(workspace.worktreePath, '').replace(/^[\\/]/, '');
+                if (rel && !seedFiles.includes(rel)) seedFiles.push(rel);
+              });
+            }
+          } catch { /* glob failed for this keyword */ }
+        }
+      } catch { /* seeding failed entirely */ }
+      if (seedFiles.length > 0) {
+        this.heartbeat(runId, ticket.id, "explorer", `Seeded ${seedFiles.length} related files: ${seedFiles.slice(0, 5).join(', ')}`);
+      }
+
+      const explorerRaw = await this.gateway.runExplorerInWorkspace!({
+        cwd: workspace.worktreePath,
+        prompt: explorerPrompt(ticket, {} as any, seedFiles),
+        runId, ticketId: ticket.id, epicId: ticket.epicId,
+        onStream: (evt: any) => {
+          evt.runId = runId;
+          evt.ticketId = ticket.id;
+          evt.epicId = ticket.epicId;
+          this.recordAgentStream(evt);
+        }
+      });
+
+      let explorerOutput;
+      try {
+        explorerOutput = JSON.parse(explorerRaw);
+      } catch {
+        this.heartbeat(runId, ticket.id, "system", "Explorer output was not valid JSON. Retrying...");
+        return { status: "building" as const, lastMessage: "Explorer output invalid, retrying..." };
+      }
+      this.heartbeat(runId, ticket.id, "explorer", "Explorer complete.");
+      return {
+        explorerOutput,
+        status: "building" as const,
+        lastMessage: "Explorer finished. Building edit packet...",
+      } satisfies Partial<TicketGraphState>;
+    };
+
+    const buildPacketNode = async (state: TicketGraphState) => {
+      this.assertNotCancelled(ticket.id, ticket.epicId);
+      const workspace = this.bridge.requireWorkspace(state.workspaceId);
+      this.heartbeat(runId, ticket.id, "system", "Building canonical edit packet...");
+
+      const canonicalEditPacket = await buildCanonicalEditPacket(
+        ticket,
+        state.explorerOutput,
+        workspace.worktreePath
+      );
+
+      return {
+        canonicalEditPacket,
+        lastMessage: "Edit packet built. Running coder...",
+      } satisfies Partial<TicketGraphState>;
+    };
+
+    const coderNode = async (state: TicketGraphState) => {
+      this.assertNotCancelled(ticket.id, ticket.epicId);
+      const workspace = this.bridge.requireWorkspace(state.workspaceId);
+      this.db.updateRun({ runId, status: "running", currentNode: "coder", heartbeatAt: nowIso(), lastMessage: "Coder generating edits..." });
+      this.heartbeat(runId, ticket.id, "coder", "Coder generating edits...");
+
+      const coderRaw = await this.gateway.runCoderDirect!({
+        prompt: coderPrompt(ticket, state.explorerOutput, state.canonicalEditPacket),
+        runId, ticketId: ticket.id, epicId: ticket.epicId,
+        onStream: (evt: any) => {
+          evt.runId = runId;
+          evt.ticketId = ticket.id;
+          evt.epicId = ticket.epicId;
+          this.recordAgentStream(evt);
+        }
+      });
+
+      let coderOutput;
+      try {
+        coderOutput = JSON.parse(coderRaw);
+      } catch {
+        this.heartbeat(runId, ticket.id, "system", "Coder output was not valid JSON. Escalating.");
+        return { status: "building" as const, lastMessage: "Coder output invalid." };
+      }
+
+      return {
+        coderOutput,
+        lastMessage: "Coder complete. Verifying...",
+      } satisfies Partial<TicketGraphState>;
+    };
+
+    const verifyNode = async (state: TicketGraphState) => {
+      this.assertNotCancelled(ticket.id, ticket.epicId);
+      const workspace = this.bridge.requireWorkspace(state.workspaceId);
+      this.heartbeat(runId, ticket.id, "coder", "Verifying and applying edits...");
+
+      const verificationResult = await verifyAndApplyEdits(
+        ticket,
+        state.coderOutput,
+        state.canonicalEditPacket,
+        workspace.worktreePath
+      );
+
+      this.heartbeat(runId, ticket.id, "coder", `Verification ${verificationResult.outcome}: ${verificationResult.summary}`);
+
+      if (verificationResult.outcome === "accepted") {
+        await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] ${ticket.title}` });
+        const diffResult = await this.bridge.gitDiff(workspace.id);
+        return {
+          verificationResult,
+          lastDiff: diffResult,
+          noDiff: !diffResult.trim(),
+          lastMessage: verificationResult.summary,
+          status: "reviewing" as const,
+        } satisfies Partial<TicketGraphState>;
+      } else {
+        return {
+          verificationResult,
+          noDiff: true,
+          lastMessage: `Verification ${verificationResult.outcome}: ${verificationResult.summary}`,
+          status: "building" as const,
+        } satisfies Partial<TicketGraphState>;
+      }
+    };
+
+        const builderNode = async (state: TicketGraphState) => {
       this.assertNotCancelled(ticket.id, ticket.epicId);
       const workspace = this.bridge.requireWorkspace(state.workspaceId);
       const buildAttempts = state.buildAttempts + 1;
@@ -541,7 +696,7 @@ export class TicketRunner {
         repeatedTestFailure: state.repeatedTestFailure,
         noDiff: state.noDiff,
         infraFailure: false,
-        currentNode: state.status // status in state matches current role/node
+        // currentNode derived from status // status in state matches current role/node
       });
       console.log(`[TICKET ${ticket.id}] Doctor decision: ${failure.decision} - ${failure.reason}`);
       return {
@@ -1548,7 +1703,7 @@ export class TicketRunner {
                   epicId: ticket.epicId,
                   onStream: (event) => this.recordAgentStream(event)
                 })
-              : this.gateway.getReviewerVerdict(reviewerPrompt(ticket, reviewerContext)),
+              : this.gateway.getReviewerVerdict(reviewerPrompt(ticket, null, null, diff)),
             reviewerTimeoutMs,
             `Reviewer timed out after ${reviewerTimeoutMs}ms`
           )

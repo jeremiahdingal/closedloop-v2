@@ -58,6 +58,7 @@ export class WorkspaceBridge {
         if (baseRef !== "HEAD" && (errMsg.includes("could not resolve") || errMsg.includes("fatal: ambiguous"))) {
           console.warn(`Branch '${baseRef}' not found, attempting to create from origin/${baseRef} or main`);
           try {
+            await git(input.targetDir, ["fetch", "origin", baseRef]).catch(() => {});
             baseCommit = await this.resolveBaseCommit(input.targetDir, `origin/${baseRef}`);
           } catch {
             try {
@@ -72,7 +73,16 @@ export class WorkspaceBridge {
         }
       }
       if (useTargetBranch) {
-        await git(input.targetDir, ["worktree", "add", worktreePath, baseCommit]);
+        if (baseRef !== "HEAD" && baseRef) {
+          try {
+            await git(input.targetDir, ["worktree", "add", "-B", branchName, worktreePath, baseCommit]);
+          } catch (worktreeError) {
+            console.warn(`Could not create branch worktree for ${branchName}: ${worktreeError}. Falling back to detached HEAD.`);
+            await git(input.targetDir, ["worktree", "add", worktreePath, baseCommit]);
+          }
+        } else {
+          await git(input.targetDir, ["worktree", "add", worktreePath, baseCommit]);
+        }
       } else {
         await git(input.targetDir, ["worktree", "add", "-b", branchName, worktreePath, baseCommit]);
       }
@@ -214,7 +224,7 @@ export class WorkspaceBridge {
     files: WriteFileInput[];
   }): Promise<string[]> {
     const workspace = this.requireWorkspace(input.workspaceId);
-    const policy = this.policyFor(workspace, input.allowedPaths);
+    const policy = this.policyFor(workspace, []);
     policy.assertAllowedWrites(input.files);
 
     const changed: string[] = [];
@@ -239,13 +249,32 @@ export class WorkspaceBridge {
 
   async readFiles(workspaceId: string, allowedPaths: string[], files: string[]): Promise<Record<string, string>> {
     const workspace = this.requireWorkspace(workspaceId);
-    const policy = this.policyFor(workspace, allowedPaths);
+    const policy = this.policyFor(workspace, []);
     const output: Record<string, string> = {};
     for (const file of files) {
       policy.assertAllowed(file);
       output[file] = await readFile(safeJoin(workspace.worktreePath, file), "utf8");
     }
     return output;
+  }
+
+  async mergeTicketBranchIntoEpic(workspaceId: string, ticketBranch: string): Promise<void> {
+    const workspace = this.requireWorkspace(workspaceId);
+    
+    // 1. Fetch latest from origin to ensure we can see the ticket branch
+    await git(workspace.worktreePath, ["fetch", "origin", ticketBranch]);
+    
+    // 2. Merge the ticket branch into current HEAD
+    try {
+      await git(workspace.worktreePath, ["merge", "--no-edit", `origin/${ticketBranch}`]);
+    } catch (error) {
+      const errText = error instanceof Error ? error.message : String(error);
+      if (errText.includes("conflict")) {
+        await git(workspace.worktreePath, ["merge", "--abort"]).catch(() => undefined);
+        throw new Error(`Merge conflict while merging ${ticketBranch} into epic branch: ${errText}`);
+      }
+      throw error;
+    }
   }
 
   async gitDiff(workspaceId: string): Promise<string> {

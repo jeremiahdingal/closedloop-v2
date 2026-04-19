@@ -1,4 +1,4 @@
-import path from "node:path";
+﻿import path from "node:path";
 import { readFile, readdir, stat, writeFile, mkdir, unlink } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -844,6 +844,12 @@ export async function executeToolCall(
 
 // ─── Individual tool implementations ────────────────────────────────────────
 
+// Track files already read by explore_mode to prevent re-reading
+const exploreModeReadFiles: Set<string> = new Set();
+
+export function resetExploreModeFiles(): void {
+  exploreModeReadFiles.clear();
+}
 async function execExploreMode(
   callId: string,
   args: Record<string, unknown>,
@@ -874,7 +880,7 @@ async function execExploreMode(
     return { callId, name: "explore_mode", output: "Error: calls array is required", isError: true };
   }
 
-  const allowedTools = new Set(["glob_files", "grep_files", "list_dir", "read_file", "read_files", "semantic_search", "git_status", "list_changed_files"]);
+  const allowedTools = new Set(["glob_files", "grep_files", "list_dir", "read_file", "read_files", "semantic_search", "git_status", "list_changed_files", "read_context_packet", "read_artifact", "web_search"]);
   const results: string[] = [];
 
   for (const [index, call] of calls.entries()) {
@@ -884,9 +890,24 @@ async function execExploreMode(
       continue;
     }
 
+    // Deduplication: skip files already read
+    const filePath = (call.args?.path as string) || (call.args?.pattern as string) || "";
+    if ((toolName === "read_file" || toolName === "read_files") && filePath && exploreModeReadFiles.has(filePath)) {
+      results.push(`--- [${index}] ${toolName}(${JSON.stringify(call.args)}) ---\n[SKIPPED] File already read in a previous iteration. Use the information you already have.`);
+      continue;
+    }
+
     try {
       const result = await executeToolCall({ id: `${callId}_${index}`, name: toolName, args: call.args }, ctx);
       results.push(`--- [${index}] ${toolName}(${JSON.stringify(call.args)}) ---\n${result.output}`);
+      // Track read files for dedup
+      if ((toolName === "read_file" || toolName === "read_files") && filePath) {
+        if (toolName === "read_files" && Array.isArray(call.args?.paths)) {
+          (call.args.paths as string[]).forEach((p: string) => exploreModeReadFiles.add(p));
+        } else {
+          exploreModeReadFiles.add(filePath);
+        }
+      }
     } catch (err) {
       results.push(`--- [${index}] ${toolName} ---\nError: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1637,6 +1658,9 @@ export function getAvailableToolsList(role: string): string[] {
   const common = ["explore_mode", "read_file", "read_files", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
   if (role === "builder") {
     return [...common, "write_file", "write_files", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files"];
+  }
+  if (role === "explorer") {
+    return ["explore_mode", "finish"];
   }
   if (role === "reviewer") {
     return ["read_file", "list_dir", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files", "finish"];

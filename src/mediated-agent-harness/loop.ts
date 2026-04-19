@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   ChatMessage,
   CompleteToolCall,
   MediatedHarnessConfig,
@@ -12,7 +12,7 @@ import type {
 } from "./types.ts";
 import { StagnationError, ModelConnectionError, LoopTimeoutError } from "./errors.ts";
 import { StreamParser } from "./stream-parser.ts";
-import { WORKSPACE_TOOLS, BROWSER_TOOLS, executeToolCall } from "./tools.ts";
+import { WORKSPACE_TOOLS, BROWSER_TOOLS, executeToolCall, getAvailableToolsList, resetExploreModeFiles } from "./tools.ts";
 import { CallHistory, validateAndRepair } from "./validator.ts";
 
 const KNOWN_TOOL_NAMES = new Set([
@@ -28,11 +28,12 @@ const KNOWN_TOOL_NAMES = new Set([
 export interface LoopInput {
   systemPrompt: string;
   userPrompt: string;
+  messages?: ChatMessage[];
   config: MediatedHarnessConfig;
   toolContext: ToolExecutionContext;
 }
 
-function resolveModelContextWindow(model: string): number {
+export function resolveModelContextWindow(model: string): number {
   if (model.startsWith("glm-4.7-flash")) return 4096;
   if (model.startsWith("qwen3.5:9b")) return 16384;
   if (model.startsWith("qwen3.5:27b")) return 4096;
@@ -45,6 +46,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
   const {
     systemPrompt,
     userPrompt,
+    messages: initialMessages,
     config,
     toolContext,
   } = input;
@@ -53,7 +55,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
   const apiKey = config.apiKey ?? "ollama";
   const toolMode = config.toolMode ?? "native";
   const maxIterations = config.maxIterations ?? 25;
-  const timeoutMs = config.timeoutMs ?? 600_000;
+  const timeoutMs = config.timeoutMs ?? 900_000;
   const temperature = config.temperature ?? 1.0;
   const topP = config.topP ?? 0.95;
   const topK = config.topK ?? 64;
@@ -65,21 +67,32 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     ? toolContext
     : { ...toolContext, braveApiKey: config.braveApiKey };
 
-  const messages: ChatMessage[] = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: userPrompt },
-  ];
+  const messages: ChatMessage[] = initialMessages && initialMessages.length > 0
+    ? initialMessages
+    : [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ];
 
-  // Include browser tools for playTester and tester roles
+  // Filter tools by role
+  const availableToolNames = config.role ? getAvailableToolsList(config.role) : Array.from(KNOWN_TOOL_NAMES);
+  const allowedToolSet = new Set(availableToolNames);
+
+  // Include browser tools for playTester and tester roles if they are in the allowed list
   const needsBrowser = (role: string) => role === "playTester" || role === "tester";
-  const tools = config.role && needsBrowser(config.role) 
+  let tools = needsBrowser(config.role ?? "") 
     ? [...WORKSPACE_TOOLS, ...BROWSER_TOOLS] 
     : WORKSPACE_TOOLS;
+  
+  tools = tools.filter(t => allowedToolSet.has(t.function.name));
+
   const toolSchemaMap = new Map(tools.map(t => [t.function.name, t]));
   const history = new CallHistory();
   const collectedToolCalls: ToolCall[] = [];
   const startTime = Date.now();
   let emptyResponseRetryUsed = false;
+
+  emit({ kind: "text", text: `--- SYSTEM PROMPT ---\n${systemPrompt}\n\n--- USER PROMPT ---\n${userPrompt}\n-------------------` });
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     // Check timeout
@@ -111,6 +124,34 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       }
     }
 
+
+    // Convergence: at 50% iterations, force explorer to conclude
+    const convergenceThreshold = Math.floor(maxIterations * 0.85);
+    if (config.role === "explorer" && iteration >= convergenceThreshold) {
+      resetExploreModeFiles();
+      messages.push({
+        role: "user",
+        content: `[SYSTEM] You are at iteration ${iteration + 1} of ${maxIterations}. You have used 85% of your iteration budget. STOP exploring. You MUST call the finish tool NOW. The finish tool takes two parameters: "result" (required, a JSON string with your analysis and findings) and "summary" (optional, a brief text summary). Call it now.`
+      });
+      emit({ kind: "text", text: `[convergence] Budget at 85%, forcing explorer to conclude...` });
+    }
+
+    // Token threshold: force finish if context window is nearly full
+    if (config.role === "explorer" && iteration > convergenceThreshold) {
+      const totalChars = messages.reduce((sum, m) => {
+        const c = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+        return sum + (c?.length ?? 0);
+      }, 0);
+      const estimatedTokens = Math.floor(totalChars / 3.5);
+      const tokenLimit = Math.floor(numCtx * 0.7);
+      if (estimatedTokens > tokenLimit) {
+        messages.push({
+          role: "user",
+          content: "[SYSTEM] Context window is nearly full. You MUST call the finish tool NOW. Pass your analysis as the result parameter (a JSON string). The summary parameter is optional."
+        });
+        emit({ kind: "text", text: "[convergence] Token threshold reached, forcing finish..." });
+      }
+    }
     emit({ kind: "text", text: `[iteration ${iteration + 1}/${maxIterations}] Calling model...` });
 
     // Make streaming request
@@ -122,6 +163,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`,
         },
+        signal: AbortSignal.timeout(900_000),
         body: JSON.stringify({
           model: config.model,
           messages: messages.map((message) => ({
@@ -227,7 +269,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
             assistantText = "";
           } else {
           const jsonResult = extractJson(text);
-          if (jsonResult) {
+          if (jsonResult && !requiresExplicitFinish(config.role)) {
             emit({
               kind: "complete",
               result: text,
@@ -245,9 +287,9 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
           messages.push({ role: "assistant", content: text });
           messages.push({
             role: "user",
-            content:
-              "You produced text without a tool call. STOP. Call the 'finish' tool now " +
-              "with 'summary' and 'result' parameters. Do not write any more text.",
+            content: requiresExplicitFinish(config.role)
+              ? "You produced text/JSON without using the tool interface. STOP. Use tool calls only. If you are done, call the 'finish' tool with 'summary' and 'result' parameters. Do not write any more text."
+              : "You produced text without a tool call. STOP. Call the 'finish' tool now with 'summary' and 'result' parameters. Do not write any more text.",
           });
           continue;
         }
@@ -300,6 +342,24 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     const toolResults: ChatMessage[] = [];
 
     for (const completeCall of state.toolCalls) {
+      // Role-based tool access control
+      if (!allowedToolSet.has(completeCall.name)) {
+        const errorMsg = `Unauthorized tool: ${completeCall.name}. Your role (${config.role}) is only allowed to use: ${availableToolNames.join(", ")}`;
+        emit({ kind: "tool_error", call: { id: completeCall.id, name: completeCall.name, args: {} }, error: errorMsg });
+        
+        assistantToolCalls.push({
+          id: completeCall.id,
+          type: "function",
+          function: { name: completeCall.name, arguments: completeCall.arguments },
+        });
+        toolResults.push({
+          role: "tool",
+          content: `Error: ${errorMsg}`,
+          tool_call_id: completeCall.id,
+        });
+        continue;
+      }
+
       // Validate and repair
       const validated = validateAndRepair(
         { name: completeCall.name, arguments: completeCall.arguments },
@@ -437,6 +497,16 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     maxIterations,
     "max_iterations"
   );
+}
+
+function requiresExplicitFinish(role?: string): boolean {
+  return role === "builder"
+    || role === "reviewer"
+    || role === "tester"
+    || role === "epicDecoder"
+    || role === "epicReviewer"
+    || role === "playTester"
+    || role === "explorer";
 }
 
 // ─── JSON extraction from text ──────────────────────────────────────────────

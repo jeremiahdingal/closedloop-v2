@@ -8,7 +8,7 @@ import { truncate } from "../utils.ts";
 import { parseJsonText } from "./validation.ts";
 
 export type OpenCodeTaskInput = {
-  role: Extract<AgentRole, "builder" | "epicDecoder" | "epicReviewer">;
+  role: Extract<AgentRole, "builder" | "epicDecoder" | "epicReviewer" | "tester">;
   cwd: string;
   prompt: string;
   runId?: string | null;
@@ -88,12 +88,14 @@ function buildConfigContent(role: AgentRole, model: string): string {
   });
 }
 
-function buildPrompt(role: "builder" | "epicDecoder" | "epicReviewer", prompt: string): string {
+function buildPrompt(role: "builder" | "epicDecoder" | "epicReviewer" | "tester", prompt: string): string {
   const preface = role === "builder"
     ? "You are the builder agent. Use the tools actually available in this OpenCode session: read, glob, grep, edit, write, task, todowrite, and skill. Do not call unavailable shell tools. Make the requested changes, then finish with a final JSON block."
     : role === "epicDecoder"
       ? "You are the epic decoder agent. Inspect the repository context using read, glob, grep, task, todowrite, and skill. Do not call unavailable shell tools. Understand the existing code structure and finish with a final JSON block."
-      : "You are the epic reviewer agent. Inspect the repository context and supplied summaries using read, glob, grep, task, todowrite, and skill. Do not call unavailable shell tools. Finish with a final JSON block.";
+      : role === "epicReviewer"
+        ? "You are the epic reviewer agent. Inspect the repository context and supplied summaries using read, glob, grep, task, todowrite, and skill. Do not call unavailable shell tools. Finish with a final JSON block."
+        : "You are the tester agent. Inspect the repository and run existing tests using task, todowrite, and skill. Do not call unavailable shell tools. Finish with a final JSON block.";
   return `${preface}\n\n${prompt}`;
 }
 
@@ -408,13 +410,20 @@ export class OpenCodeRunner {
     };
   }
 
+  async runTester(input: OpenCodeTaskInput): Promise<any> {
+    const raw = await this.runRaw(input);
+    return tryExtractJson(raw.combined);
+  }
+
   private async runRaw(input: OpenCodeTaskInput): Promise<{ combined: string; launchInfo: OpenCodeLaunchInfo }> {
     const models = loadConfig().models;
     const rawModel = input.role === "builder"
       ? models.builder
       : input.role === "epicDecoder"
         ? models.epicDecoder
-        : models.epicReviewer;
+        : input.role === "epicReviewer"
+          ? models.epicReviewer
+          : models.tester;
     const model = extractModel(rawModel);
     const prompt = buildPrompt(input.role, input.prompt);
     const launch = await this.resolveLaunch({ cwd: input.cwd, model, promptLength: prompt.length });
@@ -440,6 +449,8 @@ export class OpenCodeRunner {
         metadata: { cwd: input.cwd, command: launch.command, binaryPath: launch.info.binaryPath, promptLength: launch.info.promptLength }
       });
     };
+
+    emit("system", `--- PROMPT ---\n${prompt}\n--------------`);
 
     await new Promise<void>((resolve, reject) => {
       const child = this.spawnImpl(launch.command, args, {

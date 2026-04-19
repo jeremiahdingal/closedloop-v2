@@ -1,12 +1,19 @@
-import type {
+﻿import type {
+  CoderOutput,
+  CanonicalEditPacket,
+  EditOperation,
   EpicRecord,
+  ExplorerOutput,
   GoalTicketPlan,
   ReviewerVerdict,
   TicketContextPacket,
+  TicketEpicReviewPacket,
   TicketRecord
 } from "../types.ts";
+import { type VerificationResult } from "./verifier.ts";
 import { getCompactToolContract, getAvailableToolsList } from "../mediated-agent-harness/tools.ts";
 import type { BuiltContext } from "../rag/context-builder.ts";
+
 
 export function epicDecoderPrompt(epic: EpicRecord): string {
   return [
@@ -119,6 +126,9 @@ export function builderToolingPrompt(ticket: TicketRecord, packet: TicketContext
     `Allowed paths: ${ticket.allowedPaths.join(", ") || "(none)"}`,
     `Review blockers: ${packet.reviewBlockers.join("; ") || "(none)"}`,
     `Prior test failures: ${packet.priorTestFailures.join("; ") || "(none)"}`,
+    "CRITICAL: You MUST make actual code changes. Do NOT decide that existing code is sufficient without reading the relevant files first.",
+    "If ANY acceptance criterion is not fully met, you MUST write code to address it. Vague statements like 'existing implementation satisfies' are not acceptable.",
+    "NEVER output 'retry_builder' or 'no changes needed'. If genuinely complete, write a trivial change and explain which criteria were already met.",
     "Make the smallest safe set of changes needed.",
     "After you finish, output exactly one FINAL_JSON block and nothing after it.",
     '<FINAL_JSON>{"summary":"brief summary of changes"}</FINAL_JSON>'
@@ -127,7 +137,14 @@ export function builderToolingPrompt(ticket: TicketRecord, packet: TicketContext
   return sections.join("\n\n");
 }
 
-export function reviewerPrompt(ticket: TicketRecord, diff: string): string {
+
+export function reviewerPrompt(
+  ticket: TicketRecord,
+  coderOutput: CoderOutput | null,
+  verificationResult: VerificationResult | null,
+  diff: string,
+  legacyContext?: string
+): string {
   return [
     "You are the Local Reviewer.",
     "A deterministic guard has already checked destructive changes, allowed paths, and project-structure invariants.",
@@ -140,7 +157,7 @@ export function reviewerPrompt(ticket: TicketRecord, diff: string): string {
     "Do NOT invent blockers about files 'not being in the diff' when the diff clearly shows file creation.",
     "BLOCKERS vs SUGGESTIONS:",
     "- Blockers are ONLY: syntax errors, wrong file names (e.g. wrong.js instead of right.js), wrong file paths, security issues, or changes that actively break the codebase.",
-    "- In Tamagui / React Native / mobile-facing code, using raw HTML tags (`div`, `span`, `button`, `input`, etc.) is a BLOCKER unless the file is clearly web-only.",
+    "- In Tamagui / React Native / mobile-facing code, using raw HTML tags (div, span, button, input, etc.) is a BLOCKER unless the file is clearly web-only.",
     "- Changes that ignore the established styling system or replace existing design primitives with incompatible ones are BLOCKERS.",
     "- Missing type annotations, missing module exports, missing comments, style preferences, or 'best practices' for simple scripts are SUGGESTIONS, NOT blockers.",
     "- For simple files (hello world, scripts, standalone files), do NOT block on missing exports or type annotations. These are optional improvements.",
@@ -155,8 +172,11 @@ export function reviewerPrompt(ticket: TicketRecord, diff: string): string {
     }, null, 2),
     `Ticket: ${ticket.title}`,
     `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`,
+    ...(coderOutput ? [`Coder Summary: ${coderOutput.summary}`, `Intended Files: ${coderOutput.intendedFiles.join(", ")}`] : []),
+    ...(verificationResult ? [`Verification Result: ${verificationResult.outcome} (${verificationResult.appliedOperations.length} applied, ${verificationResult.failedOperations.length} failed)`] : []),
     "Diff:",
-    diff || "(empty)"
+    diff || "(empty)",
+    ...(legacyContext ? ["Legacy Context:", legacyContext] : [])
   ].join("\n\n");
 }
 
@@ -178,6 +198,90 @@ export function reviewerToolingPrompt(ticket: TicketRecord): string {
     `Ticket: ${ticket.title}`,
     `Description: ${ticket.description}`,
     `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`
+  ].join("\n\n");
+}
+
+
+
+export function explorerPrompt(ticket: TicketRecord, packet: TicketContextPacket, seedFiles?: string[]): string {
+  const seedSection = seedFiles && seedFiles.length > 0
+    ? "PRE-DISCOVERED FILES (you do NOT need to re-read these):\n" + seedFiles.map(f => `  - ${f}`).join("\n")
+    : "";
+
+  return [
+    "You are the Explorer agent.",
+    "Analyze the ticket requirements and the provided context to determine which files need to be read or modified.",
+    "Return a structured analysis with: relevant files, recommended files for coding, key patterns to follow, and any blockers.",
+    "",
+    "TOOL USAGE STRATEGY:",
+    "PREFER explore_mode for ALL file discovery. It batches multiple read-only calls efficiently.",
+    "Use explore_mode to: read_file, read_files, glob_files, grep_files, list_dir, semantic_search, web_search.",
+    "If you need to find related files OUTSIDE the allowed paths, use glob_files and grep_files to discover them.",
+    "Example: If the ticket mentions 'Orders' and 'Items', search for those files with grep_files or glob_files.",
+    "DO NOT just re-read the same files. Use glob/list_dir/grep to find related schemas, models, types, and services.",
+    "",
+    `Ticket: ${ticket.title}`,
+    `Goal: ${ticket.description}`,
+    `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`,
+    `Allowed paths: ${ticket.allowedPaths.join(", ")}`,
+    `Review blockers from previous attempt: ${packet.reviewBlockers.join("; ") || "(none)"}`,
+    `Prior test failures: ${packet.priorTestFailures.join("; ") || "(none)"}`,
+    seedSection,
+    "Return JSON only with shape:",
+    JSON.stringify({
+      summary: "string",
+      relevantFiles: ["string"],
+      recommendedFilesForCoding: ["string"],
+      keyPatterns: ["string"],
+      unresolvedBlockers: ["string"]
+    }, null, 2),
+    "After you finish, output exactly one FINAL_JSON block and nothing after it."
+  ].join("\n\n");
+}
+
+export function coderPrompt(
+  ticket: TicketRecord,
+  explorerOutput: ExplorerOutput,
+  editPacket: CanonicalEditPacket
+): string {
+  return [
+    "You are the Coder agent.",
+    "Your job is to write the actual code changes to satisfy the ticket based on the Explorer's analysis and the provided file contents.",
+    "MODEL TARGET: You are qwen3.5:27b. You do NOT have tool access. You must output a JSON edit plan.",
+    `Ticket: ${ticket.title}`,
+    `Goal: ${ticket.description}`,
+    `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`,
+    "## Acceptance Criteria Mapping",
+    "CRITICAL: Every operation you produce MUST include an 'ac' field indicating which acceptance criterion it addresses.",
+    "Format: 'ac': 'AC-1' or for multiple: 'ac': 'AC-1,AC-3'.",
+    "Do NOT produce operations that don't map to at least one acceptance criterion. This prevents scope drift.",
+    "",
+    "## Explorer Analysis",
+    JSON.stringify(explorerOutput, null, 2),
+    "## Canonical Edit Packet (Current Source of Truth)",
+    JSON.stringify(editPacket, null, 2),
+    "## Rules for Operations",
+    "1. Use 'search_replace' for existing files. You MUST provide the exact 'search' block and the 'replace' block.",
+    "2. 'search_replace' MUST include 'expected_sha256' as provided in the Canonical Edit Packet for that file.",
+    "3. Use 'create_file' for new files.",
+    "4. Use 'append_file' only if adding to the end of a file.",
+    "5. 'delete_file' or 'rename_file' are ONLY allowed if explicitly permitted in 'destructivePermissions' or 'allowedDeletePaths'/'allowedRenamePaths'.",
+    "6. If you lack enough source code to complete the task, return an unresolvedBlocker: 'NEEDS_SOURCE'.",
+    "7. If the task is impossible, return an unresolvedBlocker: 'BLOCKED'.",
+    "8. Do NOT use 'replace_file' for existing files unless 'allowFullReplace' is true for that path.",
+    "9. Every destructive operation (delete/rename) MUST include a 'reason' string.",
+    "Return JSON only with shape:",
+    JSON.stringify({
+      summary: "brief summary of what you implemented",
+      intendedFiles: ["string"],
+      unresolvedBlockers: ["string"],
+      operations: [
+        { kind: "search_replace", path: "string", expected_sha256: "string", search: "string", replace: "string", ac: "AC-1" },
+        { kind: "create_file", path: "string", content: "string", ac: "AC-2,AC-3" },
+        { kind: "delete_file", path: "string", expected_sha256: "string", reason: "explicit reason", ac: "AC-1" }
+      ]
+    }, null, 2),
+    "After you finish, output exactly one FINAL_JSON block and nothing after it."
   ].join("\n\n");
 }
 
@@ -308,7 +412,9 @@ export function doctorPrompt(input: {
     `No diff: ${String(input.noDiff)}`,
     `Infrastructure failure: ${String(input.infraFailure)}`,
     `Latest review: ${JSON.stringify(input.reviewerVerdict)}`,
-    `Latest test summary: ${input.testSummary ?? "(none)"}`
+    `Latest test summary: ${input.testSummary ?? "(none)"}`,
+    "",
+    "Re-run Awareness: This ticket may have been run before. If the coder or builder reported that all acceptance criteria are already satisfied by existing code (look for phrases like 'already exists', 'no changes needed', 'already satisfies' in the review), and the reviewer has no blockers, you should approve rather than escalate."
   ].join("\n\n");
 }
 

@@ -220,7 +220,6 @@ export class RecoveryService {
     staleAfterMs = this.config.staleRunAfterMs,
     maxRecoveries = this.config.staleRunMaxRecoveries
   ): Promise<string[]> {
-    const threshold = Date.now() - staleAfterMs;
     const staleRunIds: string[] = [];
     for (const run of this.db.listRuns("running")) {
       if (run.epicId && (run.currentNode === "goal_review" || run.currentNode === "manual_goal_review")) {
@@ -231,6 +230,12 @@ export class RecoveryService {
         const allDone = tickets.every(t => t.status === "approved" || t.status === "failed" || t.status === "escalated");
         if (allDone) continue;
       }
+
+      // Determine timeout based on node
+      const node = (run.currentNode ?? "").toLowerCase();
+      const effectiveStaleAfterMs = node === "coder" ? this.config.staleCoderRunAfterMs : staleAfterMs;
+      const threshold = Date.now() - effectiveStaleAfterMs;
+
       const heartbeat = run.heartbeatAt ? new Date(run.heartbeatAt).getTime() : 0;
       if (heartbeat < threshold) {
         staleRunIds.push(run.id);

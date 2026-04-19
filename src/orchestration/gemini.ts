@@ -1,11 +1,11 @@
-﻿import { spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import { loadConfig } from "../config.ts";
-import type { AgentRole, AgentStreamPayload, GoalDecomposition, GoalReview } from "../types.ts";
-import { validateGoalDecomposition, validateGoalReview, parseJsonText } from "./validation.ts";
+import type { AgentRole, AgentStreamPayload, GoalDecomposition, GoalReview, OpenCodeBuilderResult } from "../types.ts";
+import { parseJsonText, validateGoalDecomposition, validateGoalReview } from "./validation.ts";
 
-export type CodexTaskInput = {
+export type GeminiTaskInput = {
   role: Extract<AgentRole, "epicDecoder" | "epicReviewer" | "builder">;
   cwd: string;
   prompt: string;
@@ -15,37 +15,37 @@ export type CodexTaskInput = {
   onStream?: (event: AgentStreamPayload) => void;
 };
 
-export type CodexLaunchInfo = {
+export type GeminiLaunchInfo = {
   cwd: string;
   repoRoot: string;
   promptLength: number;
   command: string;
   args: string[];
-  shell: string | boolean;
+  shell: boolean;
   cwdExists: boolean;
   cwdIsDirectory: boolean;
 };
 
-export type CodexLaunchKind =
+export type GeminiLaunchKind =
   | "invalid_cwd"
   | "missing_binary"
   | "spawn_error"
   | "exit_error";
 
-export class CodexLaunchError extends Error {
-  readonly kind: CodexLaunchKind;
-  readonly launchInfo: CodexLaunchInfo;
+export class GeminiLaunchError extends Error {
+  readonly kind: GeminiLaunchKind;
+  readonly launchInfo: GeminiLaunchInfo;
   readonly exitCode: number | null;
   readonly cause?: unknown;
 
   constructor(
-    kind: CodexLaunchKind,
+    kind: GeminiLaunchKind,
     message: string,
-    launchInfo: CodexLaunchInfo,
+    launchInfo: GeminiLaunchInfo,
     options?: { exitCode?: number | null; cause?: unknown }
   ) {
     super(message);
-    this.name = "CodexLaunchError";
+    this.name = "GeminiLaunchError";
     this.kind = kind;
     this.launchInfo = launchInfo;
     this.exitCode = options?.exitCode ?? null;
@@ -57,31 +57,40 @@ export class CodexLaunchError extends Error {
   }
 }
 
-type CodexRunnerOptions = {
+type GeminiRunnerOptions = {
   spawnImpl?: typeof spawn;
 };
+
+function buildArgs(prompt: string): string[] {
+  // Gemini CLI flags: --approval-mode yolo --output-format text -p (for prompt)
+  // But we want to pipe to stdin if possible for large prompts
+  const args = ["--approval-mode", "yolo", "--output-format", "text"];
+  const model = process.env.GEMINI_CLI_MODEL?.trim();
+  if (model) args.push("--model", model);
+  return args;
+}
 
 function buildLaunchInfo(input: {
   cwd: string;
   repoRoot: string;
   promptLength: number;
+  args: string[];
   cwdExists: boolean;
   cwdIsDirectory: boolean;
-}): CodexLaunchInfo {
-  const isWin = process.platform === "win32";
+}): GeminiLaunchInfo {
   return {
     cwd: input.cwd,
     repoRoot: input.repoRoot,
     promptLength: input.promptLength,
-    command: "codex",
-    args: ["exec", "--yolo", "--skip-git-repo-check", "-C", input.cwd, "-"],
-    shell: isWin ? "cmd.exe" : true, // Use cmd.exe on Windows to avoid PowerShell quirks
+    command: "gemini",
+    args: input.args,
+    shell: true,
     cwdExists: input.cwdExists,
     cwdIsDirectory: input.cwdIsDirectory
   };
 }
 
-function describeLaunchInfo(info: CodexLaunchInfo): string {
+function describeLaunchInfo(info: GeminiLaunchInfo): string {
   return [
     `cwd=${info.cwd}`,
     `command=${info.command}`,
@@ -91,130 +100,72 @@ function describeLaunchInfo(info: CodexLaunchInfo): string {
   ].join(" ");
 }
 
-export function formatCodexFailure(error: unknown): string {
-  if (error instanceof CodexLaunchError) {
+export function formatGeminiFailure(error: unknown): string {
+  if (error instanceof GeminiLaunchError) {
     const extra = error.exitCode == null ? "" : ` exitCode=${error.exitCode}`;
     const cause = error.cause instanceof Error ? ` cause=${error.cause.message}` : error.cause ? ` cause=${String(error.cause)}` : "";
-    return `Codex launch failed [${error.kind}]${extra}${cause}: ${error.message}. ${describeLaunchInfo(error.launchInfo)}`;
+    return `Gemini CLI failed [${error.kind}]${extra}${cause}: ${error.message}. ${describeLaunchInfo(error.launchInfo)}`;
   }
-  if (error instanceof Error) return `Codex failed: ${error.message}`;
-  return `Codex failed: ${String(error)}`;
-}
-
-function extractJsonObjectCandidates(raw: string): string[] {
-  const candidates: string[] = [];
-  let depth = 0;
-  let start = -1;
-  let inString = false;
-  let escaped = false;
-
-  for (let index = 0; index < raw.length; index += 1) {
-    const char = raw[index];
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-        continue;
-      }
-      if (char === "\\") {
-        escaped = true;
-        continue;
-      }
-      if (char === "\"") {
-        inString = false;
-      }
-      continue;
-    }
-
-    if (char === "\"") {
-      inString = true;
-      continue;
-    }
-
-    if (char === "{") {
-      if (depth === 0) start = index;
-      depth += 1;
-      continue;
-    }
-
-    if (char === "}" && depth > 0) {
-      depth -= 1;
-      if (depth === 0 && start >= 0) {
-        candidates.push(raw.slice(start, index + 1));
-        start = -1;
-      }
-    }
-  }
-
-  return candidates;
+  if (error instanceof Error) return `Gemini CLI failed: ${error.message}`;
+  return `Gemini CLI failed: ${String(error)}`;
 }
 
 function tryExtractJson(raw: string): any {
+  // Try to find JSON in the output. Gemini CLI might wrap it in code blocks or tags.
   const tagged = raw.match(/<FINAL_JSON>([\s\S]*?)<\/FINAL_JSON>/i);
-  const direct = tagged?.[1] ?? raw;
-  const candidates = extractJsonObjectCandidates(direct);
-  if (!candidates.length) throw new Error("Codex output did not contain any JSON object candidates.");
-
-  let fallback: unknown = null;
-  let lastError: Error | null = null;
-  for (let index = candidates.length - 1; index >= 0; index -= 1) {
-    try {
-      const parsed = JSON.parse(candidates[index]);
-      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) return parsed;
-      if (fallback == null) fallback = parsed;
-    } catch (error) {
-      lastError = error as Error;
-    }
-  }
-
-  if (fallback != null) return fallback;
-  if (lastError) throw lastError;
-  throw new Error("Codex output did not contain a valid final JSON object.");
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const direct = (tagged?.[1] ?? fenced?.[1] ?? raw).trim();
+  
+  return parseJsonText(direct);
 }
 
-export class CodexRunner {
+export class GeminiRunner {
   private readonly spawnImpl: typeof spawn;
 
-  constructor(options?: CodexRunnerOptions) {
+  constructor(options?: GeminiRunnerOptions) {
     this.spawnImpl = options?.spawnImpl ?? spawn;
   }
 
-  async resolveLaunch(input: { cwd: string; promptLength: number }): Promise<{ command: string; args: string[]; info: CodexLaunchInfo }> {
+  async resolveLaunch(input: { cwd: string; prompt: string }): Promise<{ command: string; args: string[]; info: GeminiLaunchInfo }> {
     const config = loadConfig();
     const cwd = path.resolve(input.cwd);
     const cwdStat = await stat(cwd)
       .then((value) => ({ exists: true, isDirectory: value.isDirectory() }))
       .catch(() => ({ exists: false, isDirectory: false }));
 
+    const args = buildArgs(input.prompt);
     const info = buildLaunchInfo({
       cwd,
       repoRoot: config.repoRoot,
-      promptLength: input.promptLength,
+      promptLength: input.prompt.length,
+      args,
       cwdExists: cwdStat.exists,
       cwdIsDirectory: cwdStat.isDirectory
     });
 
     if (!cwdStat.exists || !cwdStat.isDirectory) {
-      throw new CodexLaunchError("invalid_cwd", `Codex workspace cwd does not exist or is not a directory: ${cwd}`, info);
+      throw new GeminiLaunchError("invalid_cwd", `Gemini workspace cwd does not exist or is not a directory: ${cwd}`, info);
     }
 
     return {
-      command: info.command,
-      args: info.args,
+      command: "gemini",
+      args,
       info
     };
   }
 
-  async runEpicDecoder(input: CodexTaskInput): Promise<GoalDecomposition> {
+  async runEpicDecoder(input: GeminiTaskInput): Promise<GoalDecomposition> {
     const raw = await this.runRaw(input);
     try {
       const parsed = tryExtractJson(raw.combined);
       return validateGoalDecomposition(parsed);
     } catch {
+      // Fallback to basic parsing if structured extraction fails
       return validateGoalDecomposition(parseJsonText(raw.combined));
     }
   }
 
-  async runEpicReviewer(input: CodexTaskInput): Promise<GoalReview> {
+  async runEpicReviewer(input: GeminiTaskInput): Promise<GoalReview> {
     const raw = await this.runRaw(input);
     try {
       const parsed = tryExtractJson(raw.combined);
@@ -224,18 +175,17 @@ export class CodexRunner {
     }
   }
 
-  async runBuilder(input: CodexTaskInput): Promise<import("../types.ts").OpenCodeBuilderResult> {
+  async runBuilder(input: GeminiTaskInput): Promise<OpenCodeBuilderResult> {
     const raw = await this.runRaw(input);
     return {
-      summary: "Codex CLI build completed",
+      summary: "Gemini CLI build completed",
       sessionId: null,
       rawOutput: raw.combined
     };
   }
 
-  private async runRaw(input: CodexTaskInput): Promise<{ combined: string; launchInfo: CodexLaunchInfo }> {
-    const launch = await this.resolveLaunch({ cwd: input.cwd, promptLength: input.prompt.length });
-    const args = [...launch.args];
+  private async runRaw(input: GeminiTaskInput): Promise<{ combined: string; launchInfo: GeminiLaunchInfo }> {
+    const launch = await this.resolveLaunch({ cwd: input.cwd, prompt: input.prompt });
     const chunks: string[] = [];
     let sequence = 0;
 
@@ -255,11 +205,13 @@ export class CodexRunner {
       });
     };
 
+    emit("system", `--- PROMPT ---\n${input.prompt}\n--------------`);
+
     await new Promise<void>((resolve, reject) => {
-      const child = this.spawnImpl(launch.command, args, {
+      const child = this.spawnImpl(launch.command, launch.args, {
         cwd: launch.info.cwd,
         env: { ...process.env },
-        shell: launch.info.shell,
+        shell: true,
         stdio: ["pipe", "pipe", "pipe"]
       });
 
@@ -274,10 +226,8 @@ export class CodexRunner {
         const kind = /think|reason/i.test(chunk) ? "thinking" : "stderr";
         emit(kind, chunk);
       });
-      child.stdin?.write(input.prompt);
-      child.stdin?.end();
       child.on("error", (error) =>
-        reject(new CodexLaunchError("spawn_error", `Codex spawn failed: ${(error as Error).message}`, launch.info, { cause: error }))
+        reject(new GeminiLaunchError("spawn_error", `Gemini spawn failed: ${(error as Error).message}`, launch.info, { cause: error }))
       );
       child.on("close", (code) => {
         emit("status", code === 0 ? "completed" : `failed (${code ?? 1})`, true);
@@ -285,8 +235,12 @@ export class CodexRunner {
           resolve();
           return;
         }
-        reject(new CodexLaunchError("exit_error", `Codex exited with code ${code ?? 1}`, launch.info, { exitCode: code ?? 1 }));
+        reject(new GeminiLaunchError("exit_error", `Gemini exited with code ${code ?? 1}`, launch.info, { exitCode: code ?? 1 }));
       });
+
+      // Write prompt to stdin
+      child.stdin?.write(input.prompt);
+      child.stdin?.end();
     });
 
     return { combined: chunks.join(""), launchInfo: launch.info };
