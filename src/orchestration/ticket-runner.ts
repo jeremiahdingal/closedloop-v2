@@ -348,24 +348,34 @@ export class TicketRunner {
 
       this.heartbeat(runId, ticket.id, "coder", `Verification ${verificationResult.outcome}: ${verificationResult.summary}`);
 
-      if (verificationResult.outcome === "accepted") {
-        await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] ${ticket.title}` });
+      console.log(`[VERIFY] ${ticket.id} outcome=${verificationResult.outcome} applied=${verificationResult.appliedOperations.length} failed=${verificationResult.failedOperations.length} relaxed=${verificationResult.relaxedOperations.length}`);
+
+      // Commit and proceed if ANY operations were successfully applied
+      const hasAppliedOps = verificationResult.appliedOperations.length > 0;
+      if (verificationResult.outcome === "accepted" || (verificationResult.outcome === "repairable" && hasAppliedOps)) {
+        await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] ${ticket.title}${verificationResult.outcome === "repairable" ? " (partial)" : ""}` });
         const diffResult = await this.bridge.gitDiff(workspace.id);
-        return {
-          verificationResult,
-          lastDiff: diffResult,
-          noDiff: !diffResult.trim(),
-          lastMessage: verificationResult.summary,
-          status: "reviewing" as const,
-        } satisfies Partial<TicketGraphState>;
-      } else {
-        return {
-          verificationResult,
-          noDiff: true,
-          lastMessage: `Verification ${verificationResult.outcome}: ${verificationResult.summary}`,
-          status: "building" as const,
-        } satisfies Partial<TicketGraphState>;
+        const hasDiff = !!diffResult.trim();
+        if (hasDiff) {
+          return {
+            verificationResult,
+            lastDiff: diffResult,
+            noDiff: false,
+            lastMessage: verificationResult.summary,
+            status: "reviewing" as const,
+          } satisfies Partial<TicketGraphState>;
+        }
+        // Applied ops but no diff (e.g. replace with identical content) — treat as noDiff
+        console.warn(`[VERIFY] ${ticket.id} applied ${verificationResult.appliedOperations.length} ops but no diff produced`);
       }
+
+      // Complete failure, escalate, or empty — signal noDiff
+      return {
+        verificationResult,
+        noDiff: true,
+        lastMessage: `Verification ${verificationResult.outcome}: ${verificationResult.summary}`,
+        status: "building" as const,
+      } satisfies Partial<TicketGraphState>;
     };
 
         const builderNode = async (state: TicketGraphState) => {
