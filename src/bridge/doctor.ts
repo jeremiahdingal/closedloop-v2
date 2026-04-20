@@ -11,10 +11,10 @@ export function deterministicDoctor(input: {
     return { decision: "retry_same_node", reason: input.infraFailure ? "Transient infrastructure failure." : "Agent stalled; restarting at current node." };
   }
   if (input.noDiff) {
-    return { decision: "retry_builder", reason: "Builder produced no diff." };
+    return { decision: "escalate", reason: "No diff produced - escalating to avoid retry loop." };
   }
   if (input.repeatedBlockers || input.repeatedTestFailure) {
     return { decision: "escalate", reason: "The same blocker or test failure repeated." };
   }
-  return { decision: "retry_builder", reason: "The ticket needs another build attempt." };
+  return { decision: "escalate", reason: "Unrecoverable failure - escalating to avoid retry loop." };
 }

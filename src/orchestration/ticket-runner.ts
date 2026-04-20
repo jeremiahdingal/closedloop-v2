@@ -159,7 +159,7 @@ export class TicketRunner {
       testSummary: z.string().default(""),
       lastDiff: z.string().default(""),
       lastMessage: z.string().default(""),
-      failureDecision: z.enum(["retry_same_node", "retry_builder", "blocked", "todo", "escalate"]).default("retry_builder"),
+      failureDecision: z.enum(["retry_same_node", "blocked", "todo", "escalate"]).default("escalate"),
       failureReason: z.string().default(""),
       noDiff: z.boolean().default(false),
       explorerOutput: z.any().default(null),
@@ -810,7 +810,6 @@ export class TicketRunner {
       .addNode("build_packet", buildPacketNode)
       .addNode("coder", coderNode)
       .addNode("verify", verifyNode)
-      .addNode("builder", builderNode)
       .addNode("reviewer", reviewerNode)
       .addNode("tester", testerNode)
       .addNode("classify", classifyNode)
@@ -831,11 +830,10 @@ export class TicketRunner {
       .addConditionalEdges(
         "classify",
         (state: TicketGraphState) => {
-          if (state.buildAttempts >= state.maxBuildAttempts) return "finalize_failed";
           if (["escalate", "blocked", "todo"].includes(state.failureDecision)) return "finalize_escalated";
-          return "builder";
+          return "finalize_failed";
         },
-        ["builder", "finalize_escalated", "finalize_failed"]
+        ["finalize_escalated", "finalize_failed"]
       )
       .addEdge("finalize_success", END)
       .addEdge("finalize_escalated", END)
