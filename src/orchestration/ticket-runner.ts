@@ -243,7 +243,7 @@ export class TicketRunner {
 
       const explorerRaw = await this.gateway.runExplorerInWorkspace!({
         cwd: workspace.worktreePath,
-        prompt: explorerPrompt(ticket, {} as any, seedFiles),
+        prompt: explorerPrompt(ticket, { reviewBlockers: state.reviewBlockers, priorTestFailures: state.testHistory } as any, seedFiles),
         runId, ticketId: ticket.id, epicId: ticket.epicId,
         onStream: (evt: any) => {
           evt.runId = runId;
@@ -487,6 +487,7 @@ export class TicketRunner {
         || state.blockHistory.includes(reviewerHistoryKey);
       return {
         reviewApproved: reviewVerdict.approved,
+        buildAttempts: state.buildAttempts + (reviewVerdict.approved ? 0 : 1),
         reviewBlockers: reviewVerdict.blockers,
         reviewSuggestions: reviewVerdict.suggestions,
         blockHistory: [
@@ -825,7 +826,11 @@ export class TicketRunner {
         (state: TicketGraphState) => state.noDiff ? "classify" : "reviewer",
         ["classify", "reviewer"]
       )
-      .addConditionalEdges("reviewer", (state: TicketGraphState) => state.reviewApproved ? "tester" : "classify", ["tester", "classify"])
+      .addConditionalEdges("reviewer", (state: TicketGraphState) => {
+        if (state.reviewApproved) return "tester";
+        if (state.buildAttempts >= state.maxBuildAttempts) return "classify";
+        return "build_packet";
+      }, ["tester", "classify", "build_packet"])
       .addConditionalEdges("tester", (state: TicketGraphState) => state.testPassed ? "finalize_success" : "classify", ["finalize_success", "classify"])
       .addConditionalEdges(
         "classify",
