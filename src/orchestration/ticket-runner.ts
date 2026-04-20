@@ -307,7 +307,7 @@ export class TicketRunner {
       this.heartbeat(runId, ticket.id, "coder", "Coder generating edits...");
 
       const coderRaw = await this.gateway.runCoderDirect!({
-        prompt: coderPrompt(ticket, state.explorerOutput, state.canonicalEditPacket),
+        prompt: coderPrompt(ticket, state.explorerOutput, state.canonicalEditPacket, { blockers: state.reviewBlockers ?? [], suggestions: state.reviewSuggestions ?? [] }),
         runId, ticketId: ticket.id, epicId: ticket.epicId,
         onStream: (evt: any) => {
           evt.runId = runId;
@@ -786,12 +786,25 @@ export class TicketRunner {
       const reason = state.failureReason || "Escalated by classifier.";
       this.db.updateRun({ runId, status: "escalated", currentNode: "escalated", heartbeatAt: nowIso(), lastMessage: reason, errorText: reason });
       this.db.updateTicketRunState({ ticketId: ticket.id, status: "escalated", currentNode: "escalated", lastHeartbeatAt: nowIso(), lastMessage: reason });
+      const escalationPacket = {
+        reason,
+        runId,
+        ticketId: ticket.id,
+        buildAttempts: state.buildAttempts,
+        reviewBlockers: state.reviewBlockers ?? [],
+        reviewSuggestions: state.reviewSuggestions ?? [],
+        blockHistory: state.blockHistory ?? [],
+        testSummary: state.testSummary || null,
+        lastDiff: state.lastDiff || null,
+        coderOutput: state.coderOutput ?? null,
+        explorerOutput: state.explorerOutput ?? null,
+      };
       await this.bridge.saveArtifact({
         runId,
         ticketId: ticket.id,
         kind: "escalation",
         name: `${ticket.id}-escalation.json`,
-        content: JSON.stringify({ reason, runId, ticketId: ticket.id }, null, 2)
+        content: JSON.stringify(escalationPacket, null, 2)
       });
       await this.bridge.archiveWorkspace(state.workspaceId);
       return { status: "escalated", lastMessage: reason } satisfies Partial<TicketGraphState>;
@@ -801,6 +814,26 @@ export class TicketRunner {
       const reason = state.failureReason || "Retry budget exceeded.";
       this.db.updateRun({ runId, status: "failed", currentNode: "complete", heartbeatAt: nowIso(), lastMessage: reason, errorText: reason });
       this.db.updateTicketRunState({ ticketId: ticket.id, status: "failed", currentNode: "complete", lastHeartbeatAt: nowIso(), lastMessage: reason });
+      const failurePacket = {
+        reason,
+        runId,
+        ticketId: ticket.id,
+        buildAttempts: state.buildAttempts,
+        reviewBlockers: state.reviewBlockers ?? [],
+        reviewSuggestions: state.reviewSuggestions ?? [],
+        blockHistory: state.blockHistory ?? [],
+        testSummary: state.testSummary || null,
+        lastDiff: state.lastDiff || null,
+        coderOutput: state.coderOutput ?? null,
+        explorerOutput: state.explorerOutput ?? null,
+      };
+      await this.bridge.saveArtifact({
+        runId,
+        ticketId: ticket.id,
+        kind: "failure",
+        name: `${ticket.id}-failure.json`,
+        content: JSON.stringify(failurePacket, null, 2)
+      });
       await this.bridge.archiveWorkspace(state.workspaceId);
       return { status: "failed", lastMessage: reason } satisfies Partial<TicketGraphState>;
     };

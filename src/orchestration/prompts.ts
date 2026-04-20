@@ -1,4 +1,4 @@
-﻿import type {
+import type {
   CoderOutput,
   CanonicalEditPacket,
   EditOperation,
@@ -243,7 +243,8 @@ export function explorerPrompt(ticket: TicketRecord, packet: TicketContextPacket
 export function coderPrompt(
   ticket: TicketRecord,
   explorerOutput: ExplorerOutput,
-  editPacket: CanonicalEditPacket
+  editPacket: CanonicalEditPacket,
+  reviewerContext?: { blockers: string[]; suggestions: string[] }
 ): string {
   return [
     "You are the Coder agent.",
@@ -260,7 +261,20 @@ export function coderPrompt(
     "## Explorer Analysis",
     JSON.stringify(explorerOutput, null, 2),
     "## Canonical Edit Packet (Current Source of Truth)",
-    JSON.stringify(editPacket, null, 2),
+    JSON.stringify(editPacket, null, 2),,
+    ...(reviewerContext && (reviewerContext.blockers?.length || reviewerContext.suggestions?.length)
+      ? [
+        "",
+        "## Previous Reviewer Feedback (address these issues)",
+        ...(reviewerContext.blockers?.length
+          ? ["Reviewer blockers (MUST resolve):", ...reviewerContext.blockers.map(b => "- " + b)]
+          : []),
+        ...(reviewerContext.suggestions?.length
+          ? ["Reviewer suggestions:", ...reviewerContext.suggestions.map(s => "- " + s)]
+          : []),
+        "Your operations MUST address every blocker listed above.",
+      ]
+      : []),
     "## Rules for Operations",
     "1. Use 'search_replace' for existing files. You MUST provide the exact 'search' block and the 'replace' block.",
     "2. 'search_replace' MUST include 'expected_sha256' as provided in the Canonical Edit Packet for that file.",
