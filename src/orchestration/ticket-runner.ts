@@ -829,8 +829,8 @@ export class TicketRunner {
       .addConditionalEdges("reviewer", (state: TicketGraphState) => {
         if (state.reviewApproved) return "tester";
         if (state.buildAttempts >= state.maxBuildAttempts) return "classify";
-        return "build_packet";
-      }, ["tester", "classify", "build_packet"])
+        return "explorer";
+      }, ["tester", "classify", "explorer"])
       .addConditionalEdges("tester", (state: TicketGraphState) => state.testPassed ? "finalize_success" : "classify", ["finalize_success", "classify"])
       .addConditionalEdges(
         "classify",
