@@ -353,8 +353,8 @@ export class TicketRunner {
       // Commit and proceed if ANY operations were successfully applied
       const hasAppliedOps = verificationResult.appliedOperations.length > 0;
       if (verificationResult.outcome === "accepted" || (verificationResult.outcome === "repairable" && hasAppliedOps)) {
-        await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] ${ticket.title}${verificationResult.outcome === "repairable" ? " (partial)" : ""}` });
         const diffResult = await this.bridge.gitDiff(workspace.id);
+        await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] ${ticket.title}${verificationResult.outcome === "repairable" ? " (partial)" : ""}` });
         const hasDiff = !!diffResult.trim();
         if (hasDiff) {
           return {
