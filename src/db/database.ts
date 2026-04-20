@@ -562,6 +562,14 @@ export class AppDatabase {
     `).all(cutoffIso) as any[]).map((row) => this.mapWorkspace(row));
   }
 
+  listOrphanedWorkspaces(cutoffIso: string): WorkspaceRecord[] {
+    return (this.db.prepare(`
+      SELECT * FROM workspaces
+      WHERE status = 'active' AND updated_at < ?
+      ORDER BY updated_at ASC
+    `).all(cutoffIso) as any[]).map((row) => this.mapWorkspace(row));
+  }
+
   listWorkspacesForTicket(ticketId: string): WorkspaceRecord[] {
     return (this.db.prepare(`
       SELECT * FROM workspaces

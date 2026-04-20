@@ -125,6 +125,18 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     }
 
 
+    // Early nudge at 60%: remind explorer about structured JSON
+    if (config.role === "explorer" && iteration >= Math.floor(maxIterations * 0.6)) {
+      const hasNudged = messages.some(m => typeof m.content === 'string' && m.content.includes('[SYSTEM REMINDER] 60%'));
+      if (!hasNudged) {
+        messages.push({
+          role: "user",
+          content: "[SYSTEM REMINDER] You are past 60% of your iteration budget. Start wrapping up. When you call finish, result MUST be a raw JSON object with fields: summary, relevantFiles, recommendedFilesForCoding, keyPatterns, unresolvedBlockers. No markdown, no code fences, no commentary. Just the JSON object."
+        });
+        emit({ kind: "text", text: "[nudge] 60% budget reached, reminding explorer about JSON output..." });
+      }
+    }
+
     // Convergence: at 50% iterations, force explorer to conclude
     const convergenceThreshold = Math.floor(maxIterations * 0.85);
     if (config.role === "explorer" && iteration >= convergenceThreshold) {

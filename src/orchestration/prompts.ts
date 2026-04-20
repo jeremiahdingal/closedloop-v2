@@ -128,6 +128,7 @@ export function builderToolingPrompt(ticket: TicketRecord, packet: TicketContext
     `Prior test failures: ${(packet.priorTestFailures ?? []).join("; ") || "(none)"}`,
     "CRITICAL: You MUST make actual code changes. Do NOT decide that existing code is sufficient without reading the relevant files first.",
     "If ANY acceptance criterion is not fully met, you MUST write code to address it. Vague statements like 'existing implementation satisfies' are not acceptable.",
+    "If ALL acceptance criteria are already met (you verified by reading the actual files), produce an empty operations array and explain in the summary. Do NOT write identity transforms.",
     "NEVER output 'retry_builder' or 'no changes needed'. If genuinely complete, write a trivial change and explain which criteria were already met.",
     "Make the smallest safe set of changes needed.",
     "After you finish, output exactly one FINAL_JSON block and nothing after it.",
@@ -285,6 +286,7 @@ export function coderPrompt(
     "7. If the task is impossible, return an unresolvedBlocker: 'BLOCKED'.",
     "8. Do NOT use 'replace_file' for existing files unless 'allowFullReplace' is true for that path.",
     "9. Every destructive operation (delete/rename) MUST include a 'reason' string.",
+    "10. CRITICAL: If reading the Canonical Edit Packet shows that the file content ALREADY matches what the acceptance criteria require, produce ZERO operations and an empty operations array. Do NOT produce identity transforms where search === replace — these waste cycles and cause no-diff escalation.",
     "Return JSON only with shape:",
     JSON.stringify({
       summary: "brief summary of what you implemented",
@@ -419,7 +421,7 @@ export function doctorPrompt(input: {
     "You are the Agent Doctor.",
     "Return JSON only with shape:",
     JSON.stringify({ decision: "retry_builder", reason: "string" }, null, 2),
-    "Decisions: retry_builder (start over), retry_same_node (retry current agent), escalate (give up)",
+    "Decisions: retry_builder (start over), retry_same_node (retry current agent), escalate (give up), approve (code already satisfies criteria — accept as-is)",
     `Ticket: ${input.ticket.title}`,
     `Current node: ${input.currentNode ?? "unknown"}`,
     `Repeated blockers: ${String(input.repeatedBlockers)}`,
@@ -429,7 +431,7 @@ export function doctorPrompt(input: {
     `Latest review: ${JSON.stringify(input.reviewerVerdict)}`,
     `Latest test summary: ${input.testSummary ?? "(none)"}`,
     "",
-    "Re-run Awareness: This ticket may have been run before. If the coder or builder reported that all acceptance criteria are already satisfied by existing code (look for phrases like 'already exists', 'no changes needed', 'already satisfies' in the review), and the reviewer has no blockers, you should approve rather than escalate."
+    "Re-run Awareness: This ticket may have been run before. If noDiff is true and the coder/explorer reported that all acceptance criteria are already satisfied, you MUST choose 'approve'. Do NOT escalate tickets where the code is already correct."
   ].join("\n\n");
 }
 

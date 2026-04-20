@@ -184,6 +184,56 @@ export class WorkspaceBridge {
     return new PathPolicy(workspace.worktreePath, allowedPaths);
   }
 
+  async cleanupOrphanedWorkspaces(maxAgeHours = 2): Promise<WorkspaceRecord[]> {
+    const cutoffIso = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString();
+    const orphans = this.db.listOrphanedWorkspaces(cutoffIso);
+    const cleaned: WorkspaceRecord[] = [];
+
+    for (const workspace of orphans) {
+      // Skip if still has a valid lease (could be genuinely active)
+      const lease = this.db.getLease("workspace", workspace.id);
+      if (lease && new Date(lease.expiresAt).getTime() > Date.now()) continue;
+
+      console.warn(`[CLEANUP] Removing orphaned workspace ${workspace.id} (ticket=${workspace.ticketId}, age>${maxAgeHours}h, no valid lease)`);
+      try {
+        await this.removeWorkspaceWorktree(workspace);
+        await this.deleteWorkspaceBranch(workspace);
+      } catch (err) {
+        console.error(`[CLEANUP] Failed to remove worktree/branch for ${workspace.id}:`, err);
+      }
+      this.db.updateWorkspace({ workspaceId: workspace.id, status: "cleaned", leaseOwner: null });
+      this.db.deleteLease("workspace", workspace.id);
+      cleaned.push({ ...workspace, status: "cleaned", leaseOwner: null });
+      await this.logAudit("workspace.log", `orphan-cleaned workspace=${workspace.id} branch=${workspace.branchName}`);
+    }
+
+    return cleaned;
+  }
+
+  async cleanupOldWorkspacesForTicket(ticketId: string, keepWorkspaceId?: string): Promise<WorkspaceRecord[]> {
+    const all = this.db.listWorkspacesForTicket(ticketId);
+    const cleaned: WorkspaceRecord[] = [];
+
+    for (const workspace of all) {
+      if (workspace.id === keepWorkspaceId) continue;
+      if (workspace.status === "cleaned") continue;
+
+      console.log(`[CLEANUP] Removing prior workspace ${workspace.id} for ticket ${ticketId} (keeping ${keepWorkspaceId ?? "none"})`);
+      try {
+        await this.removeWorkspaceWorktree(workspace);
+        await this.deleteWorkspaceBranch(workspace);
+      } catch (err) {
+        console.error(`[CLEANUP] Failed to clean workspace ${workspace.id}:`, err);
+      }
+      this.db.updateWorkspace({ workspaceId: workspace.id, status: "cleaned", leaseOwner: null });
+      this.db.deleteLease("workspace", workspace.id);
+      cleaned.push({ ...workspace, status: "cleaned", leaseOwner: null });
+      await this.logAudit("workspace.log", `ticket-rerun-cleaned workspace=${workspace.id} branch=${workspace.branchName}`);
+    }
+
+    return cleaned;
+  }
+
   async acquireWorkspaceLease(workspaceId: string, owner: string): Promise<void> {
     const existing = this.db.getLease("workspace", workspaceId);
     const now = Date.now();

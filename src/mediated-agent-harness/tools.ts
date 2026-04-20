@@ -978,7 +978,7 @@ async function execGlobFiles(
     callId,
     name: "glob_files",
     output: limited.length > 0
-      ? limited.join("\n")
+      ? limited.map(p => p.replace(/\\/g, "/")).join("\n")
       : `No files matched the pattern "${pattern}".`,
     isError: false
   };
@@ -1677,13 +1677,17 @@ export function getAvailableToolsList(role: string): string[] {
 // ─── Simple glob matching fallback ──────────────────────────────────────────
 
 function matchGlob(filePath: string, pattern: string): boolean {
+  // Normalize to forward slashes for cross-platform matching (Windows uses backslashes)
+  const normalized = filePath.replace(/\\/g, "/");
+  const normalizedPattern = pattern.replace(/\\/g, "/");
+
   // Convert simple glob to regex
-  const regex = pattern
+  const regex = normalizedPattern
     .replace(/\./g, "\\.")
     .replace(/\*\*/g, "<<GLOBSTAR>>")
     .replace(/\*/g, "[^/]*")
     .replace(/<<GLOBSTAR>>/g, ".*")
     .replace(/\?/g, "[^/]");
 
-  return new RegExp(`^${regex}$`).test(filePath);
+  return new RegExp(`^${regex}$`).test(normalized);
 }

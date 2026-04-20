@@ -159,7 +159,7 @@ export class TicketRunner {
       testSummary: z.string().default(""),
       lastDiff: z.string().default(""),
       lastMessage: z.string().default(""),
-      failureDecision: z.enum(["retry_same_node", "blocked", "todo", "escalate"]).default("escalate"),
+      failureDecision: z.enum(["retry_same_node", "blocked", "todo", "escalate", "approve"]).default("escalate"),
       failureReason: z.string().default(""),
       noDiff: z.boolean().default(false),
       explorerOutput: z.any().default(null),
@@ -241,24 +241,66 @@ export class TicketRunner {
         this.heartbeat(runId, ticket.id, "explorer", `Seeded ${seedFiles.length} related files: ${seedFiles.slice(0, 5).join(', ')}`);
       }
 
-      const explorerRaw = await this.gateway.runExplorerInWorkspace!({
-        cwd: workspace.worktreePath,
-        prompt: explorerPrompt(ticket, { reviewBlockers: state.reviewBlockers, priorTestFailures: state.testHistory } as any, seedFiles),
-        runId, ticketId: ticket.id, epicId: ticket.epicId,
-        onStream: (evt: any) => {
-          evt.runId = runId;
-          evt.ticketId = ticket.id;
-          evt.epicId = ticket.epicId;
-          this.recordAgentStream(evt);
-        }
-      });
+      const MAX_EXPLORER_RETRIES = 2;
+      const REQUIRED_FIELDS = ["summary", "relevantFiles", "recommendedFilesForCoding"];
+      let explorerOutput: any = null;
+      let lastExplorerRaw = "";
 
-      let explorerOutput;
-      try {
-        explorerOutput = JSON.parse(explorerRaw);
-      } catch {
-        this.heartbeat(runId, ticket.id, "system", "Explorer output was not valid JSON. Retrying...");
-        return { status: "building" as const, lastMessage: "Explorer output invalid, retrying..." };
+      for (let attempt = 0; attempt <= MAX_EXPLORER_RETRIES; attempt++) {
+        const retryNudge = attempt > 0
+          ? `\n\n[SYSTEM WARNING] Your previous output was NOT valid JSON or was missing required fields. You MUST return ONLY a raw JSON object (no markdown, no code fences) with these fields: ${REQUIRED_FIELDS.join(", ")}. Do NOT wrap it in backticks. Output the JSON object directly.`
+          : "";
+        const prompt = explorerPrompt(ticket, { reviewBlockers: state.reviewBlockers, priorTestFailures: state.testHistory } as any, seedFiles) + retryNudge;
+
+        const explorerRaw = await this.gateway.runExplorerInWorkspace!({
+          cwd: workspace.worktreePath,
+          prompt,
+          runId, ticketId: ticket.id, epicId: ticket.epicId,
+          onStream: (evt: any) => {
+            evt.runId = runId;
+            evt.ticketId = ticket.id;
+            evt.epicId = ticket.epicId;
+            this.recordAgentStream(evt);
+          }
+        });
+        lastExplorerRaw = explorerRaw;
+
+        // Strip markdown code fences if present
+        let cleaned = explorerRaw.trim();
+        if (cleaned.startsWith("```")) {
+          cleaned = cleaned.replace(/^\`\`\`[a-z]*\n?/, "").replace(/\`\`\`$/, "");
+        }
+
+        try {
+          explorerOutput = JSON.parse(cleaned);
+        } catch {
+          if (attempt < MAX_EXPLORER_RETRIES) {
+            this.heartbeat(runId, ticket.id, "system", `Explorer output was not valid JSON (attempt ${attempt + 1}/${MAX_EXPLORER_RETRIES + 1}). Retrying with corrective nudge...`);
+            continue;
+          }
+          this.heartbeat(runId, ticket.id, "system", "Explorer output was not valid JSON after retries. Skipping to builder.");
+          return { status: "building" as const, lastMessage: "Explorer output invalid after retries", explorerOutput: null };
+        }
+
+        // Validate required fields
+        const missingFields = REQUIRED_FIELDS.filter(f => !explorerOutput?.[f]);
+        if (missingFields.length > 0) {
+          if (attempt < MAX_EXPLORER_RETRIES) {
+            this.heartbeat(runId, ticket.id, "system", `Explorer JSON missing fields: ${missingFields.join(", ")} (attempt ${attempt + 1}/${MAX_EXPLORER_RETRIES + 1}). Retrying...`);
+            explorerOutput = null;
+            continue;
+          }
+          this.heartbeat(runId, ticket.id, "system", `Explorer JSON missing fields: ${missingFields.join(", ")}. Using partial output.`);
+          // Fill defaults for missing fields so downstream doesn't crash
+          for (const f of missingFields) {
+            if (f === "summary") explorerOutput.summary = lastExplorerRaw;
+            else if (f === "relevantFiles") explorerOutput.relevantFiles = [];
+            else if (f === "recommendedFilesForCoding") explorerOutput.recommendedFilesForCoding = [];
+          }
+        }
+
+        // Valid output — break retry loop
+        break;
       }
       this.heartbeat(runId, ticket.id, "explorer", "Explorer complete.");
       return {
@@ -745,6 +787,18 @@ export class TicketRunner {
         // currentNode derived from status // status in state matches current role/node
       });
       console.log(`[TICKET ${ticket.id}] Doctor decision: ${failure.decision} - ${failure.reason}`);
+      if (failure.decision === "approve") {
+        const diffResult = await this.bridge.gitDiff(state.workspaceId);
+        console.log(`[TICKET ${ticket.id}] Doctor approved (code already satisfies criteria).`);
+        return {
+          failureDecision: "approve",
+          failureReason: failure.reason,
+          lastMessage: failure.reason,
+          lastDiff: diffResult || "",
+          status: "reviewing" as const,
+          reviewApproved: true,
+        } satisfies Partial<TicketGraphState>;
+      }
       return {
         failureDecision: failure.decision,
         failureReason: failure.reason,
@@ -894,10 +948,11 @@ export class TicketRunner {
       .addConditionalEdges(
         "classify",
         (state: TicketGraphState) => {
+          if (state.failureDecision === "approve") return "finalize_success";
           if (["escalate", "blocked", "todo"].includes(state.failureDecision)) return "finalize_escalated";
           return "finalize_failed";
         },
-        ["finalize_escalated", "finalize_failed"]
+        ["finalize_success", "finalize_escalated", "finalize_failed"]
       )
       .addEdge("finalize_success", END)
       .addEdge("finalize_escalated", END)
@@ -1045,10 +1100,18 @@ export class TicketRunner {
             noDiff: true,
             infraFailure: false
           });
-          if (failure.decision === "escalate") return await this.escalate(runId, workspace.id, ticket.id, "Builder produced no diff.");
-          packet.reviewBlockers = [`No diff detected after build attempt ${buildAttempts}.`];
-          blockHistory.push(packet.reviewBlockers.join("; "));
-          continue;
+          if (failure.decision === "approve") {
+            console.log(`[TICKET ${ticket.id}] Doctor approved (code already satisfies criteria) in legacy path.`);
+            lastDiff = builderResult.lastDiff || "";
+            reviewVerdict = { approved: true, blockers: [], suggestions: [], riskLevel: "low" };
+            // Fall through to test/success path below
+          } else if (failure.decision === "escalate") {
+            return await this.escalate(runId, workspace.id, ticket.id, "Builder produced no diff.");
+          } else {
+            packet.reviewBlockers = [`No diff detected after build attempt ${buildAttempts}.`];
+            blockHistory.push(packet.reviewBlockers.join("; "));
+            continue;
+          }
         }
 
         this.heartbeat(runId, ticket.id, "reviewer", "Reviewing diff.");

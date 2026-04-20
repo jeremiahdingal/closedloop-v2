@@ -77,6 +77,12 @@ export async function verifyAndApplyEdits(
           console.warn(`[VERIFIER] SHA256 mismatch for ${op.path} — attempting relaxed application (search block validation)`);
         }
 
+        // Skip identity transforms (search === replace) — no actual change needed
+        if (op.search === op.replace) {
+          console.warn(`[VERIFIER] Skipping identity transform for ${op.path} (search === replace)`);
+          continue;
+        }
+
         // Apply search/replace
         const index = currentContent.indexOf(op.search);
         if (index === -1) {

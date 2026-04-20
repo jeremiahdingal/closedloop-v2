@@ -144,7 +144,7 @@ export type GoalReview = {
 };
 
 export type FailureDecision = {
-  decision: "retry_same_node" | "retry_builder" | "blocked" | "todo" | "escalate";
+  decision: "retry_same_node" | "retry_builder" | "blocked" | "todo" | "escalate" | "approve";
   reason: string;
 };
 

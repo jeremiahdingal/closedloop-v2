@@ -1,6 +1,27 @@
 type ToolMode = "native" | "xml";
 
-function commonToolsGuidance(toolMode: ToolMode): string {
+const READ_ONLY_TOOLS = [
+  "glob_files(pattern: string)",
+  "grep_files(pattern: string)",
+  "list_dir(path: string)",
+  "read_file(path: string)",
+  "read_files(paths: string[])",
+  "web_search(query: string)",
+  "semantic_search(query: string)",
+  "finish(summary: string, result: string)",
+];
+
+const ALL_TOOLS = [
+  ...READ_ONLY_TOOLS.slice(0, -1), // everything except finish (we add it back)
+  "write_file(path: string, content: string)",
+  "write_files(files: {path: string, content: string}[])",
+  "git_diff()",
+  "git_status()",
+  "run_command(name: string)  // whitelisted names include test, lint, typecheck, build, status",
+  "finish(summary: string, result: string)",
+];
+
+function commonToolsGuidance(toolMode: ToolMode, readOnly = false): string {
   const formatBlock = toolMode === "xml"
     ? [
         "## Tool Call Format (CRITICAL)",
@@ -23,6 +44,8 @@ function commonToolsGuidance(toolMode: ToolMode): string {
     ? "4. The 'finish' tool requires 'summary' (string) and 'result' (JSON string)."
     : "4. When you are done, call the native 'finish' tool with 'summary' (string) and 'result' (JSON string).";
 
+  const toolList = readOnly ? READ_ONLY_TOOLS : ALL_TOOLS;
+
   return [
     formatBlock,
     "",
@@ -37,19 +60,7 @@ function commonToolsGuidance(toolMode: ToolMode): string {
     "",
     "## Tools",
     "",
-    "- glob_files(pattern: string)",
-    "- grep_files(pattern: string)",
-    "- list_dir(path: string)",
-    "- read_file(path: string)",
-    "- read_files(paths: string[])",
-    "- write_file(path: string, content: string)",
-    "- write_files(files: {path: string, content: string}[])",
-    "- git_diff()",
-    "- git_status()",
-    "- run_command(name: string)  // whitelisted names include test, lint, typecheck, build, status",
-    "- web_search(query: string)",
-    "- semantic_search(query: string)",
-    "- finish(summary: string, result: string)",
+    ...toolList.map(t => `- ${t}`),
   ].join("\n");
 }
 
@@ -230,8 +241,44 @@ Workspace: ${workspaceRoot}
 ${commonToolsGuidance(toolMode)}`;
 }
 
+export function explorerHarnessPrompt(workspaceRoot: string, toolMode: ToolMode = "native"): string {
+  return `You are the Explorer agent. Your ONLY job is to READ and ANALYZE the codebase.
+You must NOT write, modify, create, or delete any files.
+
+YOUR JOB:
+1. Discover relevant files using ${toolExample(toolMode, "glob_files")}, ${toolExample(toolMode, "grep_files")}, and ${toolExample(toolMode, "list_dir")}
+2. Read file contents using ${toolExample(toolMode, "read_file")} or ${toolExample(toolMode, "read_files")}
+3. Use ${toolExample(toolMode, "semantic_search")} or ${toolExample(toolMode, "web_search")} for broader context
+4. Call: ${toolExample(toolMode, "finish")} with a structured analysis
+
+## Rules
+- MAX 20 tool calls
+- You are READ-ONLY. You must NOT call write_file, write_files, remove_file, or any mutation tool.
+- Do NOT output code blocks in your summary or result. Output only a JSON analysis.
+- Do NOT attempt to implement changes. Your job ends at analysis.
+- Do NOT output file contents verbatim — summarize patterns and key findings instead.
+- Use explore_mode to batch multiple read calls efficiently.
+- When you have gathered enough context, call finish immediately.
+
+## Finish Output
+Call ${toolExample(toolMode, "finish")} with JSON:
+{
+  "summary": "brief analysis of the codebase relevant to the task",
+  "relevantFiles": ["list of files that are relevant"],
+  "recommendedFilesForCoding": ["files that should be modified"],
+  "keyPatterns": ["coding patterns and conventions found"],
+  "unresolvedBlockers": ["any blockers discovered, or empty array"]
+}
+
+Workspace: ${workspaceRoot}
+
+${commonToolsGuidance(toolMode, true)}`;
+}
+
 export function getPromptForRole(role: string, workspaceRoot: string, toolMode: ToolMode = "native"): string {
   switch (role) {
+    case "explorer":
+      return explorerHarnessPrompt(workspaceRoot, toolMode);
     case "epicDecoder":
       return epicDecoderPrompt(workspaceRoot, toolMode);
     case "epicReviewer":
