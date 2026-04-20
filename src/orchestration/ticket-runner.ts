@@ -369,6 +369,22 @@ export class TicketRunner {
         console.warn(`[VERIFY] ${ticket.id} applied ${verificationResult.appliedOperations.length} ops but no diff produced`);
       }
 
+      // Coder produced 0 ops ("already satisfied") — check if workspace already has a diff from a previous run
+      if (verificationResult.outcome === "empty_failure" || verificationResult.outcome === "escalate") {
+        const existingDiff = await this.bridge.gitDiff(workspace.id);
+        if (existingDiff && existingDiff.trim()) {
+          console.log(`[VERIFY] ${ticket.id} coder produced 0 ops but workspace has existing diff — treating as already-complete`);
+          this.heartbeat(runId, ticket.id, "coder", "No new operations needed — workspace already contains changes. Proceeding to review.");
+          return {
+            verificationResult,
+            lastDiff: existingDiff,
+            noDiff: false,
+            lastMessage: "Coder determined no changes needed; workspace already contains prior changes matching ticket criteria.",
+            status: "reviewing" as const,
+          } satisfies Partial<TicketGraphState>;
+        }
+      }
+
       // Complete failure, escalate, or empty — signal noDiff
       return {
         verificationResult,
