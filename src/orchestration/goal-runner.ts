@@ -584,205 +584,157 @@ export class GoalRunner {
   private async runEpicReview(epic: EpicRecord, tickets: TicketRecord[], runId: string): Promise<GoalReview> {
     this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting epic review with ${tickets.length} tickets`, runId, epicId: epic.id, sequence: 0 });
 
-    // ── 1. Create review workspace and merge all ticket branches ──
-    const reviewWorkspace = await this.bridge.createWorkspace({ ticketId: `${epic.id}__EPIC_REVIEW`, runId, owner: runId, targetDir: epic.targetDir });
-    await this.bridge.acquireWorkspaceLease(reviewWorkspace.id, runId);
-    try {
-      for (const ticket of tickets) {
-        const workspaces = this.db.listWorkspacesForTicket(ticket.id);
-        if (workspaces.length > 0) {
-          try {
-            await this.bridge.mergeTicketBranchIntoEpic(reviewWorkspace.id, workspaces[0].branchName);
-          } catch (err) {
-            console.warn(`Merge failed for ${ticket.id}: ${err}`);
-          }
-        }
-      }
-
-      // ── 2. Collect git diffs from each ticket's workspace ──
-      const ticketDiffs = new Map<string, string>();
-      for (const ticket of tickets) {
-        const workspaces = this.db.listWorkspacesForTicket(ticket.id);
-        if (workspaces.length > 0) {
-          try {
-            const diff = await this.bridge.gitDiff(workspaces[0].id);
+    // ── 1. Collect diffs from each ticket's workspaces (local, no remote fetch) ──
+    const ticketDiffs = new Map<string, string>();
+    for (const ticket of tickets) {
+      const workspaces = this.db.listWorkspacesForTicket(ticket.id);
+      // Find the workspace that actually has changes (head_commit !== base_commit)
+      const wsWithChanges = workspaces.find(ws => ws.headCommit && ws.headCommit !== ws.baseCommit);
+      if (wsWithChanges) {
+        try {
+          // Get diff by commit range in the worktree
+          const { execSync } = await import('node:child_process');
+          const diff = execSync(
+            `git diff ${wsWithChanges.baseCommit}..${wsWithChanges.headCommit}`,
+            { cwd: wsWithChanges.worktreePath, maxBuffer: 10 * 1024 * 1024 }
+          ).toString('utf8');
+          if (diff.trim()) {
             ticketDiffs.set(ticket.id, diff);
+            console.log(`Collected diff for ${ticket.id}: ${diff.split('\n').length} lines`);
+          }
+        } catch (err) {
+          console.warn(`Failed to get commit diff for ${ticket.id}: ${err}`);
+        }
+      } else {
+        // Try gitDiff on active workspaces (may have unstaged changes)
+        const activeWs = workspaces.find(ws => ws.status === 'active');
+        if (activeWs) {
+          try {
+            const diff = await this.bridge.gitDiff(activeWs.id);
+            if (diff.trim()) {
+              ticketDiffs.set(ticket.id, diff);
+              console.log(`Collected unstaged diff for ${ticket.id}: ${diff.split('\n').length} lines`);
+            }
           } catch (err) {
             console.warn(`Failed to get diff for ${ticket.id}: ${err}`);
           }
         }
       }
+    }
 
-      // ── 3. Load review packets for all tickets (especially failing ones) ──
-      const reviewPackets = new Map<string, TicketEpicReviewPacket>();
-      for (const ticket of tickets) {
-        const packet = await this.loadEpicReviewPacket(ticket.id);
-        if (packet) {
-          reviewPackets.set(ticket.id, packet);
-        }
+    // ── 2. Load review packets for all tickets (especially failing ones) ──
+    const reviewPackets = new Map<string, TicketEpicReviewPacket>();
+    for (const ticket of tickets) {
+      const packet = await this.loadEpicReviewPacket(ticket.id);
+      if (packet) {
+        reviewPackets.set(ticket.id, packet);
       }
+    }
 
-      // ── 4. Build context ──
-      const ragCtx = await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`, "epic-reviewer");
-      const projectStructure = await ensureProjectStructureFile(epic.targetDir).catch(() => null);
+    // ── 3. Build context ──
+    const ragCtx = await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`, "epic-reviewer");
+    const projectStructure = await ensureProjectStructureFile(epic.targetDir).catch(() => null);
 
-      const useDirectCli = Boolean(this.gateway.runGoalReviewInWorkspace);
+    const useDirectCli = Boolean(this.gateway.runGoalReviewInWorkspace);
 
-      this.recordAgentStream({
-        agentRole: "epicReviewer", source: "orchestrator", streamKind: "status",
-        content: `Reviewing epic: ${epic.title} (${tickets.length} tickets) via ${useDirectCli ? "direct CLI" : "direct LLM"}`,
-        runId, epicId: epic.id, sequence: 1,
-      });
+    this.recordAgentStream({
+      agentRole: "epicReviewer", source: "orchestrator", streamKind: "status",
+      content: `Reviewing epic: ${epic.title} (${tickets.length} tickets, ${ticketDiffs.size} with diffs) via ${useDirectCli ? "direct CLI" : "direct LLM"}`,
+      runId, epicId: epic.id, sequence: 1,
+    });
 
-      // ── 5. Build the unified prompt with diffs and review packets ──
-      const basePrompt = epicReviewerDirectCliPrompt({
-        epic,
-        tickets,
-        ticketDiffs,
-        reviewPackets,
-        ragContext: ragCtx ?? undefined,
-        projectStructure,
-        targetBranch: epic.targetBranch,
-      });
+    // ── 4. Build the unified prompt with diffs and review packets ──
+    const basePrompt = epicReviewerDirectCliPrompt({
+      epic,
+      tickets,
+      ticketDiffs,
+      reviewPackets,
+      ragContext: ragCtx ?? undefined,
+      projectStructure,
+      targetBranch: epic.targetBranch,
+    });
 
-      const MAX_RETRIES = 2;
-      let lastReview: GoalReview | null = null;
-      let lastError: string | null = null;
+    const MAX_RETRIES = 2;
+    let lastReview: GoalReview | null = null;
+    let lastError: string | null = null;
 
-      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        try {
-          // Build retry context into prompt if this is a retry
-          const retryPrompt: string = (attempt > 0 && lastReview)
-            ? basePrompt + "\n\nPREVIOUS REVIEW ATTEMPT:\n" +
-              `Verdict: ${lastReview.verdict}\nSummary: ${lastReview.summary}\n` +
-              (lastError ? `Error: ${lastError}\n` : "") +
-              "You MUST fix the identified issues directly. If you cannot fix them, return verdict 'needs_followups' with followupTickets."
-            : basePrompt;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const retryPrompt: string = (attempt > 0 && lastReview)
+          ? basePrompt + "\n\nPREVIOUS REVIEW ATTEMPT:\n" +
+            `Verdict: ${lastReview.verdict}\nSummary: ${lastReview.summary}\n` +
+            (lastError ? `Error: ${lastError}\n` : "") +
+            "You MUST fix the identified issues directly. If you cannot fix them, return verdict 'needs_followups' with followupTickets."
+          : basePrompt;
 
-          if (attempt > 0) {
-            this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Review retry attempt ${attempt}/${MAX_RETRIES}. Previous verdict: ${lastReview?.verdict ?? "unknown"}`, runId, epicId: epic.id, sequence: 2 + attempt * 2 });
-          }
+        if (attempt > 0) {
+          this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Review retry attempt ${attempt}/${MAX_RETRIES}. Previous verdict: ${lastReview?.verdict ?? "unknown"}`, runId, epicId: epic.id, sequence: 2 + attempt * 2 });
+        }
 
-          // ── 6. Call the reviewer via direct CLI or fallback to direct LLM ──
-          const review: GoalReview = useDirectCli
-            ? await this.gateway.runGoalReviewInWorkspace!({
-                cwd: reviewWorkspace.worktreePath,
-                prompt: retryPrompt,
-                runId,
-                epicId: epic.id,
-                onStream: (event) => this.recordAgentStream(event),
-                ragIndexId: ragCtx?.indexId ?? undefined,
-                db: this.db,
-              })
-            : await this.gateway.getGoalReview(retryPrompt);
+        // ── 5. Call the reviewer ──
+        const review: GoalReview = useDirectCli
+          ? await this.gateway.runGoalReviewInWorkspace!({
+              cwd: epic.targetDir,
+              prompt: retryPrompt,
+              runId,
+              epicId: epic.id,
+              onStream: (event) => this.recordAgentStream(event),
+              ragIndexId: ragCtx?.indexId ?? undefined,
+              db: this.db,
+            })
+          : await this.gateway.getGoalReview(retryPrompt);
 
-          lastReview = review;
+        lastReview = review;
 
-          if (review.verdict === "approved") {
-            // ── 7. Push reviewer fixes to the epic's targetBranch ──
-            await this.pushReviewerFixesToTargetBranch(reviewWorkspace, epic, runId);
-            this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: review.summary, runId, epicId: epic.id, sequence: 3 + attempt * 2, done: true });
-            return review;
-          }
-
-          // Review found issues — if we have retries left, loop again to try fixing
-          if (attempt < MAX_RETRIES) {
-            this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: `Review found issues (verdict: ${review.verdict}). Retrying with fixes...`, runId, epicId: epic.id, sequence: 4 + attempt * 2 });
-            lastError = review.summary;
-            continue;
-          }
-
-          // Final attempt — push whatever fixes were applied, then fail forward
-          await this.pushReviewerFixesToTargetBranch(reviewWorkspace, epic, runId);
-
-          if (review.followupTickets && review.followupTickets.length > 0) {
-            this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Creating ${review.followupTickets.length} followup tickets to address remaining issues.`, runId, epicId: epic.id, sequence: 3 + MAX_RETRIES * 2 });
-            for (const ft of review.followupTickets) {
-              this.db.createTicket({
-                id: `${epic.id}__${ft.id}`,
-                epicId: epic.id,
-                title: ft.title,
-                description: ft.description,
-                acceptanceCriteria: ft.acceptanceCriteria,
-                dependencies: ft.dependencies ?? [],
-                allowedPaths: ft.allowedPaths ?? [],
-                status: "queued",
-                priority: ft.priority ?? "medium",
-                metadata: {},
-                prUrl: null,
-              });
-            }
-          }
-
-          this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Review completed after ${attempt + 1} attempts. Verdict: ${review.verdict}. ${review.summary}`, runId, epicId: epic.id, sequence: 4 + MAX_RETRIES * 2, done: true });
+        if (review.verdict === "approved") {
+          this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: review.summary, runId, epicId: epic.id, sequence: 3 + attempt * 2, done: true });
           return review;
+        }
 
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          lastError = msg;
-          this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Review attempt ${attempt + 1} error: ${msg}`, runId, epicId: epic.id, sequence: 2 + attempt * 2 });
-          if (attempt >= MAX_RETRIES) {
-            throw err;
+        if (attempt < MAX_RETRIES) {
+          this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: `Review found issues (verdict: ${review.verdict}). Retrying with fixes...`, runId, epicId: epic.id, sequence: 4 + attempt * 2 });
+          lastError = review.summary;
+          continue;
+        }
+
+        // Final attempt — push whatever fixes were applied
+        if (review.followupTickets && review.followupTickets.length > 0) {
+          this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Creating ${review.followupTickets.length} followup tickets to address remaining issues.`, runId, epicId: epic.id, sequence: 3 + MAX_RETRIES * 2 });
+          for (const ft of review.followupTickets) {
+            this.db.createTicket({
+              id: `${epic.id}__${ft.id}`,
+              epicId: epic.id,
+              title: ft.title,
+              description: ft.description,
+              acceptanceCriteria: ft.acceptanceCriteria,
+              dependencies: ft.dependencies ?? [],
+              allowedPaths: ft.allowedPaths ?? [],
+              status: "queued",
+              priority: ft.priority ?? "medium",
+              metadata: {},
+              prUrl: null,
+            });
           }
         }
+
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Review completed after ${attempt + 1} attempts. Verdict: ${review.verdict}. ${review.summary}`, runId, epicId: epic.id, sequence: 4 + MAX_RETRIES * 2, done: true });
+        return review;
+
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        lastError = msg;
+        this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Review attempt ${attempt + 1} error: ${msg}`, runId, epicId: epic.id, sequence: 2 + attempt * 2 });
+        if (attempt >= MAX_RETRIES) {
+          throw err;
+        }
       }
-
-      // Safety fallback
-      return lastReview ?? { verdict: "failed", summary: lastError ?? "Review failed after all attempts", followupTickets: [] };
-    } finally {
-      await this.bridge.archiveWorkspace(reviewWorkspace.id);
-      this.bridge.releaseLease("workspace", reviewWorkspace.id);
     }
+
+    return lastReview ?? { verdict: "failed", summary: lastError ?? "Review failed after all attempts", followupTickets: [] };
   }
 
-  /**
-   * After the reviewer applies fixes in the review workspace, push those
-   * changes to the epic's targetBranch on the remote.
-   */
-  private async pushReviewerFixesToTargetBranch(
-    reviewWorkspace: { id: string; worktreePath: string },
-    epic: EpicRecord,
-    runId: string,
-  ): Promise<void> {
-    if (!epic.targetBranch) return;
 
-    try {
-      // Check if the reviewer made any changes
-      const diff = await this.bridge.gitDiff(reviewWorkspace.id);
-      if (!diff.trim()) return;
 
-      // Commit the reviewer's fixes
-      await git(reviewWorkspace.worktreePath, ["add", "-A"]);
-      await git(reviewWorkspace.worktreePath, ["commit", "-m", `epic-review-fixes: ${epic.title}`]);
-
-      // Push to the epic's target branch
-      const remoteRef = await this.bridge.gitPushToBranch({
-        workspaceId: reviewWorkspace.id,
-        targetBranch: epic.targetBranch,
-      });
-
-      this.recordAgentStream({
-        agentRole: "epicReviewer",
-        source: "orchestrator",
-        streamKind: "assistant",
-        content: `Pushed review fixes to ${remoteRef}`,
-        runId,
-        epicId: epic.id,
-        done: false,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`Failed to push review fixes to targetBranch: ${msg}`);
-      this.recordAgentStream({
-        agentRole: "epicReviewer",
-        source: "orchestrator",
-        streamKind: "stderr",
-        content: `Failed to push fixes to ${epic.targetBranch}: ${msg}`,
-        runId,
-        epicId: epic.id,
-      });
-    }
-  }
 
   private recordAgentStream(event: AgentStreamPayload): void {
     this.db.recordEvent({ aggregateType: event.ticketId ? "ticket" : "epic", aggregateId: event.ticketId ?? event.epicId ?? event.runId ?? "stream", runId: event.runId ?? null, ticketId: event.ticketId ?? null, kind: "agent_stream", message: `${event.agentRole}:${event.streamKind}`, payload: event as any });
