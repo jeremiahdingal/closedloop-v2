@@ -2,7 +2,7 @@
 import { dirname } from "node:path";
 import { AppDatabase } from "../db/database.ts";
 import { randomId, nowIso, sleep } from "../utils.ts";
-import { epicDecoderPrompt, epicDecoderToolingPrompt, epicReviewerPrompt, epicReviewerToolingPrompt, epicReviewerCodexPrompt, epicReviewerBuildFixPrompt } from "./prompts.ts";
+import { epicDecoderPrompt, epicDecoderToolingPrompt, epicReviewerPrompt, epicReviewerToolingPrompt, epicReviewerCodexPrompt, epicReviewerBuildFixPrompt, epicReviewerDirectCliPrompt } from "./prompts.ts";
 import type { ModelGateway } from "./models.ts";
 import type { AgentStreamPayload, EpicRecord, GoalDecomposition, GoalReview, GoalTicketPlan, TicketEpicReviewPacket, TicketRecord } from "../types.ts";
 import { TicketRunner } from "./ticket-runner.ts";
@@ -447,14 +447,15 @@ export class GoalRunner {
 
     const finalizeGoal = async (state: GoalGraphState) => {
       const approved = state.reviewVerdict === "approved";
-      this.db.updateEpicStatus(epic.id, approved ? "done" : "failed");
+      const failForward = state.reviewVerdict === "needs_followups";
+      this.db.updateEpicStatus(epic.id, (approved || failForward) ? "done" : "failed");
       this.db.updateRun({
         runId,
-        status: approved ? "succeeded" : "failed",
+        status: (approved || failForward) ? "succeeded" : "failed",
         currentNode: "complete",
         heartbeatAt: nowIso(),
         lastMessage: state.reviewSummary,
-        errorText: approved ? null : state.reviewSummary
+        errorText: (approved || failForward) ? null : state.reviewSummary
       });
       this.db.recordEvent({
         aggregateType: "epic",
@@ -533,8 +534,11 @@ export class GoalRunner {
       const review = await this.withEpicHeartbeat(runId, epic.id, "goal_review", "Reviewing epic.", () => this.runEpicReview(epic, finalTickets, runId));
       legacyFinalized = true;
       const approved = review.verdict === "approved";
-      this.db.updateEpicStatus(epic.id, approved ? "done" : "failed");
-      this.db.updateRun({ runId, status: approved ? "succeeded" : "failed", currentNode: "complete", heartbeatAt: nowIso(), lastMessage: review.summary, errorText: approved ? null : review.summary });
+      const failForward = review.verdict === "needs_followups";
+      this.db.updateEpicStatus(epic.id, (approved || failForward) ? "done" : "failed");
+      const runStatus = approved ? "succeeded" : failForward ? "succeeded" : "failed";
+      this.db.updateRun({ runId, status: runStatus, currentNode: "complete", heartbeatAt: nowIso(), lastMessage: review.summary, errorText: (approved || failForward) ? null : review.summary });
+      this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Epic review ${approved ? "approved" : failForward ? "approved with followups" : "rejected"}: ${review.summary}`, runId, epicId: epic.id, sequence: 3, done: true });
     } catch (error) {
       if (error instanceof EpicCancelledError) return;
       if (!legacyFinalized) {
@@ -577,22 +581,217 @@ export class GoalRunner {
     return this.gateway.getGoalDecomposition(epicDecoderPrompt(epic));
   }
 
-  private async runEpicReview(epic: EpicRecord, tickets: TicketRecord[], runId: string): Promise<GoalReview> {
-    const reviewWorkspace = await this.bridge.createWorkspace({ ticketId: `${epic.id}__EPIC_REVIEW`, runId, owner: runId, targetDir: epic.targetDir });
+private async runEpicReview(epic: EpicRecord, tickets: TicketRecord[], runId: string): Promise<GoalReview> {
+    this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting goal review with ${tickets.length} tickets`, runId, epicId: epic.id, sequence: 0 });
+
+    const reviewWorkspace = await this.bridge.createWorkspace({
+      ticketId: `${epic.id}__EPIC_REVIEW`,
+      runId,
+      owner: runId,
+      targetDir: epic.targetDir,
+    });
     await this.bridge.acquireWorkspaceLease(reviewWorkspace.id, runId);
+
     try {
+      // ── 1. Merge all ticket branches into the review workspace ──
       for (const ticket of tickets) {
         const workspaces = this.db.listWorkspacesForTicket(ticket.id);
         if (workspaces.length > 0) {
-          try { await this.bridge.mergeTicketBranchIntoEpic(reviewWorkspace.id, workspaces[0].branchName); } catch (err) { console.warn(`Merge failed for ${ticket.id}: ${err}`); }
+          try {
+            await this.bridge.mergeTicketBranchIntoEpic(reviewWorkspace.id, workspaces[0].branchName);
+          } catch (err) {
+            console.warn(`Merge failed for ${ticket.id}: ${err}`);
+          }
         }
       }
+
+      // ── 2. Capture per-ticket diffs from their workspaces ──
+      const ticketDiffs = new Map<string, string>();
+      for (const ticket of tickets) {
+        const workspaces = this.db.listWorkspacesForTicket(ticket.id);
+        if (workspaces.length > 0) {
+          try {
+            const diff = await this.bridge.gitDiff(workspaces[0].id);
+            if (diff.trim()) {
+              ticketDiffs.set(ticket.id, diff);
+            }
+          } catch (err) {
+            console.warn(`Diff capture failed for ${ticket.id}: ${err}`);
+          }
+        }
+      }
+
+      // ── 3. Load review packets for failing/problematic tickets ──
+      const reviewPackets = new Map<string, TicketEpicReviewPacket>();
+      for (const ticket of tickets) {
+        const packet = await this.loadEpicReviewPacket(ticket.id);
+        if (packet) {
+          reviewPackets.set(ticket.id, packet);
+        }
+      }
+
+      // ── 4. Build RAG context and project structure ──
       const ragCtx = await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`, "epic-reviewer");
       const projectStructure = await ensureProjectStructureFile(epic.targetDir).catch(() => null);
-      return await this.gateway.getGoalReview(epicReviewerPrompt(epic, tickets));
+
+      // ── 5. Build the unified direct-CLI prompt with all context ──
+      const prompt = epicReviewerDirectCliPrompt({
+        epic,
+        tickets,
+        ticketDiffs,
+        reviewPackets,
+        ragContext: ragCtx ?? undefined,
+        projectStructure,
+        targetBranch: epic.targetBranch,
+      });
+
+      const useTooling = Boolean(this.gateway.runGoalReviewInWorkspace);
+      this.recordAgentStream({
+        agentRole: "epicReviewer",
+        source: "orchestrator",
+        streamKind: "status",
+        content: `Reviewing epic: ${epic.title} (${tickets.length} tickets, ${ticketDiffs.size} with diffs, ${reviewPackets.size} with review packets) via ${useTooling ? "direct CLI" : "direct LLM"}`,
+        runId,
+        epicId: epic.id,
+        sequence: 1,
+      });
+
+      // ── 6. Run the review with retry ──
+      const MAX_RETRIES = 2;
+      let lastReview: GoalReview | null = null;
+      let lastError: string | null = null;
+
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          const retryPrompt: string = (attempt > 0 && lastReview)
+            ? prompt + "\n\nPREVIOUS REVIEW ATTEMPT FAILED:\n" +
+              `Verdict: ${lastReview.verdict}\nSummary: ${lastReview.summary}\n` +
+              (lastError ? `Error: ${lastError}\n` : "") +
+              "You MUST fix the identified issues directly. If you cannot fix them, return verdict 'needs_followups' with followupTickets."
+            : prompt;
+
+          if (attempt > 0) {
+            this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Review retry attempt ${attempt}/${MAX_RETRIES}. Previous verdict: ${lastReview?.verdict ?? "unknown"}`, runId, epicId: epic.id, sequence: 2 + attempt * 2 });
+          }
+
+          const review: GoalReview = useTooling
+            ? await this.gateway.runGoalReviewInWorkspace!({
+                cwd: reviewWorkspace.worktreePath,
+                prompt: retryPrompt,
+                runId,
+                epicId: epic.id,
+                onStream: (event) => this.recordAgentStream(event),
+                ragIndexId: ragCtx?.indexId ?? undefined,
+                db: this.db,
+              })
+            : await this.gateway.getGoalReview(retryPrompt);
+
+          lastReview = review;
+
+          if (review.verdict === "approved") {
+            // ── 7. Push reviewer fixes to the epic's targetBranch ──
+            await this.pushReviewerFixesToTargetBranch(reviewWorkspace, epic, runId);
+
+            this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: review.summary, runId, epicId: epic.id, sequence: 3 + attempt * 2, done: true });
+            return review;
+          }
+
+          // Review found issues - if we have retries left, loop again
+          if (attempt < MAX_RETRIES) {
+            this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "status", content: `Review found issues (verdict: ${review.verdict}). Retrying with fixes...`, runId, epicId: epic.id, sequence: 4 + attempt * 2 });
+            lastError = review.summary;
+            continue;
+          }
+
+          // Final attempt — push whatever fixes were applied, then fail forward
+          await this.pushReviewerFixesToTargetBranch(reviewWorkspace, epic, runId);
+
+          if (review.followupTickets && review.followupTickets.length > 0) {
+            this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Creating ${review.followupTickets.length} followup tickets to address remaining issues.`, runId, epicId: epic.id, sequence: 3 + MAX_RETRIES * 2 });
+            for (const ft of review.followupTickets) {
+              this.db.createTicket({
+                id: `${epic.id}__${ft.id}`,
+                epicId: epic.id,
+                title: ft.title,
+                description: ft.description,
+                acceptanceCriteria: ft.acceptanceCriteria,
+                dependencies: ft.dependencies ?? [],
+                allowedPaths: ft.allowedPaths ?? [],
+                status: "queued",
+                priority: ft.priority ?? "medium",
+                metadata: {},
+                prUrl: null,
+              });
+            }
+          }
+
+          this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: `Review completed after ${attempt + 1} attempts. Verdict: ${review.verdict}. ${review.summary}`, runId, epicId: epic.id, sequence: 4 + MAX_RETRIES * 2, done: true });
+          return review;
+
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          lastError = msg;
+          this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Review attempt ${attempt + 1} error: ${msg}`, runId, epicId: epic.id, sequence: 2 + attempt * 2 });
+          if (attempt >= MAX_RETRIES) {
+            throw err;
+          }
+        }
+      }
+
+      // Safety fallback
+      return lastReview ?? { verdict: "failed", summary: lastError ?? "Review failed after all attempts", followupTickets: [] };
     } finally {
       await this.bridge.archiveWorkspace(reviewWorkspace.id);
       this.bridge.releaseLease("workspace", reviewWorkspace.id);
+    }
+  }
+
+  /**
+   * After the reviewer applies fixes in the review workspace, push those
+   * changes to the epic's targetBranch on the remote.
+   */
+  private async pushReviewerFixesToTargetBranch(
+    reviewWorkspace: { id: string; worktreePath: string },
+    epic: EpicRecord,
+    runId: string,
+  ): Promise<void> {
+    if (!epic.targetBranch) return;
+
+    try {
+      // Check if the reviewer made any changes
+      const diff = await this.bridge.gitDiff(reviewWorkspace.id);
+      if (!diff.trim()) return;
+
+      // Commit the reviewer's fixes
+      await git(reviewWorkspace.worktreePath, ["add", "-A"]);
+      await git(reviewWorkspace.worktreePath, ["commit", "-m", `epic-review-fixes: ${epic.title}`]);
+
+      // Push to the epic's target branch
+      const remoteRef = await this.bridge.gitPushToBranch({
+        workspaceId: reviewWorkspace.id,
+        targetBranch: epic.targetBranch,
+      });
+
+      this.recordAgentStream({
+        agentRole: "epicReviewer",
+        source: "orchestrator",
+        streamKind: "assistant",
+        content: `Pushed review fixes to ${remoteRef}`,
+        runId,
+        epicId: epic.id,
+        done: false,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`Failed to push review fixes to targetBranch: ${msg}`);
+      this.recordAgentStream({
+        agentRole: "epicReviewer",
+        source: "orchestrator",
+        streamKind: "stderr",
+        content: `Failed to push fixes to ${epic.targetBranch}: ${msg}`,
+        runId,
+        epicId: epic.id,
+      });
     }
   }
 
@@ -689,8 +888,11 @@ export class GoalRunner {
         this.runEpicReview(epic, tickets, runId)
       );
       const approved = review.verdict === "approved";
-      this.db.updateEpicStatus(epic.id, approved ? "done" : "failed");
-      this.db.updateRun({ runId, status: approved ? "succeeded" : "failed", currentNode: "complete", heartbeatAt: nowIso(), lastMessage: review.summary, errorText: approved ? null : review.summary });
+      const failForward = review.verdict === "needs_followups";
+      this.db.updateEpicStatus(epic.id, (approved || failForward) ? "done" : "failed");
+      const runStatus = approved ? "succeeded" : failForward ? "succeeded" : "failed";
+      this.db.updateRun({ runId, status: runStatus, currentNode: "complete", heartbeatAt: nowIso(), lastMessage: review.summary, errorText: (approved || failForward) ? null : review.summary });
+      this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Epic review ${approved ? "approved" : failForward ? "approved with followups" : "rejected"}: ${review.summary}`, runId, epicId: epic.id, sequence: 3, done: true });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       this.db.updateRun({ runId, status: "failed", currentNode: "error", heartbeatAt: nowIso(), lastMessage: msg, errorText: msg });

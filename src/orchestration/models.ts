@@ -829,6 +829,9 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     if (configuredModel === "qwen-cli") {
       return this.qwen.runEpicReviewer({ role: "epicReviewer", ...input });
     }
+    if (configuredModel === "codex-cli") {
+      return this.codex.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
     if (configuredModel.startsWith("opencode:")) {
       return this.opencode.runEpicReviewer({ role: "epicReviewer", ...input });
     }

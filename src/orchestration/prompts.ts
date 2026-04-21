@@ -573,6 +573,146 @@ export function epicReviewerCodexPrompt(
 }
 
 /**
+ * Unified prompt for epic review via direct CLI (codex, gemini, qwen).
+ * Includes actual git diffs from ticket workspaces and reviewer packets for failing tickets.
+ * The reviewer works directly on the merged review workspace and can apply fixes.
+ */
+export function epicReviewerDirectCliPrompt(input: {
+  epic: EpicRecord;
+  tickets: TicketRecord[];
+  ticketDiffs: Map<string, string>;
+  reviewPackets: Map<string, TicketEpicReviewPacket>;
+  ragContext?: { codeContext: string; docContext: string } | null;
+  projectStructure?: string | null;
+  targetBranch?: string | null;
+}): string {
+  const { epic, tickets, ticketDiffs, reviewPackets, ragContext, projectStructure, targetBranch } = input;
+
+  const ticketSections = tickets.map(t => {
+    const diff = ticketDiffs.get(t.id);
+    const packet = reviewPackets.get(t.id);
+    const criteria = t.acceptanceCriteria.map(c => `  - ${c}`).join("\n");
+    const paths = t.allowedPaths.join(", ");
+
+    const lines: string[] = [
+      `### Ticket: ${t.id}`,
+      `Title: ${t.title}`,
+      `Status: ${t.status}`,
+      `Description: ${t.description}`,
+      `Allowed Paths: ${paths}`,
+      `Acceptance Criteria:`,
+      criteria,
+    ];
+
+    if (t.prUrl) {
+      lines.push(`PR: ${t.prUrl}`);
+    }
+
+    // Include reviewer verdict for failing/problematic tickets
+    if (packet) {
+      lines.push("");
+      lines.push(`#### Review Packet (from ticket execution)`);
+      lines.push(`Disposition: ${packet.epicReviewDisposition}`);
+      lines.push(`Ready for epic review: ${packet.epicReviewReadiness}`);
+      if (packet.builderSummary) {
+        lines.push(`Builder Summary: ${packet.builderSummary}`);
+      }
+      if (packet.review) {
+        lines.push(`Ticket Review Verdict: ${packet.review.verdict ? "APPROVED" : "REJECTED"}`);
+        if (packet.review.blockers.length > 0) {
+          lines.push(`Blockers:`);
+          packet.review.blockers.forEach(b => lines.push(`  - ${b}`));
+        }
+        if (packet.review.suggestions.length > 0) {
+          lines.push(`Suggestions:`);
+          packet.review.suggestions.forEach(s => lines.push(`  - ${s}`));
+        }
+      }
+      if (packet.failure) {
+        lines.push(`Failure Stage: ${packet.failure.stage}`);
+        lines.push(`Failure Reason: ${packet.failure.reason}`);
+      }
+    }
+
+    // Include the actual diff
+    if (diff && diff.trim()) {
+      lines.push("");
+      lines.push(`#### Git Diff`);
+      lines.push("```diff");
+      lines.push(diff.length > 8000 ? diff.slice(0, 8000) + "\n... (truncated)" : diff);
+      lines.push("```");
+    } else {
+      lines.push("");
+      lines.push(`#### Git Diff: (no changes detected)`);
+    }
+
+    return lines.join("\n");
+  }).join("\n\n");
+
+  const sections: string[] = [
+    "You are the Epic Reviewer agent. You have access to the full workspace with all ticket changes merged in.",
+    "",
+    "Your job is to:",
+    "1. Review ALL ticket changes against the epic goal and acceptance criteria",
+    "2. Check for destructive patterns, integration issues, and missing acceptance criteria",
+    "3. FIX any issues you find DIRECTLY in the workspace",
+    "4. Push your fixes to the target branch if one is specified",
+    "",
+    "Destructive patterns to check for:",
+    "- Large file deletions (>10 files or >1000 lines)",
+    "- Security-sensitive changes (auth, tokens, env vars)",
+    "- Database migrations that could cause data loss",
+    "- Breaking API changes without deprecation warnings",
+    "- Mass refactoring that touches >20 files",
+    "",
+    "Pay special attention to tickets with REJECTED reviews or failures — these may have incomplete or broken changes.",
+  ];
+
+  if (targetBranch) {
+    sections.push("");
+    sections.push(`TARGET BRANCH: ${targetBranch}`);
+    sections.push("After applying any fixes, commit them and push to this target branch.");
+    sections.push("Use: git add -A && git commit -m 'epic-review-fixes' && git push origin HEAD:" + targetBranch);
+  }
+
+  if (projectStructure) {
+    sections.push("");
+    sections.push(`## Project Structure`);
+    sections.push("```");
+    sections.push(projectStructure.slice(0, 6000));
+    sections.push("```");
+  }
+
+  if (ragContext?.docContext) {
+    sections.push("");
+    sections.push(ragContext.docContext);
+  }
+  if (ragContext?.codeContext) {
+    sections.push("");
+    sections.push(ragContext.codeContext);
+  }
+
+  sections.push("");
+  sections.push(`## Epic: ${epic.title}`);
+  sections.push(`Goal: ${epic.goalText}`);
+  sections.push("");
+  sections.push(`## Tickets (${tickets.length} total)`);
+  sections.push(ticketSections);
+  sections.push("");
+  sections.push("## Instructions");
+  sections.push("1. Review each ticket's diff against its acceptance criteria");
+  sections.push("2. Check for cross-ticket integration issues");
+  sections.push("3. If you find issues, FIX THEM DIRECTLY by editing the files");
+  sections.push("4. Commit and push any fixes to the target branch");
+  sections.push("5. Do NOT create followup tickets unless the issue cannot be fixed");
+  sections.push("");
+  sections.push("After you finish, output exactly one FINAL_JSON block and nothing after it.");
+  sections.push('<FINAL_JSON>{"verdict":"approved|needs_followups|failed","summary":"brief summary","followupTickets":[]}</FINAL_JSON>');
+
+  return sections.join("\n");
+}
+
+/**
  * Prompt for a build-fix pass: the reviewer already ran once, build checks
  * revealed errors, and now the model must fix them directly.
  */
