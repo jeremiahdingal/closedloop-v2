@@ -33,6 +33,7 @@ import { EpicModal } from "./components/EpicModal.tsx";
 import { PlanningModal } from "./components/PlanningModal.tsx";
 import { TicketModal } from "./components/TicketModal.tsx";
 import { DirectChatModal } from "./components/DirectChatModal.tsx";
+import { GameModal } from "./components/GameModal.tsx";
 
 export function App() {
   const [data, setData] = useState<Dashboard>({ epics: [], tickets: [], runs: [], agentEvents: [] });
@@ -57,6 +58,9 @@ export function App() {
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [openRole, setOpenRole] = useState<string | null>(null);
   const [isChatOpen, setIsChatOpen] = useState(false);
+  const [isTetrisOpen, setIsTetrisOpen] = useState(false);
+  const [isPacmanOpen, setIsPacmanOpen] = useState(false);
+  const [isTamagotchiOpen, setIsTamagotchiOpen] = useState(false);
   const [selectedEpic, setSelectedEpic] = useState<string | null>(null);
   const [selectedEpicDetails, setSelectedEpicDetails] = useState<Epic | null>(null);
   const [selectedTicket, setSelectedTicket] = useState<Ticket | null>(null);
@@ -738,6 +742,15 @@ export function App() {
             <span className="subtitle-mono">workspace: {targetDir}</span>
           </div>
           <div className="topbar-actions">
+            <button className="btn" onClick={() => setIsTetrisOpen(true)}>
+              🎮 Tetris
+            </button>
+            <button className="btn" onClick={() => setIsPacmanOpen(true)}>
+              🕹️ Pac-Man
+            </button>
+            <button className="btn" onClick={() => setIsTamagotchiOpen(true)}>
+              🐾 Tamagotchi
+            </button>
             <button className="btn" onClick={() => setIsChatOpen(true)}>
               💬 Direct Chat
             </button>
@@ -1508,6 +1521,10 @@ export function App() {
         modelsConfig={modelsConfig}
         defaultTargetDir={targetDir}
       />
+
+      <GameModal isOpen={isTetrisOpen} onClose={() => setIsTetrisOpen(false)} game="tetris" />
+      <GameModal isOpen={isPacmanOpen} onClose={() => setIsPacmanOpen(false)} game="pacman" />
+      <GameModal isOpen={isTamagotchiOpen} onClose={() => setIsTamagotchiOpen(false)} game="tamagotchi" />
     </div>
   );
 }
