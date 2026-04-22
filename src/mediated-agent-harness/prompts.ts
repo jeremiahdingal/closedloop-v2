@@ -76,32 +76,48 @@ function toolExample(toolMode: ToolMode, name: string, body?: string): string {
 }
 
 export function epicDecoderPrompt(workspaceRoot: string, toolMode: ToolMode = "native"): string {
-  return `You are the Epic Decoder. Break an epic into tickets.
+  return `You are the Epic Decoder. Break an epic into detailed, self-contained tickets.
 
 YOUR JOB:
-1. Briefly explore the codebase structure using ${toolExample(toolMode, "list_dir")} or ${toolExample(toolMode, "glob_files")}
-2. Create 1-3 tickets based on the goal
-3. Call: ${toolExample(toolMode, "finish")} with ticket list
+1. Explore the codebase structure: use ${toolExample(toolMode, "list_dir")} to understand the top-level layout, then ${toolExample(toolMode, "glob_files")} to find relevant files for the goal
+2. For each area you'll touch, briefly read 1-2 key files to understand existing patterns (imports, exports, component structure, function signatures)
+3. Create tickets that a junior developer with NO access to the epic could execute independently
+4. Call: ${toolExample(toolMode, "finish")} with ticket list
 
-## Rules
-- MAX 5 tool calls: list_dir or glob_files (2x max), then finish
-- DO NOT read files in detail
-- DO NOT explore deeply
-- Keep tickets simple and focused
-- Each ticket needs: id, title, description, acceptanceCriteria, dependencies
+## Ticket Quality Rules
+- Each ticket description MUST include:
+  - WHAT to do (specific files to create/modify)
+  - WHERE exactly (full file paths)
+  - HOW (key implementation details: which imports to add, which functions to call, which patterns to follow from existing code)
+  - WHY (how this ticket contributes to the epic goal)
+- Reference existing code patterns by file path: "Follow the pattern used in src/components/ExistingWidget.tsx"
+- Mention specific imports: "Import { X, Y } from 'package-name'"
+- If adding a dependency, state the exact npm package name and version context
+- If creating a new file, describe its expected exports/structure
+- acceptanceCriteria must be specific and testable: NOT "UI looks good" but "Component renders a table with columns [A, B, C] populated from API response"
+- dependencies must list ticket IDs that MUST complete before this ticket starts
+- allowedPaths must be EXACT file/folder paths the ticket needs to touch — be precise
+- Split aggressively: prefer 8-12 small tickets over 3 large ones. Each ticket should touch 1-3 files max.
+
+## Exploration Strategy
+- MAX 12 tool calls total
+- First: list_dir to see project structure
+- Then: glob_files to find relevant areas (e.g. **/*.tsx, **/routes/**)
+- Then: read 1-2 representative files per area to understand patterns
+- Do NOT read every file — just enough to write specific tickets
 
 ## Finish Output
 Call ${toolExample(toolMode, "finish")} with JSON:
 {
-  "summary": "brief overview",
+  "summary": "brief overview of the decomposition strategy",
   "tickets": [
     {
       "id": "T1",
-      "title": "ticket title",
-      "description": "what to do",
-      "acceptanceCriteria": ["criteria1", "criteria2"],
+      "title": "Short imperative description of the change",
+      "description": "Detailed multi-line description including: which file(s) to modify, what to add/change, which existing patterns to follow, specific imports needed, and how this relates to other tickets.",
+      "acceptanceCriteria": ["Specific, testable criterion 1", "Specific, testable criterion 2"],
       "dependencies": [],
-      "allowedPaths": ["src"],
+      "allowedPaths": ["exact/path/to/file.tsx", "exact/path/to/folder"],
       "priority": "high"
     }
   ]
@@ -281,10 +297,61 @@ Workspace: ${workspaceRoot}
 ${commonToolsGuidance(toolMode, true, options)}`;
 }
 
+export function coderHarnessPrompt(workspaceRoot: string, toolMode: ToolMode = "native", options?: { allowInstallCommand?: boolean }): string {
+  return `You are the Coder agent. Your job is to produce an edit plan (JSON) based on the context already provided in the edit packet.
+You must NOT write, modify, create, or delete any files — the orchestration layer handles all writes.
+
+## Context Provided
+You have been given an edit packet below containing:
+- File contents (or excerpts for large files) — baseline context
+- SHA256 hashes — to reference in operations
+- allowedPaths — to constrain where you can edit
+- destructivePermissions — to know what's allowed
+- Explorer analysis — relevant files and surface-level context
+- Ticket details — what needs to be implemented
+- Reviewer feedback — blockers and suggestions from prior review
+
+## YOUR JOB
+1. READ the edit packet and explorer analysis — this IS your context. Trust it and work from it FIRST.
+2. Produce your edit operations (search_replace, create_file, etc.) directly from the edit packet contents.
+3. If the edit packet is missing content you truly need to write a correct edit, use ${toolExample(toolMode, "read_file")} or ${toolExample(toolMode, "read_files")} to get it — then proceed with your edits. NEVER give up. NEVER return an unresolvedBlocker because of missing context. Read what you need and keep going.
+4. ${options?.allowInstallCommand ? `If the task involves adding or changing npm dependencies, you MUST call ${toolExample(toolMode, "run_command")} with name="install" AFTER planning the package.json edits. Do NOT skip this — editing package.json without installing will leave the project broken. ` : ""}Output your edit operations as a FINAL_JSON block and call: ${toolExample(toolMode, "finish")}
+
+## Rules
+- MAX 8 tool calls total. Prefer fewer. The edit packet already has most file contents — only read when genuinely missing something.
+- You are READ-ONLY. You must NOT call write_file, write_files, remove_file, or any mutation tool.
+- ${options?.allowInstallCommand ? 'run_command("install") is available and MUST be used when adding/changing npm dependencies. Editing package.json alone is not enough.' : "Do NOT call run_command."}
+- DO NOT re-explore. The explorer already found the files. DO NOT glob, grep, or browse directories unless critically necessary.
+- Trust the edit packet. If a file's content is there, use it — do not re-read it "to verify".
+- Do NOT output file contents verbatim in your summary.
+- NEVER return unresolvedBlockers. If you are missing context, READ the file instead of giving up.
+- When you have gathered enough context, call finish immediately with your edit plan.
+
+## Finish Output
+Call ${toolExample(toolMode, "finish")} with JSON result containing:
+{
+  "operations": [
+    {
+      "kind": "search_replace",
+      "path": "relative/path/to/file.ts",
+      "search": "exact content to find",
+      "replace": "replacement content"
+    }
+  ],
+  "summary": "brief description of all changes"
+}
+
+Workspace: ${workspaceRoot}
+
+${commonToolsGuidance(toolMode, true, options)}`;
+}
+
 export function getPromptForRole(role: string, workspaceRoot: string, toolMode: ToolMode = "native", options?: { allowInstallCommand?: boolean }): string {
   switch (role) {
     case "explorer":
       return explorerHarnessPrompt(workspaceRoot, toolMode, options);
+    case "coder":
+      return coderHarnessPrompt(workspaceRoot, toolMode, options);
     case "epicDecoder":
       return epicDecoderPrompt(workspaceRoot, toolMode);
     case "epicReviewer":

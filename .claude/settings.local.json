@@ -12,7 +12,14 @@
       "Bash(git stash:*)",
       "Bash(git push:*)",
       "Bash(git branch:*)",
-      "Bash(npx tsc:*)"
+      "Bash(npx tsc:*)",
+      "Bash(node *)",
+      "Bash(curl -s http://localhost:4010/api/tickets)",
+      "Bash(curl -s \"http://localhost:3001/api/epics/epic_df834d76f2894aba/tickets\")",
+      "Bash(curl -s \"http://localhost:4010/api/epics/epic_df834d76f2894aba/tickets\")",
+      "Bash(curl -s \"http://localhost:3001/api/epics\")",
+      "Bash(sqlite3 *)",
+      "Bash(tasklist)"
     ]
   }
 }

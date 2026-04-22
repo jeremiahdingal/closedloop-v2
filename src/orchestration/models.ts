@@ -41,6 +41,7 @@ export interface ModelGateway {
   runReviewerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ReviewerVerdict>;
   runTesterInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<TesterResult>;
   runExplorerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string>;
+  runCoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; skipExplorer?: boolean; onStream?: StreamHook }): Promise<string>;
   runCoderDirect?(input: { prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string>;
   runGoalReviewInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any }): Promise<GoalReview>;
   runEpicDecoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any }): Promise<GoalDecomposition>;
@@ -225,6 +226,10 @@ export class OllamaGateway implements ModelGateway {
 
   runExplorerInWorkspace(_input: { cwd: string; prompt: string }): Promise<string> {
     throw new Error("Explorer requires mediated harness (MediatedAgentHarnessGateway)");
+  }
+
+  runCoderInWorkspace(_input: { cwd: string; prompt: string }): Promise<string> {
+    throw new Error("Coder requires mediated harness (MediatedAgentHarnessGateway)");
   }
 
   async runCoderDirect(input: { prompt: string; onStream?: StreamHook }): Promise<string> {
@@ -993,7 +998,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     await ensureModelLoaded(model);
     const result = await harness.run("explorer", input.prompt, {
-      maxIterations: 80,
+      maxIterations: 40,
       timeoutMs: 900_000,
       onEvent: (event) => {
         if (event.kind === "text" || event.kind === "thinking") {
@@ -1052,6 +1057,115 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
         if (event.kind === "complete") {
           input.onStream?.({
             agentRole: "explorer",
+            source: "mediated-harness",
+            streamKind: "status",
+            content: `Completed in ${event.iterations} iterations`,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+            metadata: { model },
+          });
+        }
+      },
+    });
+    markModelLoaded(model);
+
+    return result.text;
+  }
+
+  async runCoderInWorkspace(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    ticketId?: string | null;
+    epicId?: string | null;
+    skipExplorer?: boolean;
+    onStream?: StreamHook;
+  }): Promise<string> {
+    const model = this.resolveHarnessModel("coder");
+    const allowInstallCommand = promptExplicitlyRequestsDependencyInstall(input.prompt);
+    input.onStream?.({
+      agentRole: "coder",
+      source: "orchestrator",
+      streamKind: "status",
+      content: "Coding via mediated agent harness...",
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+    });
+
+    const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : []);
+    const harness = new MediatedAgentHarness({
+      baseURL: `${this.ollamaBaseURL}/v1`,
+      apiKey: "ollama",
+      model,
+      braveApiKey: this.braveApiKey,
+      toolContext,
+    });
+
+    await ensureModelLoaded(model);
+    const result = await harness.run("coder", input.prompt, {
+      maxIterations: input.skipExplorer ? 50 : 20,
+      timeoutMs: 600_000,
+      onEvent: (event) => {
+        if (event.kind === "text" || event.kind === "thinking") {
+          input.onStream?.({
+            agentRole: "coder",
+            source: "mediated-harness",
+            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
+            content: event.text,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+            metadata: { model },
+          });
+        }
+        if (event.kind === "tool_call") {
+          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
+          input.onStream?.({
+            agentRole: "coder",
+            source: "mediated-harness",
+            streamKind: "tool_call",
+            content: `${event.call.name}(${argsPreview})`,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
+          });
+        }
+        if (event.kind === "tool_result") {
+          input.onStream?.({
+            agentRole: "coder",
+            source: "mediated-harness",
+            streamKind: "tool_result",
+            content: event.result.output,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+            metadata: { model, toolName: event.result.name, toolResult: event.result.output, isError: Boolean(event.result.isError) },
+          });
+        }
+        if (event.kind === "tool_error") {
+          input.onStream?.({
+            agentRole: "coder",
+            source: "mediated-harness",
+            streamKind: "error",
+            content: `Tool error: ${event.error}`,
+            runId: input.runId,
+            ticketId: input.ticketId,
+            epicId: input.epicId,
+            sequence: 0,
+            metadata: { model, toolName: event.call.name, error: event.error },
+          });
+        }
+        if (event.kind === "complete") {
+          input.onStream?.({
+            agentRole: "coder",
             source: "mediated-harness",
             streamKind: "status",
             content: `Completed in ${event.iterations} iterations`,

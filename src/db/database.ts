@@ -74,6 +74,12 @@ export class AppDatabase {
       // Column already exists
     }
 
+    try {
+      this.db.exec(`ALTER TABLE workspaces ADD COLUMN saved_branch TEXT`);
+    } catch {
+      // Column already exists
+    }
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS tickets (
         id TEXT PRIMARY KEY,
@@ -120,6 +126,7 @@ export class AppDatabase {
         branch_name TEXT NOT NULL,
         base_commit TEXT NOT NULL,
         head_commit TEXT,
+        saved_branch TEXT,
         status TEXT NOT NULL,
         lease_owner TEXT,
         created_at TEXT NOT NULL,
@@ -537,8 +544,8 @@ export class AppDatabase {
   createWorkspace(workspace: Omit<WorkspaceRecord, "createdAt" | "updatedAt">): WorkspaceRecord {
     const now = nowIso();
     this.db.prepare(`
-      INSERT INTO workspaces (id, ticket_id, run_id, repo_root, worktree_path, branch_name, base_commit, head_commit, status, lease_owner, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO workspaces (id, ticket_id, run_id, repo_root, worktree_path, branch_name, base_commit, head_commit, saved_branch, status, lease_owner, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       workspace.id,
       workspace.ticketId,
@@ -548,6 +555,7 @@ export class AppDatabase {
       workspace.branchName,
       workspace.baseCommit,
       workspace.headCommit,
+      workspace.savedBranch,
       workspace.status,
       workspace.leaseOwner,
       now,
@@ -952,6 +960,7 @@ export class AppDatabase {
       branchName: row.branch_name,
       baseCommit: row.base_commit,
       headCommit: row.head_commit,
+      savedBranch: row.saved_branch ?? null,
       status: row.status,
       leaseOwner: row.lease_owner,
       createdAt: row.created_at,

@@ -84,19 +84,58 @@ export async function verifyAndApplyEdits(
         }
 
         // Apply search/replace
-        const index = currentContent.indexOf(op.search);
+        let index = currentContent.indexOf(op.search);
+        let usedFuzzyMatch = false;
+
+        // Fallback: normalize whitespace for matching (handles tabs vs spaces, trailing whitespace)
+        if (index === -1) {
+          const normalizeWs = (s: string) => s.replace(/\r\n/g, "\n").replace(/\t/g, "  ").replace(/[ \t]+$/gm, "");
+          const normCurrent = normalizeWs(currentContent);
+          const normSearch = normalizeWs(op.search);
+          const normIndex = normCurrent.indexOf(normSearch);
+          if (normIndex !== -1) {
+            // Find the corresponding position in the original content
+            // Use the normalized position as a hint and scan nearby
+            const approxCharCount = normSearch.length;
+            for (let scanStart = Math.max(0, normIndex - 50); scanStart < Math.min(currentContent.length, normIndex + 200); scanStart++) {
+              const candidate = currentContent.slice(scanStart, scanStart + op.search.length + 100);
+              const normCandidate = normalizeWs(candidate);
+              if (normCandidate.startsWith(normSearch)) {
+                // Find the actual end position by matching normalized length
+                let endOffset = 0;
+                let normOffset = 0;
+                while (normOffset < normSearch.length && scanStart + endOffset < currentContent.length) {
+                  const ch = currentContent[scanStart + endOffset];
+                  const normCh = normalizeWs(ch);
+                  endOffset++;
+                  normOffset += normCh.length;
+                }
+                index = scanStart;
+                usedFuzzyMatch = true;
+                console.warn(`[VERIFIER] Fuzzy whitespace match for ${op.path} at offset ${index}`);
+                break;
+              }
+            }
+          }
+        }
+
         if (index === -1) {
           const detail = hashMatches
-            ? "Search block not found in file"
+            ? `Search block not found in file (searched ${op.search.length} chars in ${currentContent.length} char file)`
             : "Search block not found in file (SHA256 also mismatched — file has diverged since edit was planned)";
           result.failedOperations.push({ op, reason: detail });
+          console.warn(`[VERIFIER] Search block for ${op.path}: first 200 chars of search: ${op.search.slice(0, 200)}`);
+          console.warn(`[VERIFIER] File content first 200 chars: ${currentContent.slice(0, 200)}`);
           continue;
         }
 
         const newContent = currentContent.slice(0, index) + op.replace + currentContent.slice(index + op.search.length);
         await writeFile(fullPath, newContent, "utf8");
         result.appliedOperations.push(op);
-        if (!hashMatches) {
+        if (usedFuzzyMatch) {
+          result.relaxedOperations.push({ op, reason: "Applied with fuzzy whitespace matching" });
+        }
+        if (!hashMatches && !usedFuzzyMatch) {
           result.relaxedOperations.push({ op, reason: "SHA256 mismatch but search block matched — applied with relaxed validation" });
         }
 

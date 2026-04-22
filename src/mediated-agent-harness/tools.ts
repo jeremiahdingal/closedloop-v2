@@ -1118,6 +1118,25 @@ async function execListDir(
       output: lines.length > 0 ? lines.join("\n") : "(empty directory)"
     };
   } catch (err: any) {
+    // On ENOENT, try to list the parent so the model can course-correct instead of stalling
+    if (err.code === "ENOENT" && fullPath !== resolvedCwd) {
+      try {
+        const parentPath = path.dirname(fullPath);
+        if (parentPath.startsWith(resolvedCwd)) {
+          const parentEntries = await readdir(parentPath, { withFileTypes: true });
+          const parentLines = parentEntries
+            .filter(e => !e.name.startsWith("."))
+            .map(e => `${e.name}${e.isDirectory() ? "/" : ""}`)
+            .sort();
+          return {
+            callId,
+            name: "list_dir",
+            output: `Path not found: ${dirPath}\nDid you mean one of these?\n${parentLines.join("\n")}`,
+            isError: true
+          };
+        }
+      } catch { /* parent also not accessible */ }
+    }
     return {
       callId,
       name: "list_dir",
@@ -1674,6 +1693,11 @@ export function getAvailableToolsList(role: string, options?: { availableCommand
     return availableCommands.has("install")
       ? [...common, "run_command"]
       : ["explore_mode", "read_file", "read_files", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
+  }
+  if (role === "coder") {
+    return availableCommands.has("install")
+      ? [...common, "run_command"]
+      : [...common];
   }
   if (role === "reviewer") {
     return ["read_file", "list_dir", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files", "finish"];

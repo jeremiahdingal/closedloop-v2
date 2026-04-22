@@ -835,9 +835,67 @@ async function main() {
         const epicId = decodeURIComponent(retryEpicMatch[1]);
         const epic = db.getEpic(epicId);
         if (!epic) return json(res, 404, { error: "epic_not_found" });
+
+        // Cancel any active ticket runs
+        const tickets = db.listTickets(epicId);
+        for (const ticket of tickets) {
+          if (ticket.status === "queued" || ticket.status === "building" || ticket.status === "reviewing" || ticket.status === "testing") {
+            await lifecycle.cancelTicket(ticket.id);
+          }
+        }
+
+        // Clean up stale worktrees for the target branch
+        try {
+          const { execSync } = require("child_process");
+          const worktreeList = execSync("git worktree list --porcelain", { cwd: epic.targetDir, encoding: "utf8" });
+          const worktreeEntries = worktreeList.split("\n\n");
+          for (const entry of worktreeEntries) {
+            const pathLine = entry.split("\n").find((l: string) => l.startsWith("worktree "));
+            const branchLine = entry.split("\n").find((l: string) => l.startsWith("branch refs/heads/"));
+            if (pathLine && branchLine && branchLine.includes(epic.targetBranch || "")) {
+              const wtPath = pathLine.replace("worktree ", "");
+              try { execSync(`git worktree remove --force "${wtPath}"`, { cwd: epic.targetDir, stdio: "pipe" }); } catch {}
+            }
+          }
+          execSync("git worktree prune", { cwd: epic.targetDir, stdio: "pipe" });
+        } catch {}
+
+        // Fail stale jobs for this epic's tickets
+        for (const job of db.listJobRecords()) {
+          const payload = (job.payload ?? {}) as Record<string, unknown>;
+          if (job.kind !== "run_ticket") continue;
+          if (payload.epicId !== epicId) continue;
+          if (job.status !== "queued" && job.status !== "running") continue;
+          db.failJob(job.id, "Superseded by epic retry.", false);
+        }
+
+        // Reset tickets and re-queue
         db.updateEpicStatus(epicId, "executing");
-        const runId = await goalRunner.enqueueGoal(epicId);
-        return json(res, 200, { ok: true, epicId, runId });
+        const runIds: string[] = [];
+        for (const ticket of tickets) {
+          db.updateTicketRunState({
+            ticketId: ticket.id,
+            status: "queued",
+            currentRunId: null,
+            currentNode: null,
+            lastHeartbeatAt: null,
+            lastMessage: "Re-queued by epic retry."
+          });
+          const runId = await ticketRunner.start(ticket.id, epicId);
+          runIds.push(runId);
+        }
+
+        db.recordEvent({
+          aggregateType: "epic",
+          aggregateId: epicId,
+          runId: null,
+          ticketId: null,
+          kind: "epic_retry",
+          message: "Epic retry: all tickets re-queued.",
+          payload: { epicId, ticketRunIds: runIds }
+        });
+
+        return json(res, 200, { ok: true, epicId, ticketRunIds: runIds });
       }
       const deleteEpicMatch = /^\/api\/epics\/([^/]+)$/.exec(url.pathname);
       if (deleteEpicMatch && req.method === "DELETE") {
@@ -1061,6 +1119,29 @@ async function main() {
           }
         });
         return json(res, 200, { ok: true, runId: run.id, ticketId: ticket.id, stalledForMs, supersededJobIds });
+      }
+      const rerunDirectMatch = /^\/api\/tickets\/([^/]+)\/rerun-direct$/.exec(url.pathname);
+      if (rerunDirectMatch && req.method === "POST") {
+        const ticketId = decodeURIComponent(rerunDirectMatch[1]);
+        const ticket = db.getTicket(ticketId);
+        if (!ticket) return json(res, 404, { error: "ticket_not_found" });
+        const activeRuns = db
+          .listRunsForTicket(ticket.id)
+          .filter((run) => run.status === "queued" || run.status === "running" || run.status === "waiting");
+        if (activeRuns.length) {
+          await lifecycle.cancelTicket(ticket.id);
+        }
+        const runId = await ticketRunner.startDirect(ticket.id, ticket.epicId);
+        db.recordEvent({
+          aggregateType: "ticket",
+          aggregateId: ticket.id,
+          runId,
+          ticketId: ticket.id,
+          kind: "ticket_rerun_direct_queued",
+          message: "Ticket direct rerun queued (skip explorer).",
+          payload: { ticketId: ticket.id, runId, cancelledPreviousRuns: activeRuns.map((run) => run.id) }
+        });
+        return json(res, 200, { ok: true, runId, ticketId: ticket.id });
       }
       const deleteTicketMatch = /^\/api\/tickets\/([^/]+)$/.exec(url.pathname);
       if (deleteTicketMatch && req.method === "DELETE") {

@@ -640,6 +640,31 @@ export function App() {
     }
   }
 
+  async function rerunDirectTicket(ticketId: string) {
+    const confirmed = await confirmToast({
+      title: "Skip explorer and rerun?",
+      description: "This queues a new run that skips the explorer and goes directly to coding, using previous analysis or ticket allowedPaths.",
+      confirmLabel: "Skip Explorer & Rerun",
+    });
+    if (!confirmed) return;
+    const toastId = toast.loading("Queuing direct rerun (skip explorer)...");
+    try {
+      setActionBusy(`rerun-direct-ticket-${ticketId}`);
+      await fetchJson(`/api/tickets/${encodeURIComponent(ticketId)}/rerun-direct`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cancelActive: true }),
+      });
+      await refresh();
+      toast.success("Direct rerun queued (skip explorer).", { id: toastId });
+    } catch (err) {
+      setError((err as Error).message);
+      toast.error(`Failed to direct rerun: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
   async function updateAgentModel(role: string, model: string) {
     const current = modelsConfig[role]?.currentModel;
     if (!current || current === model) return;
@@ -1505,6 +1530,7 @@ export function App() {
           onCancel={() => void cancelTicket(selectedTicket.id)}
           onRerun={() => void rerunTicket(selectedTicket.id)}
           onForceRerunInPlace={() => void forceRerunTicketInPlace(selectedTicket.id)}
+          onRerunDirect={() => void rerunDirectTicket(selectedTicket.id)}
           onForceRescue={() => void forceRescueTicket(selectedTicket.id)}
           onDelete={() => void deleteTicket(selectedTicket.id)}
           actionBusy={actionBusy !== null}

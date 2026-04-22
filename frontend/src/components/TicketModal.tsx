@@ -21,6 +21,7 @@ export function TicketModal(props: {
   onCancel: () => void;
   onRerun: () => void;
   onForceRerunInPlace: () => void;
+  onRerunDirect: () => void;
   onForceRescue: () => void;
   onDelete: () => void;
   actionBusy: boolean;
@@ -289,6 +290,13 @@ export function TicketModal(props: {
             disabled={props.actionBusy}
           >
             🔄 Force In-Place
+          </button>
+          <button
+            className="btn btn-modal-direct"
+            onClick={props.onRerunDirect}
+            disabled={props.actionBusy}
+          >
+            Skip to Coder
           </button>
           <button
             className="btn btn-modal-rescue"

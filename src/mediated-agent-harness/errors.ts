@@ -26,12 +26,12 @@ export class ToolValidationError extends MediatedHarnessError {
 
 export class StagnationError extends MediatedHarnessError {
   readonly iterations: number;
-  readonly reason: "repeated_call" | "consecutive_errors" | "no_progress" | "max_iterations";
+  readonly reason: "repeated_call" | "consecutive_errors" | "no_progress" | "max_iterations" | "stall_recovery_forced";
 
   constructor(
     message: string,
     iterations: number,
-    reason: "repeated_call" | "consecutive_errors" | "no_progress" | "max_iterations"
+    reason: "repeated_call" | "consecutive_errors" | "no_progress" | "max_iterations" | "stall_recovery_forced"
   ) {
     super(message, "stagnation", { iterations, reason });
     this.name = "StagnationError";

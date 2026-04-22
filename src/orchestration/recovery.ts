@@ -356,6 +356,22 @@ export class RecoveryService {
     if (job.kind === "run_ticket") {
       const run = this.db.getRun(String(job.payload.runId));
       if (!run || run.status !== "queued") return;
+
+      // Gate: check that all dependency tickets are approved before starting
+      const ticket = run.ticketId ? this.db.getTicket(run.ticketId) : null;
+      if (ticket && ticket.dependencies?.length) {
+        const unmet = ticket.dependencies.filter(depId => {
+          const dep = this.db.getTicket(depId);
+          return !dep || dep.status !== "approved";
+        });
+        if (unmet.length) {
+          // Re-queue instead of running — dependencies not yet met
+          this.db.failJob(job.id, `Waiting for dependencies: ${unmet.join(", ")}`, false);
+          this.db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id });
+          return;
+        }
+      }
+
       await this.ticketRunner.runExisting(run.id);
       return;
     }

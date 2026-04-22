@@ -40,25 +40,43 @@ function buildPromptPathArgs(paths: string[]): string {
 
 export function epicDecoderPrompt(epic: EpicRecord): string {
   return [
-    "You are the Goal Decomposer.",
-    "⚠️ EXECUTOR CONSTRAINT: Every ticket you create will be handed to a 20–30B parameter model with limited reasoning and a short context window. Tickets MUST be trivially simple — one cohesive change, touching 1–3 files at most, with no ambiguity. If a task seems big, split it into multiple tickets. Prefer 8 small tickets over 3 large ones.",
+    "You are the Goal Decomposer. Break the epic into detailed, self-contained tickets.",
+    "",
+    "EXECUTOR CONSTRAINT: Every ticket will be executed by a 20-30B model with limited reasoning. Tickets MUST be trivially simple — one cohesive change, 1-3 files max, zero ambiguity. Prefer 8-12 small tickets over 3 large ones.",
+    "",
+    "TICKET QUALITY REQUIREMENTS:",
+    "Each ticket description MUST include:",
+    "- WHAT: specific files to create/modify, with full paths",
+    "- WHERE: exact file paths and locations within those files (e.g. 'Add the import at the top, after the existing react import')",
+    "- HOW: key implementation details — which imports, which functions, which existing patterns to follow",
+    "- WHY: how this ticket contributes to the epic goal",
+    "- Reference existing code: 'Follow the pattern in src/components/ExistingWidget.tsx'",
+    "- For dependencies: exact npm package name",
+    "- For new files: expected exports/structure",
+    "",
+    "acceptanceCriteria MUST be specific and testable:",
+    "- BAD: 'UI looks good', 'Component works correctly'",
+    "- GOOD: 'Component renders a <table> with columns [Name, Qty, Revenue]', 'Clicking the Revenue toggle sorts rows descending by qty * price'",
+    "",
+    "dependencies: list ticket IDs that MUST complete before this one starts. Use this to enforce build order (e.g. install deps before using them, create types before importing them).",
+    "",
+    "allowedPaths: EXACT file/folder paths the ticket needs — NOT ticket IDs, NOT URLs. Example: ['src/components/TopItemsTable.tsx', 'src/hooks/']",
+    "",
     "Return JSON only with shape:",
     JSON.stringify({
-      summary: "string",
+      summary: "string — decomposition strategy",
       tickets: [
         {
-          id: "string",
-          title: "string",
-          description: "string",
-          acceptanceCriteria: ["string"],
-          dependencies: ["string"],
-          allowedPaths: ["string"],
+          id: "string — e.g. AN-01",
+          title: "string — short imperative, e.g. 'Add Revenue column to TopItemsTable'",
+          description: "string — multi-line with files, patterns, imports, and implementation details",
+          acceptanceCriteria: ["string — specific, testable criteria"],
+          dependencies: ["string — ticket IDs"],
+          allowedPaths: ["string — exact file/folder paths"],
           priority: "high|medium|low"
         }
       ]
     }, null, 2),
-    "IMPORTANT: allowedPaths must be actual file/folder paths (e.g., ['src', 'test', 'docs', 'lib']), NOT ticket IDs or external URLs.",
-    "Example: For a ticket about testing, use allowedPaths: ['test', '__tests__', 'spec']",
     `Epic: ${epic.title}`,
     `Goal: ${epic.goalText}`
   ].join("\n\n");
@@ -266,14 +284,16 @@ export function explorerPrompt(ticket: TicketRecord, packet: TicketContextPacket
 
 export function coderPrompt(
   ticket: TicketRecord,
-  explorerOutput: ExplorerOutput,
+  explorerOutput: ExplorerOutput | null,
   editPacket: CanonicalEditPacket,
-  reviewerContext?: { blockers: string[]; suggestions: string[] }
+  reviewerContext?: { blockers: string[]; suggestions: string[] },
+  skipContext?: { skipped: boolean; reason?: string }
 ): string {
   return [
     "You are the Coder agent.",
     "Your job is to write the actual code changes to satisfy the ticket based on the Explorer's analysis and the provided file contents.",
-    "MODEL TARGET: You are qwen3.5:27b. You do NOT have tool access. You must output a JSON edit plan.",
+    "MODEL TARGET: You are qwen3.5:27b. Output a JSON edit plan.",
+    "CRITICAL: Work from the edit packet below. The file contents are already provided — do NOT request or expect to read more files. Produce your edits directly from this context.",
     `Ticket: ${ticket.title}`,
     `Goal: ${ticket.description}`,
     `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`,
@@ -281,6 +301,13 @@ export function coderPrompt(
     "CRITICAL: Every operation you produce MUST include an 'ac' field indicating which acceptance criterion it addresses.",
     "Format: 'ac': 'AC-1' or for multiple: 'ac': 'AC-1,AC-3'.",
     "Do NOT produce operations that don't map to at least one acceptance criterion. This prevents scope drift.",
+    ...(skipContext?.skipped ? [
+      "",
+      "## IMPORTANT: Explorer Was Skipped",
+      skipContext.reason ?? "The explorer node was bypassed for this run.",
+      "You may have less file context than usual. Focus on the files listed in the edit packet and the ticket's allowedPaths.",
+      "If you are missing context, read the files you need rather than giving up."
+    ] : []),
     "",
     "## Explorer Analysis",
     JSON.stringify(explorerOutput, null, 2),
@@ -305,7 +332,7 @@ export function coderPrompt(
     "3. Use 'create_file' for new files.",
     "4. Use 'append_file' only if adding to the end of a file.",
     "5. 'delete_file' or 'rename_file' are ONLY allowed if explicitly permitted in 'destructivePermissions' or 'allowedDeletePaths'/'allowedRenamePaths'.",
-    "6. If you lack enough source code to complete the task, return an unresolvedBlocker: 'NEEDS_SOURCE'.",
+    "6. If the edit packet is missing content you need, read the file first. NEVER give up with an unresolvedBlocker — always try to get the context and produce edits.",
     "7. If the task is impossible, return an unresolvedBlocker: 'BLOCKED'.",
     "8. Do NOT use 'replace_file' for existing files unless 'allowFullReplace' is true for that path.",
     "9. Every destructive operation (delete/rename) MUST include a 'reason' string.",
@@ -476,15 +503,39 @@ export function epicDecoderToolingPrompt(
     `Epic: ${epic.title}`,
     `Goal: ${epic.goalText}`,
     [
-      "⚠️ EXECUTOR CONSTRAINT — read this before writing a single ticket:",
-      "Each ticket you create will be executed by a 20–30B parameter model. That model has limited reasoning capacity and a short context window.",
+      "EXECUTOR CONSTRAINT — read this before writing a single ticket:",
+      "Each ticket you create will be executed by a 20-30B parameter model. That model has limited reasoning capacity and a short context window.",
       "This means every ticket MUST be:",
-      "  • Atomic — one coherent, self-contained change only",
-      "  • Narrow — touches 1–3 files at most; never spans the whole codebase",
-      "  • Explicit — the description and acceptance criteria must be so clear that no further discovery is needed",
-      "  • Small — the full change should fit comfortably in a single LLM response",
+      "  - Atomic — one coherent, self-contained change only",
+      "  - Narrow — touches 1-3 files at most; never spans the whole codebase",
+      "  - Explicit — the description and acceptance criteria must be so clear that no further discovery is needed",
+      "  - Small — the full change should fit comfortably in a single LLM response",
       "If a task feels large or multi-faceted, SPLIT IT. Prefer 10 simple tickets over 4 complex ones.",
       "Do NOT create tickets like 'Implement the feature end-to-end' or 'Refactor the module'. Break those into individual file-level changes.",
+    ].join("\n"),
+    "",
+    [
+      "TICKET QUALITY REQUIREMENTS — every ticket MUST have:",
+      "",
+      "Description must include:",
+      "  - WHAT: specific files to create/modify, with full paths",
+      "  - WHERE: exact locations within files (e.g. 'Add import at top after existing react import')",
+      "  - HOW: key implementation details — which imports, which functions, which existing patterns to follow",
+      "  - WHY: how this ticket contributes to the epic goal",
+      "  - Reference existing code by file path: 'Follow the pattern used in src/components/ExistingWidget.tsx'",
+      "  - For npm dependencies: exact package name",
+      "  - For new files: expected exports/structure",
+      "",
+      "acceptanceCriteria must be specific and testable:",
+      "  - BAD: 'UI looks good', 'Component works correctly'",
+      "  - GOOD: 'Component renders a <table> with columns [Name, Qty, Revenue]'",
+      "  - GOOD: 'Clicking the Revenue toggle sorts rows descending by qty * price without any API call'",
+      "",
+      "dependencies: list ticket IDs that MUST complete before this one starts.",
+      "  - Use to enforce build order: install deps before using them, create types before importing them, build foundation components before pages that use them.",
+      "",
+      "allowedPaths: EXACT file/folder paths — NOT ticket IDs, NOT URLs.",
+      "  - Example: ['src/components/TopItemsTable.tsx', 'src/hooks/useTopItems.ts']",
     ].join("\n"),
   ];
 
@@ -499,10 +550,10 @@ export function epicDecoderToolingPrompt(
 
   sections.push(
     "Steps:",
-    "1. Explore the repo structure with glob/grep and read key files",
-    "2. Understand existing code patterns and architecture",
-    "3. Decompose the epic into atomic, file-scoped tickets (keep each one small!)",
-    "4. Each ticket must have literal acceptance criteria and tight allowedPaths",
+    "1. Explore the repo structure with glob/grep to understand layout",
+    "2. Read 1-2 representative files per area to understand existing patterns (imports, exports, component structure, function signatures)",
+    "3. Decompose the epic into atomic, file-scoped tickets — each one a junior developer could execute independently",
+    "4. Each ticket must have rich descriptions, specific acceptance criteria, and tight allowedPaths",
     "After you finish, output exactly one FINAL_JSON block and nothing after it.",
     `<FINAL_JSON>${JSON.stringify({
       summary: "string",

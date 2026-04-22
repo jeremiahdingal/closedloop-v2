@@ -14,6 +14,8 @@ import { StagnationError, ModelConnectionError, LoopTimeoutError } from "./error
 import { StreamParser } from "./stream-parser.ts";
 import { WORKSPACE_TOOLS, BROWSER_TOOLS, executeToolCall, getAvailableToolsList, resetExploreModeFiles } from "./tools.ts";
 import { CallHistory, validateAndRepair } from "./validator.ts";
+import { computeBudget, shouldCompact, compactMessages, estimateMessagesTokens } from "./context-budget.ts";
+import { classifyStall, computeStallLevel, getRecoveryAction, createStallState, recordStall, resetStallCounters, type StallState, type StallKind } from "./stall-recovery.ts";
 
 const KNOWN_TOOL_NAMES = new Set([
   "explore_mode",
@@ -34,12 +36,14 @@ export interface LoopInput {
 }
 
 export function resolveModelContextWindow(model: string): number {
-  if (model.startsWith("glm-4.7-flash")) return 4096;
-  if (model.startsWith("qwen3.5:9b")) return 16384;
-  if (model.startsWith("qwen3.5:27b")) return 4096;
-  if (model.startsWith("devstral-small-2:24b")) return 393216;
-  if (model.startsWith("qwen2.5-coder:14b")) return 65536;
-  return 32768;
+  let result = 32768;
+  if (model.startsWith("glm-4.7-flash")) result = 16384;
+  else if (model.startsWith("qwen3.5:9b")) result = 16384;
+  else if (model.startsWith("qwen3.5:27b")) result = 16384;
+  else if (model.startsWith("qwen3:14b")) result = 16384;
+  else if (model.startsWith("devstral-small-2:24b")) result = 393216;
+  else if (model.startsWith("qwen2.5-coder:14b")) result = 65536;
+  return Math.max(result, 16384);
 }
 
 export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarnessResult> {
@@ -90,7 +94,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
   const history = new CallHistory();
   const collectedToolCalls: ToolCall[] = [];
   const startTime = Date.now();
-  let emptyResponseRetryUsed = false;
+  let stallState = createStallState();
 
   emit({ kind: "text", text: `--- SYSTEM PROMPT ---\n${systemPrompt}\n\n--- USER PROMPT ---\n${userPrompt}\n-------------------` });
 
@@ -105,22 +109,44 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       );
     }
 
-    // Check stagnation
+    // Check stagnation — use progressive stall recovery
     if (iteration > 0) {
-      const recentCalls = history.getRecentCalls(Infinity);
-      if (history.hasRepeatedCalls(3)) {
-        throw new StagnationError(
-          "Identical tool calls detected 3 times in a row",
-          iteration,
-          "repeated_call"
-        );
-      }
-      if (history.getConsecutiveErrors() >= 5) {
-        throw new StagnationError(
-          "5 consecutive tool errors",
-          iteration,
-          "consecutive_errors"
-        );
+      const repeatedCount = history.hasRepeatedCalls(3) ? 3 : 0;
+      const stallKind = classifyStall({
+        hasEmptyResponse: false,
+        hasNoToolCalls: false,
+        repeatedCallCount: repeatedCount,
+        consecutiveErrors: history.getConsecutiveErrors(),
+      });
+
+      if (stallKind) {
+        stallState = recordStall(stallState, stallKind);
+        const level = computeStallLevel(stallKind, stallState.counts[stallKind], numCtx);
+        const action = getRecoveryAction(stallKind, level, config.role, iteration, maxIterations);
+
+        if (action.forceXmlMode) {
+          stallState = { ...stallState, toolModeOverride: "xml" };
+        }
+
+        if (action.forceFinish || level === "forced") {
+          throw new StagnationError(
+            `Stall recovery forced finish after ${stallState.counts[stallKind]} consecutive ${stallKind} events`,
+            iteration,
+            "stall_recovery_forced"
+          );
+        }
+
+        if (action.allowRetry) {
+          messages.push({ role: "user", content: action.nudgeMessage });
+          emit({ kind: "text", text: `[stall-recovery] ${stallKind} at ${level} level, nudging model...` });
+          // Don't call the model again immediately — continue to next iteration
+        } else {
+          throw new StagnationError(
+            `Stall recovery exhausted: ${stallKind} at ${level} level`,
+            iteration,
+            "stall_recovery_forced"
+          );
+        }
       }
     }
 
@@ -148,23 +174,51 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       emit({ kind: "text", text: `[convergence] Budget at 80%, forcing explorer to conclude...` });
     }
 
-    // Token threshold: force finish if context window is nearly full
-    if (config.role === "explorer" && iteration > convergenceThreshold) {
-      const totalChars = messages.reduce((sum, m) => {
-        const c = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-        return sum + (c?.length ?? 0);
-      }, 0);
-      const estimatedTokens = Math.floor(totalChars / 3.5);
-      const tokenLimit = Math.floor(numCtx * 0.7);
-      if (estimatedTokens > tokenLimit) {
+    // Coder: early nudge at 40% — remind about outputting edit plan
+    if (config.role === "coder" && iteration >= Math.floor(maxIterations * 0.4)) {
+      const hasNudged = messages.some(m => typeof m.content === 'string' && m.content.includes('[SYSTEM REMINDER] coder 40%'));
+      if (!hasNudged) {
         messages.push({
           role: "user",
-          content: "[SYSTEM] Context window is nearly full. You MUST call the finish tool NOW. Pass your analysis as the result parameter (a JSON string). The summary parameter is optional."
+          content: `[SYSTEM REMINDER] You are past 40% of your iteration budget (${iteration + 1}/${maxIterations}). You should have verified any stale file contents by now. Start formulating your edit operations. When you call finish, the "result" parameter MUST be a raw JSON string with this exact structure:\n\n{"operations":[{"kind":"search_replace","path":"relative/path","search":"exact content","replace":"replacement"}],"summary":"brief description"}\n\nNo markdown, no code fences, no commentary. Just the raw JSON object.`
         });
-        emit({ kind: "text", text: "[convergence] Token threshold reached, forcing finish..." });
+        emit({ kind: "text", text: "[nudge] 40% budget reached, reminding coder to output edit plan..." });
+      }
+    }
+
+    // Coder: convergence at 60% — force to conclude
+    if (config.role === "coder" && iteration >= Math.floor(maxIterations * 0.6)) {
+      messages.push({
+        role: "user",
+        content: `[SYSTEM] You are at iteration ${iteration + 1} of ${maxIterations}. You have used 60% of your budget. STOP reading files. You MUST call the finish tool NOW with your edit plan as the result parameter (a JSON string). No more tool calls.`
+      });
+      emit({ kind: "text", text: `[convergence] Budget at 60%, forcing coder to conclude...` });
+    }
+
+    // Context budget check — applies to ALL roles
+    if (iteration > 3) {
+      const budget = computeBudget(messages, numCtx, stallState.contextCompacted);
+      const compactLevel = shouldCompact(budget);
+
+      if (compactLevel === "force_finish") {
+        messages.push({
+          role: "user",
+          content: "[SYSTEM] Context window is nearly full (90%+). You MUST call the finish tool NOW. Pass your analysis as the result parameter (a JSON string). No more tool calls."
+        });
+        emit({ kind: "text", text: `[context] Budget at ${Math.round(budget.usedFraction * 100)}%, forcing finish...` });
+      } else if (compactLevel !== "none" && !stallState.contextCompacted) {
+        const result = compactMessages(messages, numCtx, compactLevel);
+        if (result.removedTokens > 0) {
+          messages.length = 0;
+          messages.push(...result.messages);
+          stallState = { ...stallState, contextCompacted: true };
+          emit({ kind: "text", text: `[context] ${compactLevel} compaction: removed ${result.removedTokens} estimated tokens (now at ${Math.round(estimateMessagesTokens(messages) / numCtx * 100)}%)` });
+        }
       }
     }
     emit({ kind: "text", text: `[iteration ${iteration + 1}/${maxIterations}] Calling model...` });
+
+    const effectiveToolMode = stallState.toolModeOverride ?? toolMode;
 
     // Make streaming request
     let response: Response;
@@ -182,7 +236,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
             ...message,
             content: message.content ?? "",
           })),
-          ...(toolMode === "native" ? {
+          ...(effectiveToolMode === "native" ? {
             tools: tools.map(t => ({
               type: t.type,
               function: {
@@ -319,24 +373,29 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         continue;
       }
 
-      if (state.toolCalls.length === 0 && !emptyResponseRetryUsed) {
-        emptyResponseRetryUsed = true;
-        messages.push({ role: "assistant", content: state.content || "" });
-        messages.push({
-          role: "user",
-          content: toolMode === "xml"
-            ? "No output. Continue with exactly one XML function call. Do not write prose."
-            : "No output. Continue with exactly one tool call. Do not write prose.",
-        });
-        continue;
-      }
-
       if (state.toolCalls.length === 0) {
-        throw new StagnationError(
-          "Model produced empty response",
-          iteration + 1,
-          "no_progress"
-        );
+        // Progressive stall recovery for empty/no-tool-call responses
+        const kind: StallKind = assistantText ? "no_tool_calls" : "empty_response";
+        stallState = recordStall(stallState, kind);
+        const level = computeStallLevel(kind, stallState.counts[kind], numCtx);
+        const action = getRecoveryAction(kind, level, config.role, iteration, maxIterations);
+
+        if (action.forceXmlMode) {
+          stallState = { ...stallState, toolModeOverride: "xml" };
+        }
+
+        if (action.forceFinish || level === "forced") {
+          throw new StagnationError(
+            `Stall recovery forced finish: ${kind} at ${level} level (${stallState.counts[kind]} occurrences)`,
+            iteration + 1,
+            "stall_recovery_forced"
+          );
+        }
+
+        messages.push({ role: "assistant", content: state.content || "" });
+        messages.push({ role: "user", content: action.nudgeMessage });
+        emit({ kind: "text", text: `[stall-recovery] ${kind} at ${level} level, nudging...` });
+        continue;
       }
       }
     }
@@ -470,6 +529,11 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       const result = await executeToolCall(toolCall, ctx);
       history.record(validated.name, validated.args, result.isError ?? false);
 
+      // Reset stall counters on successful tool execution
+      if (!result.isError) {
+        stallState = resetStallCounters(stallState);
+      }
+
       emit({ kind: "tool_result", result });
 
       console.log(`  [RESULT] ${validated.name}: ${result.output.slice(0, 100)}${result.output.length > 100 ? '...' : ''}`);
@@ -518,7 +582,8 @@ function requiresExplicitFinish(role?: string): boolean {
     || role === "epicDecoder"
     || role === "epicReviewer"
     || role === "playTester"
-    || role === "explorer";
+    || role === "explorer"
+    || role === "coder";
 }
 
 // ─── JSON extraction from text ──────────────────────────────────────────────

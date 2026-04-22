@@ -231,7 +231,7 @@ export function EpicModal(props: {
 
         {/* Footer */}
         <div className="modal-footer">
-          {props.epic.status === "failed" && (
+          {["failed", "escalated", "executing"].includes(props.epic.status) && (
             <button className="btn btn-modal-retry" onClick={props.onRetry} disabled={props.actionBusy}>
               ▶ Retry Epic
             </button>

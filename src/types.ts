@@ -79,6 +79,7 @@ export type WorkspaceRecord = {
   branchName: string;
   baseCommit: string;
   headCommit: string | null;
+  savedBranch: string | null;
   status: "active" | "archived" | "cleaned";
   leaseOwner: string | null;
   createdAt: string;
