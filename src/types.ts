@@ -135,6 +135,7 @@ export type GoalTicketPlan = {
 export type GoalDecomposition = {
   summary: string;
   tickets: GoalTicketPlan[];
+  clarificationQuestions?: string[];
 };
 
 export type GoalReview = {

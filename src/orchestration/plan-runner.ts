@@ -29,6 +29,10 @@ export interface PlanRunResult {
   rawText: string;
 }
 
+export function planNeedsClarification(plan: GoalDecomposition | null | undefined): boolean {
+  return Boolean(plan?.clarificationQuestions?.some((question) => question.trim().length > 0));
+}
+
 /**
  * Run the epic decoder in plan mode and return the resulting GoalDecomposition.
  * Uses the mediated/qwen/codex/opencode path depending on the configured epicDecoder model.
@@ -85,7 +89,12 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
   // qwen-cli / codex-cli / gemini-cli — runs via QwenRunner / CodexRunner / GeminiRunner
   if (
     gateway.runEpicDecoderInWorkspace &&
-    (configuredModel === "codex-cli" || configuredModel === "qwen-cli" || configuredModel === "gemini-cli")
+    (
+      configuredModel === "codex-cli" ||
+      configuredModel === "qwen-cli" ||
+      configuredModel === "gemini-cli" ||
+      configuredModel.startsWith("zai:")
+    )
   ) {
     try {
       const result = await gateway.runEpicDecoderInWorkspace({

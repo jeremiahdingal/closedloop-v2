@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { writeFile, readFile, mkdir, symlink, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import { AppDatabase } from "../db/database.ts";
@@ -27,6 +28,15 @@ type GoalGraphState = {
   reviewVerdict: "approved" | "needs_followups" | "failed";
   reviewSummary: string;
   status: "pending" | "executing" | "reviewing" | "done" | "failed";
+};
+
+type EpicReviewerTicketGitContext = {
+  ticketId: string;
+  baseRef: string | null;
+  headRef: string | null;
+  allowedPaths: string[];
+  branchName: string | null;
+  hasWorkspaceChanges: boolean;
 };
 
 function sanitizeAllowedPaths(paths: string[]): string[] {
@@ -92,6 +102,21 @@ function normalizeGoalTicketPlans(epicId: string, tickets: GoalTicketPlan[]): Go
         .filter((dependency): dependency is string => Boolean(dependency))
     ))
   }));
+}
+
+function resolveEpicDiffBase(repoRoot: string, candidateBases: string[]): string | null {
+  const uniqueBases = Array.from(new Set(candidateBases.filter(Boolean)));
+  if (!uniqueBases.length) return null;
+  if (uniqueBases.length === 1) return uniqueBases[0];
+  try {
+    const mergeBase = execFileSync("git", ["merge-base", "--octopus", ...uniqueBases], {
+      cwd: repoRoot,
+      encoding: "utf8"
+    }).trim();
+    return mergeBase || null;
+  } catch {
+    return null;
+  }
 }
 
 function normalizeTicketTitleKey(title: string): string {
@@ -585,44 +610,29 @@ export class GoalRunner {
     this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting epic review with ${tickets.length} tickets`, runId, epicId: epic.id, sequence: 0 });
 
     // ── 1. Collect diffs from each ticket's workspaces (local, no remote fetch) ──
-    const ticketDiffs = new Map<string, string>();
+    const ticketGitContext: EpicReviewerTicketGitContext[] = [];
+    const candidateBases: string[] = [];
     for (const ticket of tickets) {
       const workspaces = this.db.listWorkspacesForTicket(ticket.id);
-      // Find the workspace that actually has changes (head_commit !== base_commit)
-      const wsWithChanges = workspaces.find(ws => ws.headCommit && ws.headCommit !== ws.baseCommit);
-      if (wsWithChanges) {
-        try {
-          // Get diff by commit range in the worktree
-          const { execSync } = await import('node:child_process');
-          const diff = execSync(
-            `git diff ${wsWithChanges.baseCommit}..${wsWithChanges.headCommit}`,
-            { cwd: wsWithChanges.worktreePath, maxBuffer: 10 * 1024 * 1024 }
-          ).toString('utf8');
-          if (diff.trim()) {
-            ticketDiffs.set(ticket.id, diff);
-            console.log(`Collected diff for ${ticket.id}: ${diff.split('\n').length} lines`);
-          }
-        } catch (err) {
-          console.warn(`Failed to get commit diff for ${ticket.id}: ${err}`);
-        }
-      } else {
-        // Try gitDiff on active workspaces (may have unstaged changes)
-        const activeWs = workspaces.find(ws => ws.status === 'active');
-        if (activeWs) {
-          try {
-            const diff = await this.bridge.gitDiff(activeWs.id);
-            if (diff.trim()) {
-              ticketDiffs.set(ticket.id, diff);
-              console.log(`Collected unstaged diff for ${ticket.id}: ${diff.split('\n').length} lines`);
-            }
-          } catch (err) {
-            console.warn(`Failed to get diff for ${ticket.id}: ${err}`);
-          }
-        }
-      }
+      const changedWorkspace = workspaces.find(ws => ws.headCommit && ws.headCommit !== ws.baseCommit);
+      const activeWorkspace = workspaces.find(ws => ws.status === "active");
+      const fallbackWorkspace = changedWorkspace ?? activeWorkspace ?? workspaces[0] ?? null;
+
+      if (changedWorkspace?.baseCommit) candidateBases.push(changedWorkspace.baseCommit);
+      else if (fallbackWorkspace?.baseCommit) candidateBases.push(fallbackWorkspace.baseCommit);
+
+      ticketGitContext.push({
+        ticketId: ticket.id,
+        baseRef: fallbackWorkspace?.baseCommit ?? null,
+        headRef: changedWorkspace?.headCommit ?? null,
+        allowedPaths: ticket.allowedPaths,
+        branchName: fallbackWorkspace?.branchName ?? null,
+        hasWorkspaceChanges: Boolean(activeWorkspace)
+      });
     }
 
     // ── 2. Load review packets for all tickets (especially failing ones) ──
+    const diffBase = resolveEpicDiffBase(epic.targetDir, candidateBases);
     const reviewPackets = new Map<string, TicketEpicReviewPacket>();
     for (const ticket of tickets) {
       const packet = await this.loadEpicReviewPacket(ticket.id);
@@ -639,7 +649,7 @@ export class GoalRunner {
 
     this.recordAgentStream({
       agentRole: "epicReviewer", source: "orchestrator", streamKind: "status",
-      content: `Reviewing epic: ${epic.title} (${tickets.length} tickets, ${ticketDiffs.size} with diffs) via ${useDirectCli ? "direct CLI" : "direct LLM"}`,
+      content: `Reviewing epic: ${epic.title} (${tickets.length} tickets${diffBase ? `, diff base ${diffBase.slice(0, 10)}` : ""}) via ${useDirectCli ? "direct CLI" : "direct LLM"}`,
       runId, epicId: epic.id, sequence: 1,
     });
 
@@ -647,11 +657,12 @@ export class GoalRunner {
     const basePrompt = epicReviewerDirectCliPrompt({
       epic,
       tickets,
-      ticketDiffs,
+      ticketGitContext,
       reviewPackets,
       ragContext: ragCtx ?? undefined,
       projectStructure,
       targetBranch: epic.targetBranch,
+      diffBase,
     });
 
     const MAX_RETRIES = 2;

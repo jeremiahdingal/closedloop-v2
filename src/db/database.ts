@@ -261,6 +261,23 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_rag_chunks_file_path ON rag_chunks(index_id, file_path);
       CREATE INDEX IF NOT EXISTS idx_ast_edges_index_id ON ast_edges(index_id);
       CREATE INDEX IF NOT EXISTS idx_ast_edges_source ON ast_edges(index_id, source_file);
+
+      CREATE TABLE IF NOT EXISTS tetris_scores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        score INTEGER NOT NULL,
+        level INTEGER NOT NULL,
+        lines INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS pacman_scores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        score INTEGER NOT NULL,
+        level INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
   }
 
@@ -1181,5 +1198,43 @@ export class AppDatabase {
 
   clearDirectChatMessages(sessionId: string): void {
     this.db.prepare(`DELETE FROM direct_chat_messages WHERE session_id = ?`).run(sessionId);
+  }
+
+  // ─── Tetris Scores ───
+
+  getTetrisHighScores(limit: number = 10): { name: string; score: number; level: number; lines: number; date: string }[] {
+    const rows = this.db.prepare(`SELECT * FROM tetris_scores ORDER BY score DESC, created_at ASC LIMIT ?`).all(limit) as any[];
+    return rows.map(row => ({
+      name: row.name,
+      score: row.score,
+      level: row.level,
+      lines: row.lines,
+      date: row.created_at
+    }));
+  }
+
+  addTetrisScore(name: string, score: number, level: number, lines: number): void {
+    const now = nowIso();
+    this.db.prepare(`INSERT INTO tetris_scores (name, score, level, lines, created_at) VALUES (?, ?, ?, ?, ?)`).run(name, score, level, lines, now);
+  }
+
+  clearTetrisScores(): void {
+    this.db.prepare(`DELETE FROM tetris_scores`).run();
+  }
+
+  // ── Pac-Man Scores ──────────────────────────────────
+
+  getPacmanHighScores(limit = 10): any[] {
+    const rows = this.db.prepare(`SELECT * FROM pacman_scores ORDER BY score DESC, created_at ASC LIMIT ?`).all(limit) as any[];
+    return rows;
+  }
+
+  addPacmanScore(name: string, score: number, level: number): void {
+    const now = nowIso();
+    this.db.prepare(`INSERT INTO pacman_scores (name, score, level, created_at) VALUES (?, ?, ?, ?)`).run(name, score, level, now);
+  }
+
+  clearPacmanScores(): void {
+    this.db.prepare(`DELETE FROM pacman_scores`).run();
   }
 }

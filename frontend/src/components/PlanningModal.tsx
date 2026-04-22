@@ -20,12 +20,14 @@ export function PlanningModal(props: {
   onMinimize: () => void;
   onApproved: (epicId: string) => void;
   onReady?: () => void;
+  onStateChange?: (state: { hasPlan: boolean; awaitingClarification: boolean }) => void;
 }) {
   const [streamItems, setStreamItems] = useState<
     Array<{ id: number; agentRole: string; streamKind: string; content: string; source: string }>
   >([]);
   const [sessionStatus, setSessionStatus] = useState<"running" | "idle" | "error">("running");
   const [latestPlan, setLatestPlan] = useState<GoalDecomposition | null>(null);
+  const [awaitingClarification, setAwaitingClarification] = useState(false);
   const [messageInput, setMessageInput] = useState("");
   const [planBranch, setPlanBranch] = useState(props.initialBranch ?? "");
   const [sending, setSending] = useState(false);
@@ -52,6 +54,12 @@ export function PlanningModal(props: {
       .filter(Boolean)
       .join("");
   }, [streamItems]);
+
+  const clarificationQuestions = useMemo(
+    () => (latestPlan?.clarificationQuestions ?? []).filter((question) => question.trim().length > 0),
+    [latestPlan]
+  );
+  const hasClarificationQuestions = clarificationQuestions.length > 0;
 
   // Smarter auto-scroll for Phase 1
   useEffect(() => {
@@ -109,6 +117,8 @@ export function PlanningModal(props: {
       afterIndexRef.current = data.id + 1;
       if (data.streamKind === "plan_cleared") {
         setLatestPlan(null);
+        setAwaitingClarification(false);
+        props.onStateChange?.({ hasPlan: false, awaitingClarification: false });
         setStreamItems([]);
         setShowRawOutput(false);
         hasAutoFocusedPlanRef.current = false;
@@ -119,16 +129,27 @@ export function PlanningModal(props: {
     es.addEventListener("session_status", (e) => {
       const data = JSON.parse(e.data);
       setSessionStatus(data.status);
+      setAwaitingClarification(Boolean(data.awaitingClarification));
+      props.onStateChange?.({
+        hasPlan: Boolean(data.hasPlan),
+        awaitingClarification: Boolean(data.awaitingClarification)
+      });
     });
     es.addEventListener("plan_ready", (e) => {
-      setLatestPlan(JSON.parse(e.data));
+      const plan = JSON.parse(e.data) as GoalDecomposition;
+      setLatestPlan(plan);
+      setAwaitingClarification(Boolean(plan.clarificationQuestions?.length));
+      props.onStateChange?.({
+        hasPlan: true,
+        awaitingClarification: Boolean(plan.clarificationQuestions?.length)
+      });
       props.onReady?.();
     });
     return () => {
       es.close();
       esRef.current = null;
     };
-  }, [props.open, props.sessionId]);
+  }, [props.open, props.sessionId, props]);
 
   async function sendMessage() {
     if (!messageInput.trim()) return;
@@ -169,7 +190,7 @@ export function PlanningModal(props: {
   }
 
   if (!props.open) return null;
-  const canApprove = latestPlan !== null && sessionStatus !== "running";
+  const canApprove = latestPlan !== null && sessionStatus !== "running" && !hasClarificationQuestions && latestPlan.tickets.length > 0;
 
   return (
     <div className="modal-backdrop" onClick={props.onClose}>
@@ -185,7 +206,9 @@ export function PlanningModal(props: {
                   ? "⏳ planning..."
                   : sessionStatus === "idle"
                   ? latestPlan
-                    ? "✅ plan ready"
+                    ? hasClarificationQuestions
+                      ? "💬 clarification needed"
+                      : "✅ plan ready"
                     : "💬 awaiting input"
                   : "⚠️ error"}
               </span>
@@ -222,19 +245,30 @@ export function PlanningModal(props: {
             )}
             {latestPlan && (
               <div className="plan-nav-group">
-                <div className="plan-nav-group-label">Plan · {latestPlan.tickets.length} tickets</div>
+                <div className="plan-nav-group-label">
+                  {hasClarificationQuestions ? `Questions · ${clarificationQuestions.length}` : `Plan · ${latestPlan.tickets.length} tickets`}
+                </div>
                 <div className="plan-nav-summary">{latestPlan.summary}</div>
-                {latestPlan.tickets.map((t, i) => (
-                  <div className="plan-nav-ticket" key={t.id}>
-                    <span className="plan-nav-ticket-num">{i + 1}</span>
-                    <div className="plan-nav-ticket-body">
-                      <div className="plan-nav-ticket-title">{t.title}</div>
-                      <span className={`priority-${t.priority} plan-nav-ticket-priority`}>
-                        {t.priority}
-                      </span>
-                    </div>
-                  </div>
-                ))}
+                {hasClarificationQuestions
+                  ? clarificationQuestions.map((question, index) => (
+                      <div className="plan-nav-ticket" key={`question-${index}`}>
+                        <span className="plan-nav-ticket-num">?</span>
+                        <div className="plan-nav-ticket-body">
+                          <div className="plan-nav-ticket-title">{question}</div>
+                        </div>
+                      </div>
+                    ))
+                  : latestPlan.tickets.map((t, i) => (
+                      <div className="plan-nav-ticket" key={t.id}>
+                        <span className="plan-nav-ticket-num">{i + 1}</span>
+                        <div className="plan-nav-ticket-body">
+                          <div className="plan-nav-ticket-title">{t.title}</div>
+                          <span className={`priority-${t.priority} plan-nav-ticket-priority`}>
+                            {t.priority}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
               </div>
             )}
             {headings.length === 0 && !latestPlan && (
@@ -280,36 +314,47 @@ export function PlanningModal(props: {
                 ) : (
                   <div className="modal-stream-list">
                     <div className="epic-main-section">
-                      <div className="epic-main-section-label">Plan Summary</div>
+                      <div className="epic-main-section-label">{hasClarificationQuestions ? "Planner Summary" : "Plan Summary"}</div>
                       <div className="plan-md-content">
                         <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
                           {latestPlan.summary}
                         </ReactMarkdown>
                       </div>
                     </div>
-                    {latestPlan.tickets.map((ticket, index) => (
-                      <div className="epic-main-section" key={ticket.id}>
-                        <div className="epic-main-section-label">
-                          Ticket {index + 1} · {ticket.title}
-                        </div>
+                    {hasClarificationQuestions ? (
+                      <div className="epic-main-section">
+                        <div className="epic-main-section-label">Questions From Planner</div>
                         <div className="plan-md-content">
                           <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                            {[
-                              `**ID:** ${ticket.id}`,
-                              `**Priority:** ${ticket.priority}`,
-                              "",
-                              ticket.description,
-                              "",
-                              "**Acceptance Criteria**",
-                              ...ticket.acceptanceCriteria.map((criterion) => `- ${criterion}`),
-                              "",
-                              `**Allowed Paths:** ${ticket.allowedPaths.join(", ") || "(none)"}`,
-                              `**Dependencies:** ${ticket.dependencies.join(", ") || "(none)"}`
-                            ].join("\n")}
+                            {clarificationQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n")}
                           </ReactMarkdown>
                         </div>
                       </div>
-                    ))}
+                    ) : (
+                      latestPlan.tickets.map((ticket, index) => (
+                        <div className="epic-main-section" key={ticket.id}>
+                          <div className="epic-main-section-label">
+                            Ticket {index + 1} · {ticket.title}
+                          </div>
+                          <div className="plan-md-content">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                              {[
+                                `**ID:** ${ticket.id}`,
+                                `**Priority:** ${ticket.priority}`,
+                                "",
+                                ticket.description,
+                                "",
+                                "**Acceptance Criteria**",
+                                ...ticket.acceptanceCriteria.map((criterion) => `- ${criterion}`),
+                                "",
+                                `**Allowed Paths:** ${ticket.allowedPaths.join(", ") || "(none)"}`,
+                                `**Dependencies:** ${ticket.dependencies.join(", ") || "(none)"}`
+                              ].join("\n")}
+                            </ReactMarkdown>
+                          </div>
+                        </div>
+                      ))
+                    )}
                     <div ref={streamEndRef} />
                   </div>
                 )}
@@ -330,7 +375,7 @@ export function PlanningModal(props: {
                 void sendMessage();
               }
             }}
-            placeholder="Add context or answer questions from the planner..."
+            placeholder={awaitingClarification ? "Answer the planner's questions here..." : "Add context or answer questions from the planner..."}
             disabled={sending}
           />
           <button
@@ -356,7 +401,7 @@ export function PlanningModal(props: {
             onClick={() => void approvePlan()}
             disabled={!canApprove || approving}
           >
-            {approving ? "⏳ Creating epic..." : "✅ Approve Plan"}
+            {approving ? "⏳ Creating epic..." : hasClarificationQuestions ? "💬 Answer questions to continue" : "✅ Approve Plan"}
           </button>
           <button className="btn" onClick={props.onClose}>
             Cancel

@@ -118,6 +118,7 @@ export type AgentStreamStatus = "idle" | "running" | "stalled" | "completed";
 
 export type GoalDecomposition = {
   summary: string;
+  clarificationQuestions?: string[];
   tickets: Array<{
     id: string;
     title: string;

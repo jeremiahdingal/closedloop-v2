@@ -47,7 +47,9 @@ export class MediatedAgentHarness {
     userPrompt: string,
     options?: Partial<MediatedHarnessConfig>
   ): Promise<MediatedHarnessResult> {
-    const systemPrompt = getPromptForRole(role, this.toolContext.cwd, options?.toolMode ?? "native");
+    const systemPrompt = getPromptForRole(role, this.toolContext.cwd, options?.toolMode ?? "native", {
+      allowInstallCommand: (this.toolContext.availableCommands ?? []).includes("install")
+    });
 
     return runMediatedLoop({
       systemPrompt,

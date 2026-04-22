@@ -88,6 +88,7 @@ export interface ToolExecutionContext {
   cwd: string;
   workspaceId: string;
   allowedPaths: string[];
+  availableCommands?: string[];
   braveApiKey?: string;
   ragIndexId?: number;
   db?: any; // AppDatabase - optional to avoid circular deps

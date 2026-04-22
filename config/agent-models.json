@@ -5,7 +5,7 @@
   "tester": "skip",
   "explorer": "mediated:qwen3.5:9b",
   "coder": "qwen3-coder:30b",
-  "epicReviewer": "zai:claude-sonnet-4-20250514",
+  "epicReviewer": "zai:glm-5.1",
   "playWriter": "qwen-cli",
   "playTester": "mediated:qwen3.5:9b",
   "doctor": "qwen3:8b"

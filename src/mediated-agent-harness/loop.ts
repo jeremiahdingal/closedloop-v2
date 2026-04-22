@@ -54,7 +54,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
   const baseURL = config.baseURL ?? "http://localhost:11434/v1";
   const apiKey = config.apiKey ?? "ollama";
   const toolMode = config.toolMode ?? "native";
-  const maxIterations = config.maxIterations ?? 25;
+  const maxIterations = config.maxIterations ?? 80;
   const timeoutMs = config.timeoutMs ?? 900_000;
   const temperature = config.temperature ?? 1.0;
   const topP = config.topP ?? 0.95;
@@ -131,21 +131,21 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       if (!hasNudged) {
         messages.push({
           role: "user",
-          content: "[SYSTEM REMINDER] You are past 60% of your iteration budget. Start wrapping up. When you call finish, result MUST be a raw JSON object with fields: summary, relevantFiles, recommendedFilesForCoding, keyPatterns, unresolvedBlockers. No markdown, no code fences, no commentary. Just the JSON object."
+          content: `[SYSTEM REMINDER] You are past 60% of your iteration budget (${iteration + 1}/${maxIterations}). Start wrapping up. When you call finish, the "result" parameter MUST be a raw JSON string with this exact structure:\n\n{"summary":"<brief summary of what was explored>","relevantFiles":["path/to/file1.ts","path/to/file2.ts"],"recommendedFilesForCoding":["path/to/file1.ts"],"keyPatterns":"<describe key patterns and architecture>","unresolvedBlockers":"<any blockers or 'none'>"}\n\nNo markdown, no code fences, no commentary. Just the raw JSON object as a string value for the "result" parameter.`
         });
         emit({ kind: "text", text: "[nudge] 60% budget reached, reminding explorer about JSON output..." });
       }
     }
 
-    // Convergence: at 50% iterations, force explorer to conclude
-    const convergenceThreshold = Math.floor(maxIterations * 0.85);
+    // Convergence: at 80% iterations, force explorer to conclude
+    const convergenceThreshold = Math.floor(maxIterations * 0.8);
     if (config.role === "explorer" && iteration >= convergenceThreshold) {
       resetExploreModeFiles();
       messages.push({
         role: "user",
-        content: `[SYSTEM] You are at iteration ${iteration + 1} of ${maxIterations}. You have used 85% of your iteration budget. STOP exploring. You MUST call the finish tool NOW. The finish tool takes two parameters: "result" (required, a JSON string with your analysis and findings) and "summary" (optional, a brief text summary). Call it now.`
+        content: `[SYSTEM] You are at iteration ${iteration + 1} of ${maxIterations}. You have used 80% of your iteration budget. STOP exploring. You MUST call the finish tool NOW. The finish tool takes two parameters:\n1. "result" (required): a JSON string with this exact structure:\n{"summary":"<brief summary>","relevantFiles":["path/to/file1.ts","path/to/file2.ts"],"recommendedFilesForCoding":["path/to/file1.ts"],"keyPatterns":"<describe key patterns>","unresolvedBlockers":"<any blockers or none>"}\n2. "summary" (optional): a brief text summary.\n\nCall the finish tool NOW with the result parameter as a raw JSON string. No markdown fences, no extra text.`
       });
-      emit({ kind: "text", text: `[convergence] Budget at 85%, forcing explorer to conclude...` });
+      emit({ kind: "text", text: `[convergence] Budget at 80%, forcing explorer to conclude...` });
     }
 
     // Token threshold: force finish if context window is nearly full

@@ -61,6 +61,10 @@ function resolveOllamaContextWindow(model: string): number {
   return 32768;
 }
 
+function promptExplicitlyRequestsDependencyInstall(prompt: string): boolean {
+  return /\bnpm\s+install\b|\binstall(?: the| a| an)?\s+(?:dependency|dependencies|package|packages|library|libraries|runtime dependency|runtime dependencies|chart library|chart libraries)\b|\badd(?: any missing| the)?\s+(?:dependency|dependencies|package|packages|library|libraries|runtime dependency|runtime dependencies)\b/i.test(prompt);
+}
+
 function buildZodSchemas(z: any) {
   const GoalTicketPlanSchema = z.object({
     id: z.string(),
@@ -352,6 +356,18 @@ export class OpenCodeHybridGateway implements ModelGateway {
   }
 
   runGoalReviewInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview> {
+    if (this.models.epicReviewer === "gemini-cli") {
+      return this.gemini.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (this.models.epicReviewer === "qwen-cli") {
+      return this.qwen.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (this.models.epicReviewer.startsWith("zai:")) {
+      return this.zai.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (this.models.epicReviewer === "codex-cli") {
+      return this.codex.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
     return this.opencode.runEpicReviewer({ role: "epicReviewer", ...input });
   }
 
@@ -361,6 +377,9 @@ export class OpenCodeHybridGateway implements ModelGateway {
     }
     if (this.models.epicDecoder === "qwen-cli") {
       return this.qwen.runEpicDecoder({ role: "epicDecoder", ...input });
+    }
+    if (this.models.epicDecoder.startsWith("zai:")) {
+      return this.zai.runEpicDecoder({ role: "epicDecoder", ...input });
     }
     return this.codex.runEpicDecoder({ role: "epicDecoder", ...input });
   }
@@ -376,6 +395,9 @@ export class OpenCodeHybridGateway implements ModelGateway {
     }
     if (this.models.epicReviewer === "qwen-cli") {
       return this.qwen.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (this.models.epicReviewer.startsWith("zai:")) {
+      return this.zai.runEpicReviewer({ role: "epicReviewer", ...input });
     }
     return this.codex.runEpicReviewer({ role: "epicReviewer", ...input });
   }
@@ -738,6 +760,9 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     if (configuredModel === "qwen-cli") {
       return this.qwen.runEpicDecoder({ role: "epicDecoder", ...input });
     }
+    if (configuredModel.startsWith("zai:")) {
+      return this.zai.runEpicDecoder({ role: "epicDecoder", ...input });
+    }
     if (configuredModel.startsWith("opencode:")) {
       const parsed = await this.opencode.runEpicDecoder({ role: "epicDecoder", ...input });
       return validateGoalDecomposition(parsed);
@@ -831,6 +856,9 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     }
     if (configuredModel === "codex-cli") {
       return this.codex.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (configuredModel.startsWith("zai:")) {
+      return this.zai.runEpicReviewer({ role: "epicReviewer", ...input });
     }
     if (configuredModel.startsWith("opencode:")) {
       return this.opencode.runEpicReviewer({ role: "epicReviewer", ...input });
@@ -942,6 +970,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     onStream?: StreamHook;
   }): Promise<string> {
     const model = this.resolveHarnessModel("explorer");
+    const allowInstallCommand = promptExplicitlyRequestsDependencyInstall(input.prompt);
     input.onStream?.({
       agentRole: "explorer",
       source: "orchestrator",
@@ -953,7 +982,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown");
+    const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : []);
     const harness = new MediatedAgentHarness({
       baseURL: `${this.ollamaBaseURL}/v1`,
       apiKey: "ollama",
@@ -964,7 +993,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     await ensureModelLoaded(model);
     const result = await harness.run("explorer", input.prompt, {
-      maxIterations: 50,
+      maxIterations: 80,
       timeoutMs: 900_000,
       onEvent: (event) => {
         if (event.kind === "text" || event.kind === "thinking") {
@@ -1355,11 +1384,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
   private buildToolContext(
     cwd: string,
     workspaceId: string,
-    ragOptions?: { ragIndexId?: number; db?: any }
+    ragOptions?: { ragIndexId?: number; db?: any },
+    extraCommands?: string[]
   ): ToolExecutionContext {
+    const config = loadConfig();
+    const availableCommands = Array.from(new Set([
+      ...Object.keys(config.commandCatalog),
+      ...(extraCommands ?? [])
+    ]));
     return {
       cwd,
       workspaceId,
+      availableCommands,
       ragIndexId: ragOptions?.ragIndexId,
       db: ragOptions?.db,
       allowedPaths: ["*"],
@@ -1403,8 +1439,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
         } catch { return ""; }
       },
       runNamedCommand: async (name) => {
-        const config = loadConfig();
-        const command = config.commandCatalog[name as keyof typeof config.commandCatalog];
+        const builtinInstallCommand = name === "install" ? "npm install" : null;
+        const command = builtinInstallCommand || config.commandCatalog[name as keyof typeof config.commandCatalog];
         if (!command) return { stdout: "", stderr: `Unknown command: ${name}`, exitCode: 1 };
         const { exec } = await import("node:child_process");
         const { promisify } = await import("node:util");
@@ -1416,10 +1452,10 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
           return { stdout: err.stdout ?? "", stderr: err.stderr ?? String(err), exitCode: err.code ?? 1 };
         }
       },
+      getAvailableCommands: () => availableCommands,
       saveArtifact: async (opts) => {
         const { writeFile, mkdir } = await import("node:fs/promises");
         const path = await import("node:path");
-        const config = loadConfig();
         const dir = path.join(config.artifactsDir, workspaceId);
         await mkdir(dir, { recursive: true });
         const artifactPath = path.join(dir, `${opts.name}.txt`);

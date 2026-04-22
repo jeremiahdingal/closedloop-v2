@@ -48,6 +48,7 @@ export function App() {
   const [planSessionId, setPlanSessionId] = useState<string | null>(null);
   const [planMinimized, setPlanMinimized] = useState(false);
   const [planReady, setPlanReady] = useState(false);
+  const [planAwaitingClarification, setPlanAwaitingClarification] = useState(false);
   const [loading, setLoading] = useState(true);
   const [epicPage, setEpicPage] = useState(0);
   const [epicPageSize] = useState(50);
@@ -1441,15 +1442,21 @@ export function App() {
           open={!planMinimized}
           onMinimize={() => setPlanMinimized(true)}
           onReady={() => setPlanReady(true)}
+          onStateChange={({ hasPlan, awaitingClarification }) => {
+            setPlanReady(hasPlan && !awaitingClarification);
+            setPlanAwaitingClarification(awaitingClarification);
+          }}
           onClose={() => {
             setPlanSessionId(null);
             setPlanMinimized(false);
             setPlanReady(false);
+            setPlanAwaitingClarification(false);
           }}
           onApproved={(epicId) => {
             setPlanSessionId(null);
             setPlanMinimized(false);
             setPlanReady(false);
+            setPlanAwaitingClarification(false);
             setTitle("");
             setGoalText("");
             setTargetBranch("");
@@ -1460,13 +1467,19 @@ export function App() {
 
       {planMinimized && planSessionId && (
         <div 
-          className={`minimized-planner-indicator ${planReady ? 'is-ready' : ''}`}
+          className={`minimized-planner-indicator ${planReady ? 'is-ready' : planAwaitingClarification ? 'is-ready' : ''}`}
           onClick={() => setPlanMinimized(false)}
-          title={planReady ? "Plan is ready! Click to open." : "Planning in progress... Click to open."}
+          title={
+            planReady
+              ? "Plan is ready. Click to open."
+              : planAwaitingClarification
+              ? "Planner needs clarification. Click to answer."
+              : "Planning in progress... Click to open."
+          }
         >
           <span className="min-icon">📐</span>
           <span className="min-label">Planning: {title}</span>
-          {planReady && <span className="min-ready-dot" />}
+          {(planReady || planAwaitingClarification) && <span className="min-ready-dot" />}
         </div>
       )}
 
@@ -1485,7 +1498,7 @@ export function App() {
       {selectedTicket && (
         <TicketModal
           ticket={selectedTicket}
-          events={data.agentEvents}
+          events={selectedTicketEvents}
           runs={data.runs}
           open={true}
           onClose={() => setSelectedTicket(null)}

@@ -13,7 +13,7 @@ import type {
   DirectChatSessionRecord, 
   DirectChatMessageRecord 
 } from "../types.ts";
-import { runPlanDecoder, extractPlanFromStream } from "../orchestration/plan-runner.ts";
+import { runPlanDecoder, extractPlanFromStream, planNeedsClarification } from "../orchestration/plan-runner.ts";
 import { randomId } from "../utils.ts";
 import { git } from "../bridge/git.ts";
 import { runMediatedLoop, resolveModelContextWindow } from "../mediated-agent-harness/loop.ts";
@@ -485,7 +485,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
     { id: "ollama", label: "Ollama (Fallback)", description: "Pure LLM via local Ollama, no workspace tools" },
     { id: "gemma4:26b", label: "Ollama (gemma4:26b)", description: "Pure LLM via local Ollama, no workspace tools" },
-    { id: "zai:claude-sonnet-4-20250514", label: "Z AI (claude-sonnet-4)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
   ],
   epicReviewer: [
     { id: "gemini-cli", label: "Gemini CLI", description: "Workspace-aware local Gemini CLI execution" },
@@ -497,7 +497,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" },
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" },
-    { id: "zai:claude-sonnet-4-20250514", label: "Z AI (claude-sonnet-4)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
   ],
   reviewer: [
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
@@ -509,7 +509,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "qwen3.5:9b", label: "Ollama (qwen3.5:9b)", description: "Pure LLM via local Ollama, no workspace tools" },
     { id: "glm-4.7-flash:q4_K_M", label: "Ollama (glm-4.7-flash)", description: "Pure LLM via local Ollama, no workspace tools" },
     { id: "gemma4:26b", label: "Ollama (gemma4:26b)", description: "Pure LLM via local Ollama, no workspace tools" },
-    { id: "zai:claude-sonnet-4-20250514", label: "Z AI (claude-sonnet-4)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
   ],
   tester: [
     { id: "skip", label: "Skip Tester", description: "Bypass tester step and mark tests as skipped" },
@@ -536,7 +536,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "gemini-cli", label: "Gemini CLI", description: "Workspace-aware local Gemini CLI execution" },
     { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware local Codex CLI execution" },
-    { id: "zai:claude-sonnet-4-20250514", label: "Z AI (claude-sonnet-4)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
@@ -672,6 +672,24 @@ function writeSseEvent(res: http.ServerResponse, event: string, data: unknown, i
   if (id !== undefined) res.write(`id: ${id}\n`);
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function resolveSseCursor(input: {
+  searchParam?: string | null;
+  lastEventIdHeader?: string | string[] | undefined;
+  defaultValue?: number;
+}): number {
+  const defaultValue = input.defaultValue ?? 0;
+  const fromQuery = Number(input.searchParam ?? "");
+  if (Number.isFinite(fromQuery) && fromQuery >= 0) return fromQuery;
+
+  const headerValue = Array.isArray(input.lastEventIdHeader)
+    ? input.lastEventIdHeader[0]
+    : input.lastEventIdHeader;
+  const fromHeader = Number(headerValue ?? "");
+  if (Number.isFinite(fromHeader) && fromHeader >= 0) return fromHeader + 1;
+
+  return defaultValue;
 }
 
 async function main() {
@@ -1187,7 +1205,11 @@ async function main() {
           "cache-control": "no-cache, no-transform",
           connection: "keep-alive"
         });
-        let afterIndex = Number(url.searchParams.get("afterIndex") || 0);
+        let afterIndex = resolveSseCursor({
+          searchParam: url.searchParams.get("afterIndex"),
+          lastEventIdHeader: req.headers["last-event-id"],
+          defaultValue: 0
+        });
         let closed = false;
         req.on("close", () => { closed = true; });
         writeSseEvent(res, "ready", { ok: true, afterIndex, status: session.status });
@@ -1199,7 +1221,11 @@ async function main() {
             writeSseEvent(res, "agent", { ...chunk, id: afterIndex }, afterIndex);
             afterIndex++;
           }
-          writeSseEvent(res, "session_status", { status: session.status, hasPlan: session.latestPlan !== null });
+          writeSseEvent(res, "session_status", {
+            status: session.status,
+            hasPlan: session.latestPlan !== null,
+            awaitingClarification: planNeedsClarification(session.latestPlan)
+          });
           if (session.latestPlan) {
             writeSseEvent(res, "plan_ready", session.latestPlan);
           }
@@ -1239,6 +1265,18 @@ async function main() {
         const session = planSessions.get(sessionId);
         if (!session) return json(res, 404, { error: "plan_session_not_found" });
         if (!session.latestPlan) return json(res, 409, { error: "no_plan_ready", message: "The planner has not produced a plan yet." });
+        if (planNeedsClarification(session.latestPlan)) {
+          return json(res, 409, {
+            error: "clarification_required",
+            message: "The planner is waiting for clarification before the plan can be approved."
+          });
+        }
+        if (session.latestPlan.tickets.length === 0) {
+          return json(res, 409, {
+            error: "empty_plan",
+            message: "The planner has not produced any tickets yet."
+          });
+        }
 
         const approveBody = await readBody(req);
         // Allow approve-time override; fall back to branch set at session creation
@@ -1382,6 +1420,40 @@ async function main() {
           }
         }
       }
+      // ─── Tetris Score API ───
+      if (url.pathname === "/api/tetris/scores" && req.method === "GET") {
+        return json(res, 200, db.getTetrisHighScores(10));
+      }
+      if (url.pathname === "/api/tetris/scores" && req.method === "POST") {
+        const body = await readBody(req);
+        if (!body || typeof body.name !== "string" || typeof body.score !== "number") {
+          return json(res, 400, { error: "name (string) and score (number) required" });
+        }
+        db.addTetrisScore(body.name.slice(0, 3).toUpperCase(), body.score, body.level || 0, body.lines || 0);
+        return json(res, 200, { ok: true });
+      }
+      if (url.pathname === "/api/tetris/scores" && req.method === "DELETE") {
+        db.clearTetrisScores();
+        return json(res, 200, { ok: true });
+      }
+
+      // ─── Pac-Man Score API ───
+      if (url.pathname === "/api/pacman/scores" && req.method === "GET") {
+        return json(res, 200, db.getPacmanHighScores(10));
+      }
+      if (url.pathname === "/api/pacman/scores" && req.method === "POST") {
+        const body = await readBody(req);
+        if (!body || typeof body.name !== "string" || typeof body.score !== "number") {
+          return json(res, 400, { error: "name (string) and score (number) required" });
+        }
+        db.addPacmanScore(body.name.slice(0, 3).toUpperCase(), body.score, body.level || 0);
+        return json(res, 200, { ok: true });
+      }
+      if (url.pathname === "/api/pacman/scores" && req.method === "DELETE") {
+        db.clearPacmanScores();
+        return json(res, 200, { ok: true });
+      }
+
       json(res, 404, { error: "not_found" });
     } catch (error) {
       json(res, 500, { error: (error as Error).message });

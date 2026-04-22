@@ -21,7 +21,7 @@ const ALL_TOOLS = [
   "finish(summary: string, result: string)",
 ];
 
-function commonToolsGuidance(toolMode: ToolMode, readOnly = false): string {
+function commonToolsGuidance(toolMode: ToolMode, readOnly = false, options?: { allowInstallCommand?: boolean }): string {
   const formatBlock = toolMode === "xml"
     ? [
         "## Tool Call Format (CRITICAL)",
@@ -44,7 +44,11 @@ function commonToolsGuidance(toolMode: ToolMode, readOnly = false): string {
     ? "4. The 'finish' tool requires 'summary' (string) and 'result' (JSON string)."
     : "4. When you are done, call the native 'finish' tool with 'summary' (string) and 'result' (JSON string).";
 
-  const toolList = readOnly ? READ_ONLY_TOOLS : ALL_TOOLS;
+  const toolList = readOnly
+    ? options?.allowInstallCommand
+      ? [...READ_ONLY_TOOLS.slice(0, -1), 'run_command(name: string)  // only "install" is allowed here; it runs npm install', READ_ONLY_TOOLS[READ_ONLY_TOOLS.length - 1]]
+      : READ_ONLY_TOOLS
+    : ALL_TOOLS;
 
   return [
     formatBlock,
@@ -241,7 +245,7 @@ Workspace: ${workspaceRoot}
 ${commonToolsGuidance(toolMode)}`;
 }
 
-export function explorerHarnessPrompt(workspaceRoot: string, toolMode: ToolMode = "native"): string {
+export function explorerHarnessPrompt(workspaceRoot: string, toolMode: ToolMode = "native", options?: { allowInstallCommand?: boolean }): string {
   return `You are the Explorer agent. Your ONLY job is to READ and ANALYZE the codebase.
 You must NOT write, modify, create, or delete any files.
 
@@ -249,11 +253,13 @@ YOUR JOB:
 1. Discover relevant files using ${toolExample(toolMode, "glob_files")}, ${toolExample(toolMode, "grep_files")}, and ${toolExample(toolMode, "list_dir")}
 2. Read file contents using ${toolExample(toolMode, "read_file")} or ${toolExample(toolMode, "read_files")}
 3. Use ${toolExample(toolMode, "semantic_search")} or ${toolExample(toolMode, "web_search")} for broader context
-4. Call: ${toolExample(toolMode, "finish")} with a structured analysis
+${options?.allowInstallCommand ? `4. If the ticket explicitly requires dependency installation, you may call ${toolExample(toolMode, "run_command")} with name="install" exactly once to run npm install
+` : ""}${options?.allowInstallCommand ? "5" : "4"}. Call: ${toolExample(toolMode, "finish")} with a structured analysis
 
 ## Rules
 - MAX 20 tool calls
 - You are READ-ONLY. You must NOT call write_file, write_files, remove_file, or any mutation tool.
+- ${options?.allowInstallCommand ? 'run_command("install") is the only command exception, and only because the ticket explicitly requires adding or installing a dependency.' : "Do NOT call run_command."}
 - Do NOT output code blocks in your summary or result. Output only a JSON analysis.
 - Do NOT attempt to implement changes. Your job ends at analysis.
 - Do NOT output file contents verbatim — summarize patterns and key findings instead.
@@ -272,13 +278,13 @@ Call ${toolExample(toolMode, "finish")} with JSON:
 
 Workspace: ${workspaceRoot}
 
-${commonToolsGuidance(toolMode, true)}`;
+${commonToolsGuidance(toolMode, true, options)}`;
 }
 
-export function getPromptForRole(role: string, workspaceRoot: string, toolMode: ToolMode = "native"): string {
+export function getPromptForRole(role: string, workspaceRoot: string, toolMode: ToolMode = "native", options?: { allowInstallCommand?: boolean }): string {
   switch (role) {
     case "explorer":
-      return explorerHarnessPrompt(workspaceRoot, toolMode);
+      return explorerHarnessPrompt(workspaceRoot, toolMode, options);
     case "epicDecoder":
       return epicDecoderPrompt(workspaceRoot, toolMode);
     case "epicReviewer":

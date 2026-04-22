@@ -23,3 +23,11 @@ test("getAvailableToolsList respects role", () => {
   assert.ok(decoderTools.includes("web_search"));
   assert.ok(epicReviewerTools.includes("write_file")); // We added this per user feedback
 });
+
+test("explorer only gets run_command when install is explicitly enabled", () => {
+  const defaultExplorerTools = getAvailableToolsList("explorer");
+  const installExplorerTools = getAvailableToolsList("explorer", { availableCommands: ["install"] });
+
+  assert.equal(defaultExplorerTools.includes("run_command"), false);
+  assert.equal(installExplorerTools.includes("run_command"), true);
+});

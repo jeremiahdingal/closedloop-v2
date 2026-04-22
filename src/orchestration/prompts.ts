@@ -14,6 +14,29 @@ import { type VerificationResult } from "./verifier.ts";
 import { getCompactToolContract, getAvailableToolsList } from "../mediated-agent-harness/tools.ts";
 import type { BuiltContext } from "../rag/context-builder.ts";
 
+type EpicReviewerTicketGitContext = {
+  ticketId: string;
+  baseRef: string | null;
+  headRef: string | null;
+  allowedPaths: string[];
+  branchName?: string | null;
+  hasWorkspaceChanges?: boolean;
+};
+
+function promptShellQuote(value: string): string {
+  return JSON.stringify(String(value ?? "").replace(/\\/g, "/"));
+}
+
+function buildPromptPathArgs(paths: string[]): string {
+  const normalized = (paths ?? [])
+    .map((pathValue) => String(pathValue || "").trim())
+    .filter(Boolean)
+    .map((pathValue) => pathValue.replace(/\\/g, "/"))
+    .filter((pathValue) => pathValue !== "*" && pathValue !== ".");
+
+  return normalized.length ? ` -- ${normalized.map(promptShellQuote).join(" ")}` : "";
+}
+
 
 export function epicDecoderPrompt(epic: EpicRecord): string {
   return [
@@ -580,19 +603,30 @@ export function epicReviewerCodexPrompt(
 export function epicReviewerDirectCliPrompt(input: {
   epic: EpicRecord;
   tickets: TicketRecord[];
-  ticketDiffs: Map<string, string>;
   reviewPackets: Map<string, TicketEpicReviewPacket>;
+  ticketGitContext?: EpicReviewerTicketGitContext[];
   ragContext?: { codeContext: string; docContext: string } | null;
   projectStructure?: string | null;
   targetBranch?: string | null;
+  /** Git ref (branch or commit) that serves as the base for the review diff */
+  diffBase?: string | null;
 }): string {
-  const { epic, tickets, ticketDiffs, reviewPackets, ragContext, projectStructure, targetBranch } = input;
+  const { epic, tickets, reviewPackets, ticketGitContext = [], ragContext, projectStructure, targetBranch, diffBase } = input;
+  const gitContextByTicket = new Map(ticketGitContext.map((entry) => [entry.ticketId, entry]));
+  const holisticRange = diffBase ? `${diffBase}..HEAD` : "HEAD";
 
+  // ── Ticket metadata sections (info the CLI cannot discover from the workspace) ──
   const ticketSections = tickets.map(t => {
-    const diff = ticketDiffs.get(t.id);
     const packet = reviewPackets.get(t.id);
+    const gitContext = gitContextByTicket.get(t.id);
     const criteria = t.acceptanceCriteria.map(c => `  - ${c}`).join("\n");
     const paths = t.allowedPaths.join(", ");
+    const pathArgs = buildPromptPathArgs(gitContext?.allowedPaths ?? t.allowedPaths);
+    const ticketRange = gitContext?.baseRef && gitContext?.headRef
+      ? `${gitContext.baseRef}..${gitContext.headRef}`
+      : diffBase
+        ? `${diffBase}..HEAD`
+        : null;
 
     const lines: string[] = [
       `### Ticket: ${t.id}`,
@@ -606,6 +640,27 @@ export function epicReviewerDirectCliPrompt(input: {
 
     if (t.prUrl) {
       lines.push(`PR: ${t.prUrl}`);
+    }
+
+    lines.push("");
+    lines.push("Git Review Commands:");
+    if (ticketRange) {
+      lines.push(`- Ticket diff: git diff ${ticketRange}${pathArgs}`);
+      lines.push(`- Ticket diff stat: git diff --stat ${ticketRange}${pathArgs}`);
+      lines.push(`- Ticket changed files: git diff --name-only ${ticketRange}${pathArgs}`);
+    } else {
+      lines.push(`- Ticket diff: git diff${pathArgs}`);
+      lines.push(`- Ticket diff stat: git diff --stat${pathArgs}`);
+    }
+    if (gitContext?.headRef) {
+      lines.push(`- Ticket commits: git log --oneline ${gitContext.headRef} -n 5`);
+      lines.push(`- Final ticket commit summary: git show --stat --summary ${gitContext.headRef}`);
+    }
+    if (gitContext?.branchName) {
+      lines.push(`- Ticket branch/worktree hint: ${gitContext.branchName}`);
+    }
+    if (gitContext?.hasWorkspaceChanges && !gitContext.headRef) {
+      lines.push("- This ticket may include uncommitted workspace changes. Inspect `git status --short` and `git diff` in addition to commit-based review.");
     }
 
     // Include reviewer verdict for failing/problematic tickets
@@ -634,29 +689,31 @@ export function epicReviewerDirectCliPrompt(input: {
       }
     }
 
-    // Include the actual diff
-    if (diff && diff.trim()) {
-      lines.push("");
-      lines.push(`#### Git Diff`);
-      lines.push("```diff");
-      lines.push(diff.length > 8000 ? diff.slice(0, 8000) + "\n... (truncated)" : diff);
-      lines.push("```");
-    } else {
-      lines.push("");
-      lines.push(`#### Git Diff: (no changes detected)`);
-    }
-
     return lines.join("\n");
   }).join("\n\n");
 
+  // ── System instructions ──
   const sections: string[] = [
-    "You are the Epic Reviewer agent. You have access to the full workspace with all ticket changes merged in.",
+    "You are the Epic Reviewer agent. You have access to the full workspace with all ticket changes already merged in.",
+    "",
+    "IMPORTANT: All ticket code changes are already present in your working directory.",
+    "Do NOT rely on embedded/truncated diffs in the prompt. Pull the git history and diffs yourself.",
+    "Use git in two passes: first holistically for the whole epic, then ticket-by-ticket using the command hints below.",
+    "",
+    "Recommended whole-epic commands:",
+    "1. Run: git status --short",
+    `2. Run: git diff --stat ${holisticRange}`,
+    `3. Run: git diff ${holisticRange}`,
+    `4. Run: git diff --name-only ${holisticRange}`,
+    "5. If the holistic diff is large, switch to ticket-specific diff commands from the ticket metadata below.",
+    "6. Read source files directly after locating suspicious hunks.",
     "",
     "Your job is to:",
     "1. Review ALL ticket changes against the epic goal and acceptance criteria",
     "2. Check for destructive patterns, integration issues, and missing acceptance criteria",
-    "3. FIX any issues you find DIRECTLY in the workspace",
-    "4. Push your fixes to the target branch if one is specified",
+    "3. Use the ticket-specific git commands below to verify each ticket in isolation when needed",
+    "4. FIX any issues you find DIRECTLY in the workspace",
+    "5. Push your fixes to the target branch if one is specified",
     "",
     "Destructive patterns to check for:",
     "- Large file deletions (>10 files or >1000 lines)",
@@ -697,14 +754,17 @@ export function epicReviewerDirectCliPrompt(input: {
   sections.push(`Goal: ${epic.goalText}`);
   sections.push("");
   sections.push(`## Tickets (${tickets.length} total)`);
+  sections.push("Each ticket's metadata is below, including git commands for isolated review. Use those commands instead of relying on prompt-injected diffs.");
   sections.push(ticketSections);
   sections.push("");
   sections.push("## Instructions");
-  sections.push("1. Review each ticket's diff against its acceptance criteria");
-  sections.push("2. Check for cross-ticket integration issues");
-  sections.push("3. If you find issues, FIX THEM DIRECTLY by editing the files");
-  sections.push("4. Commit and push any fixes to the target branch");
-  sections.push("5. Do NOT create followup tickets unless the issue cannot be fixed");
+  sections.push(`1. Start with the whole-epic diff: \`git diff ${holisticRange}\``);
+  sections.push("2. For each ticket, run the ticket-specific `git diff` command listed in that ticket section to inspect only its scoped paths");
+  sections.push("3. Cross-reference each ticket's changes against its acceptance criteria above");
+  sections.push("4. Check for cross-ticket integration issues (conflicting changes, missing imports, broken shared types, etc.)");
+  sections.push("5. If you find issues, FIX THEM DIRECTLY by editing the files");
+  sections.push("6. Commit and push any fixes to the target branch");
+  sections.push("7. Do NOT create followup tickets unless the issue cannot be fixed");
   sections.push("");
   sections.push("After you finish, output exactly one FINAL_JSON block and nothing after it.");
   sections.push('<FINAL_JSON>{"verdict":"approved|needs_followups|failed","summary":"brief summary","followupTickets":[]}</FINAL_JSON>');
@@ -840,8 +900,9 @@ export function epicDecoderPlanModePrompt(
     "1. Explore the repo structure — read key files, understand existing patterns and architecture",
     "2. Identify what is already implemented vs what needs to be built",
     "3. Note ambiguities, risks, or things you are unsure about",
-    "4. Decompose the epic into well-scoped, independently executable tickets",
-    "5. Each ticket must have clear acceptance criteria, file scope (allowedPaths), dependencies, and priority",
+    "4. If a critical ambiguity would materially change ticket boundaries or acceptance criteria, pause and ask concise clarification questions instead of guessing",
+    "5. Otherwise, decompose the epic into well-scoped, independently executable tickets",
+    "6. Each ticket must have clear acceptance criteria, file scope (allowedPaths), dependencies, and priority",
     "Think carefully. Be specific about what each ticket changes and why.",
     [
       "⚠️ EXECUTOR CONSTRAINT — critical for ticket design:",
@@ -856,9 +917,28 @@ export function epicDecoderPlanModePrompt(
       "Avoid vague titles like 'Update module X' — be precise: 'Add exportFoo() to src/foo.ts'.",
     ].join("\n"),
     "## Required Output Format",
-    "Before outputting FINAL_JSON, you MUST write a structured analysis in plain text so the user can follow your reasoning. Use this exact format:\n\n## Codebase Analysis\n[Describe what you found: key files, existing patterns, relevant architecture, important types/interfaces]\n\n## What Exists vs What Needs Building\n[Enumerate what is already implemented and what is missing or incomplete]\n\n## Risks & Unknowns\n[List ambiguities, potential issues, or things that need clarification]\n\n## Ticket Overview\n[For each ticket: name, 1-sentence rationale, key files it touches]\n\nThen, after this analysis, output exactly one FINAL_JSON block:",
+    [
+      "Before outputting FINAL_JSON, you MUST write a structured analysis in plain text so the user can follow your reasoning. Use this exact format:",
+      "",
+      "## Codebase Analysis",
+      "[Describe what you found: key files, existing patterns, relevant architecture, important types/interfaces]",
+      "",
+      "## What Exists vs What Needs Building",
+      "[Enumerate what is already implemented and what is missing or incomplete]",
+      "",
+      "## Risks & Unknowns",
+      "[List ambiguities, potential issues, or things that need clarification]",
+      "",
+      "## Ticket Overview",
+      "[For each ticket: name, 1-sentence rationale, key files it touches]",
+      "",
+      "Then, after this analysis, output exactly one FINAL_JSON block.",
+      "If you need clarification before planning, return `tickets: []` and set `clarificationQuestions` to 1-3 specific questions the user can answer directly.",
+      "Only use clarificationQuestions for genuinely plan-shaping unknowns. If the repo inspection gives enough signal, produce the full plan instead."
+    ].join("\n"),
     `<FINAL_JSON>${JSON.stringify({
       summary: "brief summary of overall plan",
+      clarificationQuestions: [],
       tickets: [{
         id: "string",
         title: "string",
@@ -868,6 +948,15 @@ export function epicDecoderPlanModePrompt(
         allowedPaths: ["string"],
         priority: "high|medium|low"
       }]
+    })}</FINAL_JSON>`,
+    `Clarification example:\n<FINAL_JSON>${JSON.stringify({
+      summary: "Need a few answers before I can break this into reliable tickets.",
+      clarificationQuestions: [
+        "Which existing route or screen should own this feature?",
+        "Should this behavior be gated behind a feature flag or replace the current flow?",
+        "Do you want tests included in this epic or handled separately?"
+      ],
+      tickets: []
     })}</FINAL_JSON>`
   );
 

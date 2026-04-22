@@ -1419,6 +1419,16 @@ async function execRunCommand(
     return { callId, name: "run_command", output: "Error: name is required", isError: true };
   }
 
+  const availableCommands = ctx.getAvailableCommands?.() ?? ctx.availableCommands ?? [];
+  if (availableCommands.length > 0 && !availableCommands.includes(name)) {
+    return {
+      callId,
+      name: "run_command",
+      output: `Error: command '${name}' is not available in this workspace. Available commands: ${availableCommands.join(", ")}`,
+      isError: true
+    };
+  }
+
   const result = await ctx.runNamedCommand(name);
   const output = [
     result.stdout.trim(),
@@ -1654,13 +1664,16 @@ export function getCompactToolContract(toolNames: string[]): string {
   return lines.join("\n");
 }
 
-export function getAvailableToolsList(role: string): string[] {
+export function getAvailableToolsList(role: string, options?: { availableCommands?: string[] }): string[] {
+  const availableCommands = new Set(options?.availableCommands ?? []);
   const common = ["explore_mode", "read_file", "read_files", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
   if (role === "builder") {
     return [...common, "write_file", "write_files", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files"];
   }
   if (role === "explorer") {
-    return ["explore_mode", "read_file", "read_files", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
+    return availableCommands.has("install")
+      ? [...common, "run_command"]
+      : ["explore_mode", "read_file", "read_files", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
   }
   if (role === "reviewer") {
     return ["read_file", "list_dir", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files", "finish"];

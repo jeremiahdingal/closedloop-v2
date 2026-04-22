@@ -22,7 +22,7 @@ export function isRunActiveForRole(role: string, run: Run): boolean {
   if (role === "tester") return run.kind === "ticket" && (node === "tester" || node.includes("test"));
   if (role === "doctor") return run.kind === "ticket" && (node === "doctor" || node.includes("classify") || node === "error");
   if (role === "epicDecoder") return run.kind === "epic" && node.includes("decompose");
-  if (role === "epicReviewer") return run.kind === "epic" && (node.includes("goal_review") || node.includes("review"));
+  if (role === "epicReviewer") return (run.kind === "epic" || run.kind === "epic_review") && (node.includes("goal_review") || node.includes("review"));
   return false;
 }
 
