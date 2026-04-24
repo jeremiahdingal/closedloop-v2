@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir, rename, unlink } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import type { CanonicalEditPacket, CoderOutput, EditOperation, TicketRecord } from "../types.ts";
+import { fuzzyMatch } from "../utils.ts";
 
 export type VerifierOutcome = "accepted" | "repairable" | "escalate" | "empty_failure";
 
@@ -89,33 +90,11 @@ export async function verifyAndApplyEdits(
 
         // Fallback: normalize whitespace for matching (handles tabs vs spaces, trailing whitespace)
         if (index === -1) {
-          const normalizeWs = (s: string) => s.replace(/\r\n/g, "\n").replace(/\t/g, "  ").replace(/[ \t]+$/gm, "");
-          const normCurrent = normalizeWs(currentContent);
-          const normSearch = normalizeWs(op.search);
-          const normIndex = normCurrent.indexOf(normSearch);
-          if (normIndex !== -1) {
-            // Find the corresponding position in the original content
-            // Use the normalized position as a hint and scan nearby
-            const approxCharCount = normSearch.length;
-            for (let scanStart = Math.max(0, normIndex - 50); scanStart < Math.min(currentContent.length, normIndex + 200); scanStart++) {
-              const candidate = currentContent.slice(scanStart, scanStart + op.search.length + 100);
-              const normCandidate = normalizeWs(candidate);
-              if (normCandidate.startsWith(normSearch)) {
-                // Find the actual end position by matching normalized length
-                let endOffset = 0;
-                let normOffset = 0;
-                while (normOffset < normSearch.length && scanStart + endOffset < currentContent.length) {
-                  const ch = currentContent[scanStart + endOffset];
-                  const normCh = normalizeWs(ch);
-                  endOffset++;
-                  normOffset += normCh.length;
-                }
-                index = scanStart;
-                usedFuzzyMatch = true;
-                console.warn(`[VERIFIER] Fuzzy whitespace match for ${op.path} at offset ${index}`);
-                break;
-              }
-            }
+          const fuzzyResult = fuzzyMatch(currentContent, op.search);
+          if (fuzzyResult) {
+            index = fuzzyResult.index;
+            usedFuzzyMatch = true;
+            console.warn(`[VERIFIER] Fuzzy whitespace match for ${op.path} at offset ${index}`);
           }
         }
 

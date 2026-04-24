@@ -430,7 +430,7 @@ export class TicketRunner {
       this.db.updateRun({ runId, status: "running", currentNode: "coder", heartbeatAt: nowIso(), lastMessage: "Coder generating edits..." });
       this.heartbeat(runId, ticket.id, "coder", "Coder generating edits...");
 
-      const coderRaw = await this.gateway.runCoderInWorkspace!({
+      const coderResult = await this.gateway.runCoderInWorkspace!({
         cwd: workspace.worktreePath,
         prompt: coderPrompt(ticket, state.explorerOutput, state.canonicalEditPacket, { blockers: state.reviewBlockers ?? [], suggestions: state.reviewSuggestions ?? [] }, { skipped: state.skipExplorer, reason: "Explorer was skipped by user request." }),
         runId, ticketId: ticket.id, epicId: ticket.epicId, skipExplorer: state.skipExplorer,
@@ -442,15 +442,87 @@ export class TicketRunner {
         }
       });
 
+      // Detect direct writes from tool call history
+      const writeToolNames = new Set(["write_file", "write_files", "search_replace"]);
+      const directWrites = (coderResult.toolCalls ?? []).filter(tc => writeToolNames.has(tc.name));
+      console.log(`[TICKET ${ticket.id}] Coder result: ${coderResult.toolCalls?.length ?? 0} tool calls, ${directWrites.length} direct writes. Tool names: ${(coderResult.toolCalls ?? []).map(tc => tc.name).join(", ")}`);
+
+      if (directWrites.length > 0) {
+        const intendedFiles = directWrites.flatMap(tc => {
+          if (tc.name === "write_files" && Array.isArray(tc.args?.files)) {
+            return (tc.args.files as Array<{ path: string }>).map(f => f.path);
+          }
+          return tc.args?.path ? [String(tc.args.path)] : [];
+        });
+        console.log(`[TICKET ${ticket.id}] Coder made ${directWrites.length} direct write calls: ${intendedFiles.join(", ")}`);
+
+        // Stage and commit the coder's writes
+        await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] ${ticket.title} (coder direct write)` });
+
+        // Auto-detect package.json changes and run npm install
+        const touchedPackageJson = intendedFiles.some(f => f.replace(/\\/g, "/").endsWith("package.json"));
+        if (touchedPackageJson) {
+          try {
+            this.heartbeat(runId, ticket.id, "coder", "Running npm install (package.json modified)...");
+            const { exec } = require("node:child_process");
+            const { promisify } = require("node:util");
+            const execAsync = promisify(exec);
+            await execAsync("npm install", { cwd: workspace.worktreePath, timeout: 120_000 });
+            const postInstallDiff = await this.bridge.gitDiff(workspace.id);
+            if (postInstallDiff && postInstallDiff.trim()) {
+              await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] npm install (lockfile update)` });
+            }
+          } catch (err) {
+            console.warn(`[TICKET ${ticket.id}] npm install failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+
+        // Get diff — first try staged (new changes), then fall back to diff against effective diff base
+        let diff = await this.bridge.gitDiff(workspace.id);
+        if (!diff || !diff.trim()) {
+          const diffBase = await getEffectiveDiffBase(workspace.worktreePath, workspace.baseCommit);
+          const baseDiff = await git(workspace.worktreePath, ["diff", diffBase, "--", "."]);
+          diff = baseDiff.stdout.trim();
+          if (diff) {
+            console.log(`[TICKET ${ticket.id}] No new staged diff, but found changes vs diff base ${diffBase}`);
+          }
+        }
+
+        if (diff && diff.trim()) {
+          return {
+            coderOutput: { operations: [], summary: `Coder wrote ${directWrites.length} files directly`, intendedFiles, unresolvedBlockers: [] },
+            lastDiff: diff,
+            noDiff: false,
+            lastMessage: "Coder wrote files directly via tool calls.",
+            status: "reviewing" as const,
+          } satisfies Partial<TicketGraphState>;
+        }
+
+        // Tool calls succeeded but no diff at all — trust the tool calls and proceed
+        console.warn(`[TICKET ${ticket.id}] Coder made ${directWrites.length} write calls but no diff detected — trusting tool calls`);
+        return {
+          coderOutput: { operations: [], summary: `Coder wrote ${directWrites.length} files directly (no diff captured)`, intendedFiles, unresolvedBlockers: [] },
+          lastDiff: "",
+          noDiff: false,
+          lastMessage: "Coder wrote files via tool calls (diff not captured).",
+          status: "reviewing" as const,
+        } satisfies Partial<TicketGraphState>;
+      }
+
+      // Fallback: try JSON extraction from text output (legacy path)
       let coderOutput;
       try {
-        coderOutput = extractCoderJson(coderRaw);
+        coderOutput = extractCoderJson(coderResult.text);
       } catch (parseErr) {
-        // JSON parse failed — check if workspace has diffs anyway
-        const existingDiff = await this.bridge.gitDiff(workspace.id);
+        await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] ${ticket.title} (coder output commit)` });
+        let existingDiff = await this.bridge.gitDiff(workspace.id);
+        if (!existingDiff || !existingDiff.trim()) {
+          const diffBase = await getEffectiveDiffBase(workspace.worktreePath, workspace.baseCommit);
+          const baseDiff = await git(workspace.worktreePath, ["diff", diffBase, "--", "."]);
+          existingDiff = baseDiff.stdout.trim() || existingDiff;
+        }
         if (existingDiff && existingDiff.trim()) {
-          console.log(`[TICKET ${ticket.id}] Coder output was not valid JSON but workspace has diff — committing and proceeding`);
-          await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] ${ticket.title} (coder direct write)` });
+          console.log(`[TICKET ${ticket.id}] Coder output was not valid JSON but workspace has diff — proceeding`);
           return {
             coderOutput: { operations: [], summary: "Coder output was not valid JSON but files were written to workspace", unresolvedBlockers: [] },
             lastDiff: existingDiff,
@@ -459,8 +531,8 @@ export class TicketRunner {
             status: "reviewing" as const,
           } satisfies Partial<TicketGraphState>;
         }
-        this.heartbeat(runId, ticket.id, "system", `Coder output was not valid JSON. Escalating. Raw output: ${coderRaw.slice(0, 200)}`);
-        return { status: "building" as const, lastMessage: `Coder output invalid: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}` };
+        this.heartbeat(runId, ticket.id, "system", `Coder output was not valid JSON. Escalating. Raw output: ${coderResult.text.slice(0, 200)}`);
+        return { status: "building" as const, buildAttempts: state.buildAttempts + 1, lastMessage: `Coder output invalid: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}` };
       }
 
       return {
@@ -472,7 +544,7 @@ export class TicketRunner {
     const verifyNode = async (state: TicketGraphState) => {
       this.assertNotCancelled(ticket.id, ticket.epicId);
       if (!state.coderOutput || !state.canonicalEditPacket) {
-        return { status: "building" as const, noDiff: true, lastMessage: "Verify skipped." } satisfies Partial<TicketGraphState>;
+        return { status: "building" as const, noDiff: true, buildAttempts: state.buildAttempts + 1, lastMessage: "Verify skipped." } satisfies Partial<TicketGraphState>;
       }
       const workspace = this.bridge.requireWorkspace(state.workspaceId);
       this.heartbeat(runId, ticket.id, "coder", "Verifying and applying edits...");
@@ -501,6 +573,25 @@ export class TicketRunner {
       if (verificationResult.outcome === "accepted" || (verificationResult.outcome === "repairable" && hasAppliedOps)) {
         const diffResult = await this.bridge.gitDiff(workspace.id);
         await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] ${ticket.title}${verificationResult.outcome === "repairable" ? " (partial)" : ""}` });
+
+        // Auto-detect package.json changes from applied operations and run npm install
+        const touchedPackageJson = verificationResult.appliedOperations.some(op => op.path.replace(/\\/g, "/").endsWith("package.json"));
+        if (touchedPackageJson) {
+          try {
+            this.heartbeat(runId, ticket.id, "coder", "Running npm install (package.json modified via edit plan)...");
+            const { exec } = require("node:child_process");
+            const { promisify } = require("node:util");
+            const execAsync = promisify(exec);
+            await execAsync("npm install", { cwd: workspace.worktreePath, timeout: 120_000 });
+            const postInstallDiff = await this.bridge.gitDiff(workspace.id);
+            if (postInstallDiff && postInstallDiff.trim()) {
+              await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] npm install (lockfile update)` });
+            }
+          } catch (err) {
+            console.warn(`[TICKET ${ticket.id}] npm install failed after verify: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+
         const hasDiff = !!diffResult.trim();
         if (hasDiff) {
           return {
@@ -517,7 +608,12 @@ export class TicketRunner {
 
       // Coder produced 0 ops ("already satisfied") — check if workspace already has a diff from a previous run
       if (verificationResult.outcome === "empty_failure" || verificationResult.outcome === "escalate") {
-        const existingDiff = await this.bridge.gitDiff(workspace.id);
+        let existingDiff = await this.bridge.gitDiff(workspace.id);
+        if (!existingDiff || !existingDiff.trim()) {
+          const diffBase = await getEffectiveDiffBase(workspace.worktreePath, workspace.baseCommit);
+          const baseDiff = await git(workspace.worktreePath, ["diff", diffBase, "--", "."]);
+          existingDiff = baseDiff.stdout.trim() || existingDiff;
+        }
         if (existingDiff && existingDiff.trim()) {
           console.log(`[VERIFY] ${ticket.id} coder produced 0 ops but workspace has existing diff — treating as already-complete`);
           this.heartbeat(runId, ticket.id, "coder", "No new operations needed — workspace already contains changes. Proceeding to review.");
@@ -532,7 +628,12 @@ export class TicketRunner {
       }
 
       // Complete failure, escalate, or empty — check workspace one last time before giving up
-      const lastChanceDiff = await this.bridge.gitDiff(workspace.id);
+      let lastChanceDiff = await this.bridge.gitDiff(workspace.id);
+      if (!lastChanceDiff || !lastChanceDiff.trim()) {
+        const diffBase = await getEffectiveDiffBase(workspace.worktreePath, workspace.baseCommit);
+        const baseDiff = await git(workspace.worktreePath, ["diff", diffBase, "--", "."]);
+        lastChanceDiff = baseDiff.stdout.trim() || lastChanceDiff;
+      }
       if (lastChanceDiff && lastChanceDiff.trim()) {
         console.log(`[VERIFY] ${ticket.id} verification ${verificationResult.outcome} but workspace has diff — committing and proceeding`);
         await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] ${ticket.title} (partial coder)` });
@@ -548,6 +649,7 @@ export class TicketRunner {
       return {
         verificationResult,
         noDiff: true,
+        buildAttempts: state.buildAttempts + 1,
         lastMessage: `Verification ${verificationResult.outcome}: ${verificationResult.summary}`,
         status: "building" as const,
       } satisfies Partial<TicketGraphState>;
@@ -880,7 +982,20 @@ export class TicketRunner {
 
     const classifyNode = async (state: TicketGraphState) => {
       this.assertNotCancelled(ticket.id, ticket.epicId);
-      console.log(`[TICKET ${ticket.id}] Classify node: buildAttempts=${state.buildAttempts}, noDiff=${state.noDiff}, repeatedBlockers=${state.repeatedBlockers}`);
+      console.log(`[TICKET ${ticket.id}] Classify node: buildAttempts=${state.buildAttempts}/${state.maxBuildAttempts}, noDiff=${state.noDiff}, repeatedBlockers=${state.repeatedBlockers}`);
+
+      // Hard guard: prevent infinite retry loops
+      if (state.buildAttempts >= state.maxBuildAttempts) {
+        const reason = `Max build attempts (${state.maxBuildAttempts}) reached. ${state.noDiff ? "Code may already satisfy criteria — check manually." : "Repeated failures."}`;
+        console.log(`[TICKET ${ticket.id}] Classify: max attempts reached, escalating`);
+        return {
+          failureDecision: "escalate",
+          failureReason: reason,
+          lastMessage: reason,
+          status: "escalated"
+        } satisfies Partial<TicketGraphState>;
+      }
+
       if (state.repeatedBlockers) {
         const reason = "Reviewer produced duplicate/unchanged verdicts across attempts; escalating early to prevent drift.";
         console.log(`[TICKET ${ticket.id}] Classify early escalation: ${reason}`);
@@ -901,9 +1016,37 @@ export class TicketRunner {
         repeatedTestFailure: state.repeatedTestFailure,
         noDiff: state.noDiff,
         infraFailure: false,
-        // currentNode derived from status // status in state matches current role/node
       });
       console.log(`[TICKET ${ticket.id}] Doctor decision: ${failure.decision} - ${failure.reason}`);
+
+      // Override retry_builder when noDiff is true — code already satisfies criteria, approve instead
+      if (failure.decision === "retry_builder" && state.noDiff) {
+        const diffResult = await this.bridge.gitDiff(state.workspaceId);
+        if (!diffResult || !diffResult.trim()) {
+          const ws = this.bridge.requireWorkspace(state.workspaceId);
+          const diffBase = await getEffectiveDiffBase(ws.worktreePath, ws.baseCommit);
+          const baseDiff = await git(ws.worktreePath, ["diff", diffBase, "--", "."]);
+          if (baseDiff.stdout.trim()) {
+            console.log(`[TICKET ${ticket.id}] Doctor said retry_builder with noDiff, but found diff vs ${diffBase} — approving`);
+            return {
+              failureDecision: "approve",
+              failureReason: `Code already satisfies acceptance criteria (changes exist on branch). ${failure.reason}`,
+              lastMessage: failure.reason,
+              lastDiff: baseDiff.stdout.trim(),
+              status: "reviewing" as const,
+              reviewApproved: true,
+            } satisfies Partial<TicketGraphState>;
+          }
+        }
+        console.log(`[TICKET ${ticket.id}] Doctor said retry_builder with noDiff and no diff found — escalating`);
+        return {
+          failureDecision: "escalate",
+          failureReason: `Doctor recommended retry but noDiff=true and no changes detected. ${failure.reason}`,
+          lastMessage: failure.reason,
+          status: "escalated"
+        } satisfies Partial<TicketGraphState>;
+      }
+
       if (failure.decision === "approve") {
         const diffResult = await this.bridge.gitDiff(state.workspaceId);
         console.log(`[TICKET ${ticket.id}] Doctor approved (code already satisfies criteria).`);
@@ -927,8 +1070,24 @@ export class TicketRunner {
     const finalizeSuccess = async (state: TicketGraphState) => {
       this.assertNotCancelled(ticket.id, ticket.epicId);
       this.db.updateRun({ runId, status: "succeeded", currentNode: "complete", heartbeatAt: nowIso(), lastMessage: "Ticket approved." });
-      
-      const diffStats = await this.bridge.getDiffStats(state.workspaceId);
+
+      // Capture diff stats — first try staged, then fall back to diff against merge-base
+      let diffStats = await this.bridge.getDiffStats(state.workspaceId);
+      if (diffStats.length === 0) {
+        try {
+          const ws = this.bridge.requireWorkspace(state.workspaceId);
+          const diffBase = await getEffectiveDiffBase(ws.worktreePath, ws.baseCommit);
+          const numstatResult = await git(ws.worktreePath, ["diff", diffBase, "--numstat", "--", "."]);
+          diffStats = numstatResult.stdout.trim().split("\n").map(l => l.trim()).filter(Boolean).map(line => {
+            const parts = line.split("\t");
+            const a = parseInt(parts[0] ?? "", 10);
+            const d = parseInt(parts[1] ?? "", 10);
+            return { path: parts.slice(2).join("\t"), additions: Number.isFinite(a) ? a : 0, deletions: Number.isFinite(d) ? d : 0 };
+          }).filter(r => r.path.length > 0);
+        } catch (err) {
+          console.warn(`[TICKET ${ticket.id}] Failed to get diff stats against merge-base: ${err}`);
+        }
+      }
       const commitResult = await this.bridge.gitCommit({ workspaceId: state.workspaceId, message: `[${ticket.id}] automated ticket completion` });
       
         const epic = this.db.getEpic(ticket.epicId);
@@ -1070,10 +1229,10 @@ export class TicketRunner {
         (state: TicketGraphState) => {
           if (state.failureDecision === "approve") return "finalize_success";
           if (["escalate", "blocked", "todo"].includes(state.failureDecision)) return "finalize_escalated";
-          if (state.failureDecision === "retry_same_node" || state.failureDecision === "retry_builder") return "builder";
+          if (state.failureDecision === "retry_same_node" || state.failureDecision === "retry_builder") return "build_packet";
           return "finalize_failed";
         },
-        ["finalize_success", "finalize_escalated", "finalize_failed", "builder"]
+        ["finalize_success", "finalize_escalated", "finalize_failed", "build_packet"]
       )
       .addEdge("finalize_success", END)
       .addEdge("finalize_escalated", END)
@@ -2435,4 +2594,17 @@ function extractCoderJson(raw: string): any {
   }
 
   throw new Error(`Could not extract JSON from coder output (${raw.length} chars): ${raw.slice(0, 200)}`);
+}
+
+async function getEffectiveDiffBase(worktreePath: string, baseCommit: string): Promise<string> {
+  // For target-branch workflows, baseCommit is HEAD of the branch (not the branch point).
+  // Use merge-base with origin/main to get the true diff base.
+  for (const upstream of ["origin/main", "origin/master", "main", "master"]) {
+    try {
+      const mb = await git(worktreePath, ["merge-base", upstream, "HEAD"]);
+      const mergeBase = mb.stdout.trim();
+      if (mergeBase && mergeBase !== baseCommit) return mergeBase;
+    } catch {}
+  }
+  return baseCommit;
 }

@@ -5,9 +5,27 @@ import { promisify } from "node:util";
 import type { ToolDef, ToolExecutionContext, ToolCall, ToolResult } from "./types.ts";
 import { ToolExecutionError } from "./errors.ts";
 import { retrieveChunks } from "../rag/retriever.ts";
+import { fuzzyMatch } from "../utils.ts";
 import { chromium, type Browser, type Page, type BrowserContext } from "playwright";
 
 const execFileAsync = promisify(execFile);
+
+// Read-before-write tracking: maps cwd -> Set of file paths read this session
+const filesReadBySession = new Map<string, Set<string>>();
+
+export function trackFileRead(cwd: string, filePath: string): void {
+  let set = filesReadBySession.get(cwd);
+  if (!set) { set = new Set(); filesReadBySession.set(cwd, set); }
+  set.add(filePath);
+}
+
+export function hasFileBeenRead(cwd: string, filePath: string): boolean {
+  return filesReadBySession.get(cwd)?.has(filePath) ?? false;
+}
+
+export function resetSessionTracking(cwd: string): void {
+  filesReadBySession.delete(cwd);
+}
 
 // Browser state management
 const browserState = new Map<string, { browser: Browser; context: BrowserContext; page: Page }>();
@@ -438,6 +456,32 @@ export const WORKSPACE_TOOLS: ToolDef[] = [
   {
     type: "function",
     function: {
+      name: "search_replace",
+      description: "Find and replace a block of text in an existing file. The 'search' string must match content in the file (fuzzy whitespace matching is applied). Prefer this over write_file for targeted edits to existing files.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "File path relative to workspace root"
+          },
+          search: {
+            type: "string",
+            description: "Exact text to find in the file"
+          },
+          replace: {
+            type: "string",
+            description: "Replacement text"
+          }
+        },
+        required: ["path", "search", "replace"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "git_diff",
       description: "Show the plain workspace diff (unstaged changes).",
       parameters: {
@@ -704,6 +748,8 @@ export const TOOL_ALIASES: Record<string, string> = {
   diff: "git_diff",
   git: "run_command",
   edit: "write_file",
+  replace: "search_replace",
+  search_and_replace: "search_replace",
   create: "write_file",
   update: "write_file",
   delete: "remove_file",
@@ -770,6 +816,8 @@ export async function executeToolCall(
         return await execWriteFiles(call.id, args, ctx);
       case "remove_file":
         return await execRemoveFile(call.id, args, ctx);
+      case "search_replace":
+        return await execSearchReplace(call.id, args, ctx);
       case "git_diff":
         return await execGitDiff(call.id, ctx);
       case "git_diff_staged":
@@ -1173,6 +1221,8 @@ async function execReadFile(
     return { callId, name: "read_file", output: `Error: file not found: ${filePath}`, isError: true };
   }
 
+  trackFileRead(ctx.cwd, filePath);
+
   // Truncate large files
   const maxLen = 50000;
   const output = content.length > maxLen
@@ -1215,6 +1265,7 @@ async function execReadFiles(
     if (content === undefined) {
       parts.push(`--- ${fp} ---\n(Error: file not found)`);
     } else {
+      trackFileRead(ctx.cwd, fp);
       const maxLen = 30000;
       const output = content.length > maxLen
         ? content.slice(0, maxLen) + `\n... [truncated]`
@@ -1247,6 +1298,36 @@ async function execWriteFile(
       output: "Error: writes to .git/ and node_modules/ are forbidden",
       isError: true
     };
+  }
+
+  // Read-before-write guard: hard block if overwriting existing file that wasn't read
+  const targetPath = path.resolve(ctx.cwd, filePath);
+  try {
+    const st = await stat(targetPath);
+    if (st.isFile() && !hasFileBeenRead(ctx.cwd, filePath)) {
+      return {
+        callId,
+        name: "write_file",
+        output: `Error: You must read "${filePath}" before overwriting it. Use read_file first.`,
+        isError: true
+      };
+    }
+  } catch {
+    // File doesn't exist — new file, no guard needed
+  }
+
+  // Validate JSON files before writing
+  if (filePath.replace(/\\/g, "/").endsWith(".json")) {
+    try {
+      JSON.parse(content);
+    } catch (parseErr) {
+      return {
+        callId,
+        name: "write_file",
+        output: `Error: invalid JSON for ${filePath}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}. Fix syntax (check trailing commas, double commas, missing quotes) and retry.`,
+        isError: true
+      };
+    }
   }
 
   await ctx.writeFiles([{ path: filePath, content }]);
@@ -1298,6 +1379,40 @@ async function execWriteFiles(
         output: `Error: writes to .git/ and node_modules/ are forbidden (got: ${f.path})`,
         isError: true
       };
+    }
+  }
+
+  // Read-before-write guard: check each existing file was read
+  for (const f of files) {
+    const targetPath = path.resolve(ctx.cwd, f.path);
+    try {
+      const st = await stat(targetPath);
+      if (st.isFile() && !hasFileBeenRead(ctx.cwd, f.path)) {
+        return {
+          callId,
+          name: "write_files",
+          output: `Error: You must read "${f.path}" before overwriting it. Use read_file first.`,
+          isError: true
+        };
+      }
+    } catch {
+      // File doesn't exist — new file, no guard needed
+    }
+  }
+
+  // Validate JSON files before writing
+  for (const f of files) {
+    if (f.path.replace(/\\/g, "/").endsWith(".json")) {
+      try {
+        JSON.parse(f.content);
+      } catch (parseErr) {
+        return {
+          callId,
+          name: "write_files",
+          output: `Error: invalid JSON for ${f.path}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}. Fix syntax and retry.`,
+          isError: true
+        };
+      }
     }
   }
 
@@ -1360,6 +1475,109 @@ async function execRemoveFile(
       isError: true
     };
   }
+}
+
+async function execSearchReplace(
+  callId: string,
+  args: Record<string, unknown>,
+  ctx: ToolExecutionContext
+): Promise<ToolResult> {
+  const filePath = String(args.path ?? "");
+  const search = String(args.search ?? "");
+  const replace = String(args.replace ?? "");
+
+  if (!filePath || !search) {
+    return { callId, name: "search_replace", output: "Error: path and search are required", isError: true };
+  }
+
+  const normalized = filePath.replace(/\\/g, "/");
+  if (normalized.startsWith(".git/") || normalized.includes("/.git/") ||
+      normalized.startsWith("node_modules/") || normalized.includes("/node_modules/")) {
+    return { callId, name: "search_replace", output: "Error: writes to .git/ and node_modules/ are forbidden", isError: true };
+  }
+
+  const cwdResolved = path.resolve(ctx.cwd);
+  const targetPath = path.resolve(ctx.cwd, filePath);
+  if (targetPath !== cwdResolved && !targetPath.startsWith(`${cwdResolved}${path.sep}`)) {
+    return { callId, name: "search_replace", output: "Error: path is outside workspace", isError: true };
+  }
+
+  // Identity check
+  if (search === replace) {
+    return { callId, name: "search_replace", output: `Skipped identity transform for ${filePath} (search === replace)` };
+  }
+
+  // Read existing content
+  let content: string;
+  try {
+    content = await readFile(targetPath, "utf8");
+  } catch (err: any) {
+    if (err?.code === "ENOENT") {
+      return { callId, name: "search_replace", output: `Error: file not found: ${filePath}`, isError: true };
+    }
+    return { callId, name: "search_replace", output: `Error reading file: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+
+  // Exact match
+  let index = content.indexOf(search);
+  let usedFuzzy = false;
+
+  // Fuzzy whitespace fallback
+  if (index === -1) {
+    const fuzzyResult = fuzzyMatch(content, search);
+    if (fuzzyResult) {
+      index = fuzzyResult.index;
+      usedFuzzy = true;
+    }
+  }
+
+  if (index === -1) {
+    return {
+      callId,
+      name: "search_replace",
+      output: `Error: search block not found in ${filePath}. First 200 chars of search: ${search.slice(0, 200)}. First 200 chars of file: ${content.slice(0, 200)}`,
+      isError: true
+    };
+  }
+
+  const newContent = content.slice(0, index) + replace + content.slice(index + search.length);
+  await mkdir(path.dirname(targetPath), { recursive: true });
+
+  // Validate JSON files — auto-repair common issues, reject if still broken
+  let finalContent = newContent;
+  if (normalized.endsWith(".json")) {
+    try {
+      JSON.parse(newContent);
+    } catch (firstErr) {
+      // Try auto-repair: double commas, trailing commas before } or ]
+      let repaired = newContent
+        .replace(/,\s*([}\]])/g, "$1")   // trailing comma before } or ]
+        .replace(/,+\s*,/g, ",")          // double/triple commas → single
+        .replace(/,\s*,/g, ",");          // comma-whitespace-comma
+      try {
+        JSON.parse(repaired);
+        finalContent = repaired;
+        console.log(`[search_replace] Auto-repaired JSON in ${filePath}`);
+      } catch (repairErr) {
+        const errMsg = repairErr instanceof Error ? repairErr.message : String(repairErr);
+        return {
+          callId,
+          name: "search_replace",
+          output: `Error: search_replace would produce invalid JSON in ${filePath}. NOT written. Parse error: ${errMsg}. Use write_file with the complete valid JSON instead.`,
+          isError: true
+        };
+      }
+    }
+  }
+
+  await writeFile(targetPath, finalContent, "utf8");
+
+  const repaired = finalContent !== newContent ? " (JSON auto-repaired)" : "";
+  return {
+    callId,
+    name: "search_replace",
+    output: `Applied search_replace to ${filePath}${usedFuzzy ? " (fuzzy whitespace match)" : ""}${repaired} (${search.length} chars replaced with ${replace.length} chars)`
+  };
 }
 
 async function execGitDiff(
@@ -1695,9 +1913,10 @@ export function getAvailableToolsList(role: string, options?: { availableCommand
       : ["explore_mode", "read_file", "read_files", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
   }
   if (role === "coder") {
+    const writeTools = ["write_file", "write_files", "search_replace"];
     return availableCommands.has("install")
-      ? [...common, "run_command"]
-      : [...common];
+      ? [...common, ...writeTools, "run_command"]
+      : [...common, ...writeTools];
   }
   if (role === "reviewer") {
     return ["read_file", "list_dir", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files", "finish"];

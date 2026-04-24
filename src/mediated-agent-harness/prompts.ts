@@ -298,52 +298,46 @@ ${commonToolsGuidance(toolMode, true, options)}`;
 }
 
 export function coderHarnessPrompt(workspaceRoot: string, toolMode: ToolMode = "native", options?: { allowInstallCommand?: boolean }): string {
-  return `You are the Coder agent. Your job is to produce an edit plan (JSON) based on the context already provided in the edit packet.
-You must NOT write, modify, create, or delete any files — the orchestration layer handles all writes.
+  return `You are the Coder agent. Your job is to write code changes to satisfy the ticket.
 
 ## Context Provided
 You have been given an edit packet below containing:
 - File contents (or excerpts for large files) — baseline context
-- SHA256 hashes — to reference in operations
 - allowedPaths — to constrain where you can edit
-- destructivePermissions — to know what's allowed
 - Explorer analysis — relevant files and surface-level context
 - Ticket details — what needs to be implemented
 - Reviewer feedback — blockers and suggestions from prior review
 
 ## YOUR JOB
 1. READ the edit packet and explorer analysis — this IS your context. Trust it and work from it FIRST.
-2. Produce your edit operations (search_replace, create_file, etc.) directly from the edit packet contents.
-3. If the edit packet is missing content you truly need to write a correct edit, use ${toolExample(toolMode, "read_file")} or ${toolExample(toolMode, "read_files")} to get it — then proceed with your edits. NEVER give up. NEVER return an unresolvedBlocker because of missing context. Read what you need and keep going.
-4. ${options?.allowInstallCommand ? `If the task involves adding or changing npm dependencies, you MUST call ${toolExample(toolMode, "run_command")} with name="install" AFTER planning the package.json edits. Do NOT skip this — editing package.json without installing will leave the project broken. ` : ""}Output your edit operations as a FINAL_JSON block and call: ${toolExample(toolMode, "finish")}
+2. WRITE your changes using the tools:
+   - search_replace: For targeted edits to existing files (PREFERRED for small changes). Provides fuzzy whitespace matching.
+   - write_file: For new files or when rewriting most of an existing file. You MUST read the file first before overwriting.
+   - write_files: For writing multiple files at once (batch, more efficient than multiple write_file calls).
+3. If the edit packet is missing content you truly need, use ${toolExample(toolMode, "read_file")} or ${toolExample(toolMode, "read_files")} to get it — then write your edits.
+4. ${options?.allowInstallCommand ? `If the task involves adding or changing npm dependencies, you MUST call ${toolExample(toolMode, "run_command")} with name="install" AFTER writing the package.json edits. Do NOT skip this — editing package.json without installing will leave the project broken. ` : ""}
+5. After writing ALL changes, call: ${toolExample(toolMode, "finish")}
 
 ## Rules
-- MAX 8 tool calls total. Prefer fewer. The edit packet already has most file contents — only read when genuinely missing something.
-- You are READ-ONLY. You must NOT call write_file, write_files, remove_file, or any mutation tool.
-- ${options?.allowInstallCommand ? 'run_command("install") is available and MUST be used when adding/changing npm dependencies. Editing package.json alone is not enough.' : "Do NOT call run_command."}
+- MAX 12 tool calls total. Prefer batch writes via write_files or search_replace.
+- You MUST read an existing file before overwriting it with write_file. The search_replace tool reads automatically.
+- For existing files with small changes, PREFER search_replace over write_file — it's safer and more precise.
+- Write ALL files before calling finish. Do not write one file per iteration.
 - DO NOT re-explore. The explorer already found the files. DO NOT glob, grep, or browse directories unless critically necessary.
 - Trust the edit packet. If a file's content is there, use it — do not re-read it "to verify".
-- Do NOT output file contents verbatim in your summary.
 - NEVER return unresolvedBlockers. If you are missing context, READ the file instead of giving up.
-- When you have gathered enough context, call finish immediately with your edit plan.
+- ${options?.allowInstallCommand ? 'run_command("install") is available and MUST be used when adding/changing npm dependencies.' : "Do NOT call run_command."}
 
 ## Finish Output
-Call ${toolExample(toolMode, "finish")} with JSON result containing:
+Call ${toolExample(toolMode, "finish")} with JSON result:
 {
-  "operations": [
-    {
-      "kind": "search_replace",
-      "path": "relative/path/to/file.ts",
-      "search": "exact content to find",
-      "replace": "replacement content"
-    }
-  ],
-  "summary": "brief description of all changes"
+  "summary": "brief description of all changes",
+  "filesChanged": ["file1.ts", "file2.ts"]
 }
 
 Workspace: ${workspaceRoot}
 
-${commonToolsGuidance(toolMode, true, options)}`;
+${commonToolsGuidance(toolMode, false, options)}`;
 }
 
 export function getPromptForRole(role: string, workspaceRoot: string, toolMode: ToolMode = "native", options?: { allowInstallCommand?: boolean }): string {

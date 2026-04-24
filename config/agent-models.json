@@ -1,11 +1,11 @@
 {
-  "epicDecoder": "codex-cli",
+  "epicDecoder": "zai:glm-5.1",
   "builder": "mediated:gemma4:26b-a4b-it-q4_K_M",
   "reviewer": "mediated:qwen3.5:9b",
   "tester": "skip",
   "explorer": "mediated:qwen3.5:9b",
   "coder": "mediated:qwen3:14b",
-  "epicReviewer": "zai:glm-5.1",
+  "epicReviewer": "codex-cli",
   "playWriter": "qwen-cli",
   "playTester": "mediated:qwen3.5:9b",
   "doctor": "qwen3:8b"

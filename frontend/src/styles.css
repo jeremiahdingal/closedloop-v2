@@ -1382,6 +1382,8 @@ body::after {
   border-bottom: 1px solid var(--win-gray);
   padding: 0.4rem 0;
   margin-bottom: 1.5rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .tev-header {
@@ -1457,6 +1459,9 @@ body::after {
 
 .tev-body {
   margin-top: 0.1rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 /* Tool call body */
@@ -1493,7 +1498,9 @@ body::after {
   line-height: 1.5;
   max-height: 400px;
   overflow-y: auto;
-  overflow-x: auto;
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .tev-text-content.markdown-body h1,
@@ -1547,6 +1554,9 @@ body::after {
   padding: 0.5rem;
   overflow-x: auto;
   margin: 0.4rem 0;
+  max-width: 100%;
+  word-break: break-all;
+  white-space: pre-wrap;
 }
 
 /* Colour tint entire card per kind */

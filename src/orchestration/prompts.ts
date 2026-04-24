@@ -292,15 +292,22 @@ export function coderPrompt(
   return [
     "You are the Coder agent.",
     "Your job is to write the actual code changes to satisfy the ticket based on the Explorer's analysis and the provided file contents.",
-    "MODEL TARGET: You are qwen3.5:27b. Output a JSON edit plan.",
+    "",
+    "## PREFERRED: Write files directly using tools",
+    "Use search_replace for targeted edits to existing files (preferred for small changes).",
+    "Use write_file for new files or when rewriting most of an existing file (you MUST read it first).",
+    "Use write_files for writing multiple files at once.",
+    "Write ALL files before calling finish.",
+    "",
+    "## FALLBACK: JSON edit plan",
+    "If you cannot use write tools, output your edits as JSON operations in a FINAL_JSON block.",
+    "",
     "CRITICAL: Work from the edit packet below. The file contents are already provided — do NOT request or expect to read more files. Produce your edits directly from this context.",
     `Ticket: ${ticket.title}`,
     `Goal: ${ticket.description}`,
     `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`,
     "## Acceptance Criteria Mapping",
-    "CRITICAL: Every operation you produce MUST include an 'ac' field indicating which acceptance criterion it addresses.",
-    "Format: 'ac': 'AC-1' or for multiple: 'ac': 'AC-1,AC-3'.",
-    "Do NOT produce operations that don't map to at least one acceptance criterion. This prevents scope drift.",
+    "CRITICAL: Every change you produce MUST address at least one acceptance criterion. This prevents scope drift.",
     ...(skipContext?.skipped ? [
       "",
       "## IMPORTANT: Explorer Was Skipped",
@@ -312,7 +319,7 @@ export function coderPrompt(
     "## Explorer Analysis",
     JSON.stringify(explorerOutput, null, 2),
     "## Canonical Edit Packet (Current Source of Truth)",
-    JSON.stringify(editPacket, null, 2),,
+    JSON.stringify(editPacket, null, 2),
     ...(reviewerContext && (reviewerContext.blockers?.length || reviewerContext.suggestions?.length)
       ? [
         "",
@@ -323,29 +330,33 @@ export function coderPrompt(
         ...(reviewerContext.suggestions?.length
           ? ["Reviewer suggestions:", ...reviewerContext.suggestions.map(s => "- " + s)]
           : []),
-        "Your operations MUST address every blocker listed above.",
+        "Your changes MUST address every blocker listed above.",
       ]
       : []),
-    "## Rules for Operations",
-    "1. Use 'search_replace' for existing files. You MUST provide the exact 'search' block and the 'replace' block.",
-    "2. 'search_replace' MUST include 'expected_sha256' as provided in the Canonical Edit Packet for that file.",
-    "3. Use 'create_file' for new files.",
-    "4. Use 'append_file' only if adding to the end of a file.",
-    "5. 'delete_file' or 'rename_file' are ONLY allowed if explicitly permitted in 'destructivePermissions' or 'allowedDeletePaths'/'allowedRenamePaths'.",
-    "6. If the edit packet is missing content you need, read the file first. NEVER give up with an unresolvedBlocker — always try to get the context and produce edits.",
-    "7. If the task is impossible, return an unresolvedBlocker: 'BLOCKED'.",
-    "8. Do NOT use 'replace_file' for existing files unless 'allowFullReplace' is true for that path.",
-    "9. Every destructive operation (delete/rename) MUST include a 'reason' string.",
-    "10. CRITICAL: If reading the Canonical Edit Packet shows that the file content ALREADY matches what the acceptance criteria require, produce ZERO operations and an empty operations array. Do NOT produce identity transforms where search === replace — these waste cycles and cause no-diff escalation.",
-    "Return JSON only with shape:",
+    "## Rules",
+    "1. Use search_replace tool for existing files — provide the exact 'search' block and the 'replace' block.",
+    "2. Use write_file for new files. For existing files, you MUST read the file first.",
+    "3. Do NOT delete or rename files unless explicitly permitted in destructivePermissions.",
+    "4. If the edit packet is missing content you need, read the file first. NEVER give up — always try to get the context and produce edits.",
+    "5. If reading the edit packet shows that the file content ALREADY matches what the acceptance criteria require, produce ZERO changes and explain in summary.",
+    "6. Do NOT produce identity transforms where search === replace.",
+    "",
+    "## Finish Output",
+    "Call finish with JSON:",
+    JSON.stringify({
+      summary: "brief summary of what you implemented",
+      filesChanged: ["file1.ts", "file2.ts"]
+    }, null, 2),
+    "",
+    "## JSON Fallback (only if tools are unavailable)",
+    "Output a FINAL_JSON block with shape:",
     JSON.stringify({
       summary: "brief summary of what you implemented",
       intendedFiles: ["string"],
       unresolvedBlockers: ["string"],
       operations: [
         { kind: "search_replace", path: "string", expected_sha256: "string", search: "string", replace: "string", ac: "AC-1" },
-        { kind: "create_file", path: "string", content: "string", ac: "AC-2,AC-3" },
-        { kind: "delete_file", path: "string", expected_sha256: "string", reason: "explicit reason", ac: "AC-1" }
+        { kind: "create_file", path: "string", content: "string", ac: "AC-2,AC-3" }
       ]
     }, null, 2),
     "After you finish, output exactly one FINAL_JSON block and nothing after it."

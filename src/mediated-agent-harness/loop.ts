@@ -20,7 +20,7 @@ import { classifyStall, computeStallLevel, getRecoveryAction, createStallState, 
 const KNOWN_TOOL_NAMES = new Set([
   "explore_mode",
   "glob_files", "grep_files", "list_dir", "read_file", "read_files",
-  "write_file", "write_files", "git_diff", "git_diff_staged",
+  "write_file", "write_files", "search_replace", "git_diff", "git_diff_staged",
   "git_status", "list_changed_files", "run_command", "finish",
   "web_search", "semantic_search", "read_artifact", "save_artifact"
 ]);

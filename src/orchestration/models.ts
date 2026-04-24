@@ -3,6 +3,7 @@ import type {
   AgentRole,
   AgentStreamPayload,
   BuilderPlan,
+  CoderRunResult,
   FailureDecision,
   GoalDecomposition,
   GoalReview,
@@ -23,7 +24,7 @@ import { CodexRunner } from "./codex.ts";
 import { QwenRunner } from "./qwen.ts";
 import { GeminiRunner } from "./gemini.ts";
 import { ZaiRunner } from "./zai.ts";
-import { MediatedAgentHarness } from "../mediated-agent-harness/index.ts";
+import { MediatedAgentHarness, resetSessionTracking } from "../mediated-agent-harness/index.ts";
 import type { ToolExecutionContext } from "../mediated-agent-harness/types.ts";
 import { ensureModelLoaded, markModelLoaded, unloadCurrentModel } from "./ollama-memory-manager.ts";
 
@@ -41,7 +42,7 @@ export interface ModelGateway {
   runReviewerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ReviewerVerdict>;
   runTesterInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<TesterResult>;
   runExplorerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string>;
-  runCoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; skipExplorer?: boolean; onStream?: StreamHook }): Promise<string>;
+  runCoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; skipExplorer?: boolean; onStream?: StreamHook }): Promise<CoderRunResult>;
   runCoderDirect?(input: { prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string>;
   runGoalReviewInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any }): Promise<GoalReview>;
   runEpicDecoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any }): Promise<GoalDecomposition>;
@@ -228,7 +229,7 @@ export class OllamaGateway implements ModelGateway {
     throw new Error("Explorer requires mediated harness (MediatedAgentHarnessGateway)");
   }
 
-  runCoderInWorkspace(_input: { cwd: string; prompt: string }): Promise<string> {
+  runCoderInWorkspace(_input: { cwd: string; prompt: string }): Promise<CoderRunResult> {
     throw new Error("Coder requires mediated harness (MediatedAgentHarnessGateway)");
   }
 
@@ -504,6 +505,17 @@ export class DryRunGateway implements ModelGateway {
     input.onStream?.({ agentRole: "builder", source: "orchestrator", streamKind: "assistant", content: plan.summary, runId: input.runId, ticketId: input.ticketId, epicId: input.epicId, sequence: 1, done: false });
     input.onStream?.({ agentRole: "builder", source: "orchestrator", streamKind: "status", content: "[dry-run] Builder completed", runId: input.runId, ticketId: input.ticketId, epicId: input.epicId, sequence: 2, done: true });
     return { summary: plan.summary, sessionId: null, rawOutput: plan.summary };
+  }
+
+  async runCoderDirect(input: { prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string> {
+    const content = "Dry run coder output";
+    input.onStream?.({ agentRole: "coder", source: "orchestrator", streamKind: "assistant", content, runId: input.runId, ticketId: input.ticketId, epicId: input.epicId, sequence: 0, done: true });
+    return content;
+  }
+
+  async runCoderInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; skipExplorer?: boolean; onStream?: StreamHook }): Promise<CoderRunResult> {
+    const text = await this.runCoderDirect(input);
+    return { text, toolCalls: [], iterations: 1 };
   }
 }
 
@@ -1082,7 +1094,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     epicId?: string | null;
     skipExplorer?: boolean;
     onStream?: StreamHook;
-  }): Promise<string> {
+  }): Promise<CoderRunResult> {
+    resetSessionTracking(input.cwd);
     const model = this.resolveHarnessModel("coder");
     const allowInstallCommand = promptExplicitlyRequestsDependencyInstall(input.prompt);
     input.onStream?.({
@@ -1180,7 +1193,11 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     });
     markModelLoaded(model);
 
-    return result.text;
+    return {
+      text: result.text,
+      toolCalls: result.toolCalls.map(tc => ({ name: tc.name, args: tc.args as Record<string, unknown> })),
+      iterations: result.iterations,
+    };
   }
 
   async runCoderDirect(input: {

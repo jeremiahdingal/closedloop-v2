@@ -326,3 +326,9 @@ export type CoderOutput = {
   unresolvedBlockers: string[];
   operations: EditOperation[];
 };
+
+export type CoderRunResult = {
+  text: string;
+  toolCalls: Array<{ name: string; args: Record<string, unknown> }>;
+  iterations: number;
+};

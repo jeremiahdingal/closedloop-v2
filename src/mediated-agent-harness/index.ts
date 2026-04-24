@@ -4,7 +4,7 @@ import { getPromptForRole } from "./prompts.ts";
 
 export type { MediatedHarnessConfig, MediatedHarnessResult, ToolExecutionContext } from "./types.ts";
 export type { MediatedHarnessEvent, ToolCall, ToolResult } from "./types.ts";
-export { WORKSPACE_TOOLS, BROWSER_TOOLS, TOOL_ALIASES, executeToolCall } from "./tools.ts";
+export { WORKSPACE_TOOLS, BROWSER_TOOLS, TOOL_ALIASES, executeToolCall, resetSessionTracking } from "./tools.ts";
 export { StreamParser } from "./stream-parser.ts";
 export { CallHistory, validateAndRepair } from "./validator.ts";
 export {
