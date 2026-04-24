@@ -1,8 +1,10 @@
-import { DatabaseSync } from "node:sqlite";
+﻿import { DatabaseSync } from "node:sqlite";
 import { dirname } from "node:path";
 import { mkdirSync } from "node:fs";
 import { nowIso } from "../utils.ts";
 import type {
+  DirectChatMessageRecord,
+  DirectChatSessionRecord,
   EpicRecord,
   Json,
   RunRecord,
@@ -72,6 +74,12 @@ export class AppDatabase {
       // Column already exists
     }
 
+    try {
+      this.db.exec(`ALTER TABLE workspaces ADD COLUMN saved_branch TEXT`);
+    } catch {
+      // Column already exists
+    }
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS tickets (
         id TEXT PRIMARY KEY,
@@ -118,6 +126,7 @@ export class AppDatabase {
         branch_name TEXT NOT NULL,
         base_commit TEXT NOT NULL,
         head_commit TEXT,
+        saved_branch TEXT,
         status TEXT NOT NULL,
         lease_owner TEXT,
         created_at TEXT NOT NULL,
@@ -145,6 +154,26 @@ export class AppDatabase {
         kind TEXT NOT NULL,
         message TEXT NOT NULL,
         payload_json TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS direct_chat_sessions (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        target_dir TEXT NOT NULL,
+        branch_name TEXT NOT NULL,
+        model TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS direct_chat_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES direct_chat_sessions(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        tool_calls_json TEXT,
+        tool_results_json TEXT,
         created_at TEXT NOT NULL
       );
 
@@ -239,6 +268,23 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_rag_chunks_file_path ON rag_chunks(index_id, file_path);
       CREATE INDEX IF NOT EXISTS idx_ast_edges_index_id ON ast_edges(index_id);
       CREATE INDEX IF NOT EXISTS idx_ast_edges_source ON ast_edges(index_id, source_file);
+
+      CREATE TABLE IF NOT EXISTS tetris_scores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        score INTEGER NOT NULL,
+        level INTEGER NOT NULL,
+        lines INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS pacman_scores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        score INTEGER NOT NULL,
+        level INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
   }
 
@@ -282,7 +328,19 @@ export class AppDatabase {
     };
   }
 
-  listEpics(): EpicRecord[] {
+  listEpics(options?: { limit?: number; offset?: number }): EpicRecord[] {
+    if (options?.limit !== undefined) {
+      return (this.db.prepare(`SELECT * FROM epics ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(options.limit, options.offset ?? 0) as any[]).map((row) => ({
+        id: row.id,
+        title: row.title,
+        goalText: row.goal_text,
+        targetDir: row.target_dir,
+        targetBranch: row.target_branch || null,
+        status: row.status,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      }));
+    }
     return (this.db.prepare(`SELECT * FROM epics ORDER BY created_at DESC`).all() as any[]).map((row) => ({
       id: row.id,
       title: row.title,
@@ -293,6 +351,11 @@ export class AppDatabase {
       createdAt: row.created_at,
       updatedAt: row.updated_at
     }));
+  }
+
+  countEpics(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) as count FROM epics`).get() as { count: number };
+    return row.count;
   }
 
   updateEpicStatus(id: string, status: EpicRecord["status"]): void {
@@ -481,8 +544,8 @@ export class AppDatabase {
   createWorkspace(workspace: Omit<WorkspaceRecord, "createdAt" | "updatedAt">): WorkspaceRecord {
     const now = nowIso();
     this.db.prepare(`
-      INSERT INTO workspaces (id, ticket_id, run_id, repo_root, worktree_path, branch_name, base_commit, head_commit, status, lease_owner, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO workspaces (id, ticket_id, run_id, repo_root, worktree_path, branch_name, base_commit, head_commit, saved_branch, status, lease_owner, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       workspace.id,
       workspace.ticketId,
@@ -492,6 +555,7 @@ export class AppDatabase {
       workspace.branchName,
       workspace.baseCommit,
       workspace.headCommit,
+      workspace.savedBranch,
       workspace.status,
       workspace.leaseOwner,
       now,
@@ -519,6 +583,14 @@ export class AppDatabase {
     return (this.db.prepare(`
       SELECT * FROM workspaces
       WHERE status = 'archived' AND updated_at < ?
+      ORDER BY updated_at ASC
+    `).all(cutoffIso) as any[]).map((row) => this.mapWorkspace(row));
+  }
+
+  listOrphanedWorkspaces(cutoffIso: string): WorkspaceRecord[] {
+    return (this.db.prepare(`
+      SELECT * FROM workspaces
+      WHERE status = 'active' AND updated_at < ?
       ORDER BY updated_at ASC
     `).all(cutoffIso) as any[]).map((row) => this.mapWorkspace(row));
   }
@@ -888,6 +960,7 @@ export class AppDatabase {
       branchName: row.branch_name,
       baseCommit: row.base_commit,
       headCommit: row.head_commit,
+      savedBranch: row.saved_branch ?? null,
       status: row.status,
       leaseOwner: row.lease_owner,
       createdAt: row.created_at,
@@ -1060,5 +1133,117 @@ export class AppDatabase {
         `SELECT source_file, target_file, dep_type FROM ast_edges WHERE index_id = ?`
       ).all(indexId) as any[]
     ).map((r) => ({ sourceFile: r.source_file, targetFile: r.target_file, depType: r.dep_type }));
+  }
+
+  // Direct Chat Methods
+  createDirectChatSession(session: Omit<DirectChatSessionRecord, "createdAt" | "updatedAt">): DirectChatSessionRecord {
+    const now = nowIso();
+    this.db.prepare(`
+      INSERT INTO direct_chat_sessions (id, title, target_dir, branch_name, model, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(session.id, session.title, session.targetDir, session.branchName, session.model, now, now);
+    return { ...session, createdAt: now, updatedAt: now };
+  }
+
+  getDirectChatSession(id: string): DirectChatSessionRecord | null {
+    const row = this.db.prepare(`SELECT * FROM direct_chat_sessions WHERE id = ?`).get(id) as any;
+    if (!row) return null;
+    return {
+      id: row.id,
+      title: row.title,
+      targetDir: row.target_dir,
+      branchName: row.branch_name,
+      model: row.model,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
+  }
+
+  listDirectChatSessions(): DirectChatSessionRecord[] {
+    const rows = this.db.prepare(`SELECT * FROM direct_chat_sessions ORDER BY updated_at DESC`).all() as any[];
+    return rows.map(row => ({
+      id: row.id,
+      title: row.title,
+      targetDir: row.target_dir,
+      branchName: row.branch_name,
+      model: row.model,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }));
+  }
+
+  appendDirectChatMessage(message: Omit<DirectChatMessageRecord, "id" | "createdAt">): DirectChatMessageRecord {
+    const now = nowIso();
+    const result = this.db.prepare(`
+      INSERT INTO direct_chat_messages (session_id, role, content, tool_calls_json, tool_results_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(message.sessionId, message.role, message.content, message.toolCallsJson, message.toolResultsJson, now) as any;
+    
+    this.db.prepare(`UPDATE direct_chat_sessions SET updated_at = ? WHERE id = ?`).run(now, message.sessionId);
+    
+    return {
+      id: Number(result.lastInsertRowid),
+      ...message,
+      createdAt: now
+    };
+  }
+
+  listDirectChatMessages(sessionId: string): DirectChatMessageRecord[] {
+    const rows = this.db.prepare(`SELECT * FROM direct_chat_messages WHERE session_id = ? ORDER BY id ASC`).all(sessionId) as any[];
+    return rows.map(row => ({
+      id: row.id,
+      sessionId: row.session_id,
+      role: row.role as any,
+      content: row.content,
+      toolCallsJson: row.tool_calls_json,
+      toolResultsJson: row.tool_results_json,
+      createdAt: row.created_at
+    }));
+  }
+
+  deleteDirectChatSession(id: string): void {
+    this.db.prepare(`DELETE FROM direct_chat_sessions WHERE id = ?`).run(id);
+  }
+
+  clearDirectChatMessages(sessionId: string): void {
+    this.db.prepare(`DELETE FROM direct_chat_messages WHERE session_id = ?`).run(sessionId);
+  }
+
+  // ─── Tetris Scores ───
+
+  getTetrisHighScores(limit: number = 10): { name: string; score: number; level: number; lines: number; date: string }[] {
+    const rows = this.db.prepare(`SELECT * FROM tetris_scores ORDER BY score DESC, created_at ASC LIMIT ?`).all(limit) as any[];
+    return rows.map(row => ({
+      name: row.name,
+      score: row.score,
+      level: row.level,
+      lines: row.lines,
+      date: row.created_at
+    }));
+  }
+
+  addTetrisScore(name: string, score: number, level: number, lines: number): void {
+    const now = nowIso();
+    this.db.prepare(`INSERT INTO tetris_scores (name, score, level, lines, created_at) VALUES (?, ?, ?, ?, ?)`).run(name, score, level, lines, now);
+  }
+
+  clearTetrisScores(): void {
+    this.db.prepare(`DELETE FROM tetris_scores`).run();
+  }
+
+  // ── Pac-Man Scores ──────────────────────────────────
+
+  getPacmanHighScores(limit = 10): any[] {
+    const rows = this.db.prepare(`SELECT * FROM pacman_scores ORDER BY score DESC, created_at ASC LIMIT ?`).all(limit) as any[];
+    return rows;
+  }
+
+  addPacmanScore(name: string, score: number, level: number): void {
+    const now = nowIso();
+    this.db.prepare(`INSERT INTO pacman_scores (name, score, level, created_at) VALUES (?, ?, ?, ?)`).run(name, score, level, now);
+  }
+
+  clearPacmanScores(): void {
+    this.db.prepare(`DELETE FROM pacman_scores`).run();
   }
 }

@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+﻿import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import { loadConfig } from "../config.ts";
@@ -6,7 +6,7 @@ import type { AgentRole, AgentStreamPayload, GoalDecomposition, GoalReview } fro
 import { validateGoalDecomposition, validateGoalReview, parseJsonText } from "./validation.ts";
 
 export type CodexTaskInput = {
-  role: Extract<AgentRole, "epicDecoder" | "epicReviewer">;
+  role: Extract<AgentRole, "epicDecoder" | "epicReviewer" | "builder">;
   cwd: string;
   prompt: string;
   runId?: string | null;
@@ -21,7 +21,7 @@ export type CodexLaunchInfo = {
   promptLength: number;
   command: string;
   args: string[];
-  shell: boolean;
+  shell: string | boolean;
   cwdExists: boolean;
   cwdIsDirectory: boolean;
 };
@@ -68,13 +68,14 @@ function buildLaunchInfo(input: {
   cwdExists: boolean;
   cwdIsDirectory: boolean;
 }): CodexLaunchInfo {
+  const isWin = process.platform === "win32";
   return {
     cwd: input.cwd,
     repoRoot: input.repoRoot,
     promptLength: input.promptLength,
     command: "codex",
-    args: ["exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-C", input.cwd, "-"],
-    shell: true,
+    args: ["exec", "--yolo", "--skip-git-repo-check", "-C", input.cwd, "-"],
+    shell: isWin ? "cmd.exe" : true, // Use cmd.exe on Windows to avoid PowerShell quirks
     cwdExists: input.cwdExists,
     cwdIsDirectory: input.cwdIsDirectory
   };
@@ -197,8 +198,8 @@ export class CodexRunner {
     }
 
     return {
-      command: "codex",
-      args: ["exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-C", cwd, "-"],
+      command: info.command,
+      args: info.args,
       info
     };
   }
@@ -221,6 +222,15 @@ export class CodexRunner {
     } catch {
       return validateGoalReview(parseJsonText(raw.combined));
     }
+  }
+
+  async runBuilder(input: CodexTaskInput): Promise<import("../types.ts").OpenCodeBuilderResult> {
+    const raw = await this.runRaw(input);
+    return {
+      summary: "Codex CLI build completed",
+      sessionId: null,
+      rawOutput: raw.combined
+    };
   }
 
   private async runRaw(input: CodexTaskInput): Promise<{ combined: string; launchInfo: CodexLaunchInfo }> {
@@ -249,7 +259,7 @@ export class CodexRunner {
       const child = this.spawnImpl(launch.command, args, {
         cwd: launch.info.cwd,
         env: { ...process.env },
-        shell: true,
+        shell: launch.info.shell,
         stdio: ["pipe", "pipe", "pipe"]
       });
 

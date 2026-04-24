@@ -1,17 +1,221 @@
-import { GoalRunner } from "../orchestration/goal-runner.ts";
+﻿import { GoalRunner } from "../orchestration/goal-runner.ts";
+import { createGateway } from "../orchestration/models.ts";
 import http from "node:http";
 import { readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { bootstrap } from "./bootstrap.ts";
 import { loadConfig, updateAgentModel } from "../config.ts";
-import type { AgentRole, AgentStreamPayload, GoalDecomposition } from "../types.ts";
-import { runPlanDecoder, extractPlanFromStream } from "../orchestration/plan-runner.ts";
+import type { 
+  AgentRole, 
+  AgentStreamPayload, 
+  GoalDecomposition, 
+  DirectChatSessionRecord, 
+  DirectChatMessageRecord 
+} from "../types.ts";
+import { runPlanDecoder, extractPlanFromStream, planNeedsClarification } from "../orchestration/plan-runner.ts";
 import { randomId } from "../utils.ts";
 import { git } from "../bridge/git.ts";
+import { runMediatedLoop, resolveModelContextWindow } from "../mediated-agent-harness/loop.ts";
+import { buildToolingContext } from "../rag/context-builder.ts";
+import { getAvailableToolsList } from "../mediated-agent-harness/tools.ts";
+import { EventEmitter } from "node:events";
+import type { ChatMessage } from "../mediated-agent-harness/types.ts";
+
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+async function summarizeConversation(model: string, messages: ChatMessage[]): Promise<string> {
+  const { adapter, model: rawModel } = parseAdapter(model);
+  const builderModel = rawModel || adapter;
+  const actualModel = builderModel.startsWith("mediated:") ? builderModel.slice(9) : builderModel;
+  
+  const baseURL = "http://localhost:11434/v1"; 
+  
+  const prompt = `Please summarize the following conversation history between a User and a Local Builder. 
+Focus on:
+1. The main goal of the session.
+2. Important facts discovered about the repository.
+3. Actions already taken (files read, edited, commands run).
+4. Decisions made and constraints identified.
+5. Current expected next steps.
+
+Format as a concise structured memory block.
+
+CONVERSATION TO SUMMARIZE:
+${messages.map(m => `[${m.role.toUpperCase()}] ${m.content || (m.tool_calls ? "Called tools: " + m.tool_calls.map(tc => tc.function.name).join(", ") : "")}`).join("\n\n")}
+`;
+
+  try {
+    const response = await fetch(`${baseURL}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: actualModel,
+        messages: [{ role: "user", content: prompt }],
+        stream: false,
+        temperature: 0.3,
+      })
+    });
+    if (!response.ok) throw new Error(`Summary failed: ${response.status}`);
+    const data: any = await response.json();
+    return data.choices[0].message.content;
+  } catch (err) {
+    console.error("Auto-compression summary failed:", err);
+    return "Summarization failed. Previous history omitted due to context limits.";
+  }
+}
+
+function findLastIndex<T>(array: T[], predicate: (value: T) => boolean): number {
+  for (let i = array.length - 1; i >= 0; i--) {
+    if (predicate(array[i])) return i;
+  }
+  return -1;
+}
+
+async function buildDirectChatContext(
+  model: string,
+  dbMessages: DirectChatMessageRecord[],
+  options: { maxTurnsVerbatim?: number; compressionThreshold?: number } = {}
+): Promise<{
+  messages: ChatMessage[];
+  didCompress: boolean;
+  usedSummary: boolean;
+  truncatedEntries: number;
+  estimatedTokens: number;
+}> {
+  const { adapter, model: rawModel } = parseAdapter(model);
+  const builderModel = rawModel || adapter;
+  const actualModel = builderModel.startsWith("mediated:") ? builderModel.slice(9) : builderModel;
+  const windowSize = resolveModelContextWindow(actualModel);
+  const threshold = options.compressionThreshold ?? 0.75;
+  const budget = Math.floor(windowSize * threshold);
+  
+  const systemIdentity: ChatMessage = {
+    role: "system",
+    content: "You are the Local Builder. Help the user with their coding task in the current repository. Use the tools available to inspect and modify code."
+  };
+
+  // 1. Initial Mapping
+  let messages: ChatMessage[] = dbMessages.map(m => {
+    if (m.role === "assistant" && m.toolCallsJson) {
+      const calls = JSON.parse(m.toolCallsJson) as any[];
+      return {
+        role: "assistant" as const,
+        content: m.content || null,
+        tool_calls: calls.map(tc => {
+          let argsStr = "";
+          if (tc.function?.arguments) {
+            argsStr = typeof tc.function.arguments === "string" ? tc.function.arguments : JSON.stringify(tc.function.arguments);
+          } else if (tc.arguments) {
+            argsStr = typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments);
+          } else if (tc.args) {
+            argsStr = JSON.stringify(tc.args);
+          }
+
+          return {
+            id: tc.id,
+            type: "function" as const,
+            function: {
+              name: tc.function?.name || tc.name || "unknown",
+              arguments: argsStr
+            }
+          };
+        })
+      };
+    }
+    if (m.role === "tool") {
+      let callId = "";
+      if (m.toolResultsJson) {
+        const res = JSON.parse(m.toolResultsJson);
+        callId = res.callId || res.tool_call_id || "";
+      }
+      return {
+        role: "tool" as const,
+        content: m.content,
+        tool_call_id: callId
+      };
+    }
+    return {
+      role: m.role as any,
+      content: m.content,
+    };
+  });
+
+  // Ensure system identity is at the start if not already there (manual compression might have saved it)
+  if (messages.length === 0 || messages[0].content !== systemIdentity.content) {
+    messages.unshift(systemIdentity);
+  }
+
+  let currentTokens = estimateTokens(JSON.stringify(messages));
+  
+  if (currentTokens <= budget) {
+    return { messages, didCompress: false, usedSummary: false, truncatedEntries: 0, estimatedTokens: currentTokens };
+  }
+
+  // 2. Hybrid Compression Step 1: Truncate large payloads
+  let truncatedEntries = 0;
+  for (const m of messages) {
+    if (m.role === "tool" && m.content && m.content.length > 2000) {
+      const originalLen = m.content.length;
+      m.content = m.content.substring(0, 1000) + `\n\n... [TRUNCATED from ${originalLen} chars] ...\n\n` + m.content.substring(originalLen - 500);
+      truncatedEntries++;
+    }
+    if (m.role === "assistant" && m.content && m.content.length > 4000) {
+       const originalLen = m.content.length;
+       m.content = m.content.substring(0, 2000) + `\n\n... [TRUNCATED from ${originalLen} chars] ...\n\n` + m.content.substring(originalLen - 1000);
+       truncatedEntries++;
+    }
+  }
+
+  currentTokens = estimateTokens(JSON.stringify(messages));
+  if (currentTokens <= budget) {
+    return { messages, didCompress: true, usedSummary: false, truncatedEntries, estimatedTokens: currentTokens };
+  }
+
+  // 3. Hybrid Compression Step 2: Summarization
+  // We keep the system identity and the last N messages.
+  // We MUST NOT break a tool call/result pair.
+  const keepRawCount = 8; 
+  let splitIdx = Math.max(1, messages.length - keepRawCount);
+  
+  // If we split at a tool message, we must include its preceding assistant message.
+  // Better: find the first non-tool message at or before splitIdx.
+  while (splitIdx > 1 && messages[splitIdx].role === "tool") {
+    splitIdx--;
+  }
+  // Now if messages[splitIdx] is an assistant message with tool calls, 
+  // we should probably keep it raw too if we are keeping its tools.
+  // Actually, the above loop ensures we don't START the raw section with a tool message.
+  
+  const toSummarize = messages.slice(1, splitIdx);
+  const toKeepRaw = messages.slice(splitIdx);
+  
+  if (toSummarize.length === 0) {
+     return { messages, didCompress: true, usedSummary: false, truncatedEntries, estimatedTokens: currentTokens };
+  }
+
+  const summary = await summarizeConversation(model, toSummarize);
+  
+  const finalMessages: ChatMessage[] = [systemIdentity];
+  finalMessages.push({
+    role: "system",
+    content: `CONVERSATION SUMMARY & MEMORY:\n${summary}\n\nThe above is a summary of the earlier part of this session. Use it as context for the current state of the task.`
+  });
+  finalMessages.push(...toKeepRaw);
+
+  return { 
+    messages: finalMessages, 
+    didCompress: true, 
+    usedSummary: true, 
+    truncatedEntries, 
+    estimatedTokens: estimateTokens(JSON.stringify(finalMessages)) 
+  };
+}
 
 // ---------------------------------------------------------------------------
-// In-memory plan session store (ephemeral — lost on server restart, by design)
+// In-memory plan session store (ephemeral - lost on server restart, by design)
 // ---------------------------------------------------------------------------
 type PlanSession = {
   id: string;
@@ -28,6 +232,235 @@ type PlanSession = {
 };
 
 const planSessions = new Map<string, PlanSession>();
+const chatEmitters = new Map<string, EventEmitter>();
+
+async function runDirectChat(sessionId: string, db: any) {
+  const session = db.getDirectChatSession(sessionId);
+  if (!session) return;
+
+  let emitter = chatEmitters.get(sessionId);
+  if (!emitter) {
+    emitter = new EventEmitter();
+    chatEmitters.set(sessionId, emitter);
+  }
+
+  try {
+    const dbMessages = db.listDirectChatMessages(sessionId);
+    const context = await buildDirectChatContext(session.model, dbMessages);
+    
+    if (context.didCompress) {
+      emitter.emit("event", { 
+        kind: "status", 
+        message: context.usedSummary 
+          ? "Context window reached. Summarized older history." 
+          : `Oversized payloads truncated (${context.truncatedEntries} entries).` 
+      });
+    }
+
+    const chatMessages = context.messages;
+
+    const repoRoot = session.targetDir;
+    if (session.branchName) {
+      await git(repoRoot, ["checkout", "-b", session.branchName]).catch(() => git(repoRoot, ["checkout", session.branchName])).catch(() => {});
+    }
+
+    const { adapter, model } = parseAdapter(session.model);
+    const builderModel = model || adapter;
+
+    if (adapter === "gemini-cli" || adapter === "qwen-cli" || adapter === "codex-cli") {
+      // Create a virtual model config for the gateway
+      const virtualModels: any = {
+        builder: session.model,
+        epicDecoder: session.model,
+        epicReviewer: session.model
+      };
+      const gateway = createGateway(virtualModels);
+      // Concatenate all messages into a single prompt for the CLI
+      const fullPrompt = chatMessages.map(m => `[${m.role.toUpperCase()}] ${m.content || (m.tool_calls ? "Called tools: " + m.tool_calls.map(tc => tc.function.name).join(", ") : "")}`).join("\n\n");
+      
+      const onStream = (event: AgentStreamPayload) => {
+        emitter!.emit("event", {
+          kind: event.streamKind === "thinking" ? "thinking" : "text",
+          text: event.content,
+          content: event.content, // Ensure both text and content are set for compatibility
+          metadata: event.metadata
+        });
+      };
+
+      const result = await gateway.runBuilderInWorkspace!({
+        cwd: repoRoot,
+        prompt: fullPrompt,
+        runId: sessionId,
+        onStream: (event) => {
+          onStream(event);
+        }
+      });
+
+      db.appendDirectChatMessage({
+        sessionId,
+        role: "assistant",
+        content: result.rawOutput,
+        toolCallsJson: null,
+        toolResultsJson: null
+      });
+
+      emitter.emit("event", {
+        kind: "complete",
+        result: result.rawOutput
+      });
+      return;
+    }
+
+    const toolContext = {
+      cwd: repoRoot,
+      workspaceId: sessionId,
+      allowedPaths: ["*"],
+      db,
+      readFiles: async (paths: string[]) => {
+        const res: Record<string, string> = {};
+        for (const p of paths) {
+          const full = path.resolve(repoRoot, p);
+          res[p] = await readFile(full, "utf8").catch(() => "");
+        }
+        return res;
+      },
+      writeFiles: async (files: { path: string; content: string }[]) => {
+        for (const f of files) {
+          const full = path.resolve(repoRoot, f.path);
+          await writeFile(full, f.content);
+        }
+      },
+      gitDiff: async () => {
+        const r = await git(repoRoot, ["diff", "main"]);
+        return r.stdout;
+      },
+      gitStatus: async () => {
+        const r = await git(repoRoot, ["status"]);
+        return r.stdout;
+      },
+      runNamedCommand: async (name: string) => {
+        return { stdout: "Command execution not fully implemented in direct chat.", stderr: "", exitCode: 0 };
+      },
+      saveArtifact: async () => "not_supported"
+    };
+
+    await runMediatedLoop({
+      systemPrompt: "You are the Local Builder. Help the user with their coding task in the current repository. Use the tools available to inspect and modify code.",
+      userPrompt: "",
+      messages: chatMessages,
+      config: {
+        model: builderModel.startsWith("mediated:") ? builderModel.slice(9) : builderModel,
+        cwd: repoRoot,
+        role: "builder",
+        onEvent: (event) => {
+          emitter!.emit("event", event);
+          if (event.kind === "complete") {
+            db.appendDirectChatMessage({
+              sessionId,
+              role: "assistant",
+              content: event.result,
+              toolCallsJson: null,
+              toolResultsJson: null
+            });
+          } else if (event.kind === "tool_result") {
+            db.appendDirectChatMessage({
+              sessionId,
+              role: "tool",
+              content: event.result.output,
+              toolCallsJson: null,
+              toolResultsJson: JSON.stringify(event.result)
+            });
+          } else if (event.kind === "tool_call") {
+            db.appendDirectChatMessage({
+              sessionId,
+              role: "assistant",
+              content: "",
+              toolCallsJson: JSON.stringify([event.call]),
+              toolResultsJson: null
+            });
+          }
+        }
+      },
+      toolContext: toolContext as any
+    });
+  } catch (err) {
+    emitter.emit("event", { kind: "error", error: String(err) });
+  } finally {
+    emitter.emit("done");
+  }
+}
+
+// Fire off plan decoder asynchronously
+async function runSession(sess: PlanSession, db: any, goalRunner: any) {
+  if (sess.status === "idle" && sess.pendingMessages.length === 0) {
+    // Already finished and nothing new to do
+    return;
+  }
+
+  try {
+    const gateway = (goalRunner as any).gateway;
+    const result = await runPlanDecoder({
+      cwd: sess.targetDir,
+      epicTitle: sess.epicTitle,
+      epicDescription: sess.epicDescription,
+      userMessages: sess.userMessages,
+      sessionId: sess.id,
+      db,
+      gateway,
+      onStream: (event: AgentStreamPayload) => {
+        sess.streamChunks.push(event);
+        if (event.streamKind === "assistant" && event.content) {
+          sess.textChunks.push(event.content);
+          const plan = extractPlanFromStream(sess.textChunks);
+          if (plan) sess.latestPlan = plan;
+        }
+      },
+    });
+    // Ollama fallback: onStream was never called - push rawText as a stream chunk
+    if (!sess.latestPlan) {
+      sess.latestPlan = result.plan;
+      if (result.rawText) {
+        sess.streamChunks.push({
+          agentRole: "epicDecoder",
+          source: "orchestrator",
+          streamKind: "assistant",
+          content: result.rawText,
+          sequence: sess.streamChunks.length,
+        });
+      }
+    }
+  } catch (err) {
+    console.error(`[PlanSession] Session ${sess.id} failed:`, err);
+    sess.streamChunks.push({
+      agentRole: "epicDecoder",
+      source: "orchestrator",
+      streamKind: "stderr",
+      content: `Plan decoder error: ${err instanceof Error ? err.message : String(err)}`,
+      sequence: sess.streamChunks.length,
+    });
+    sess.status = "error";
+    return;
+  }
+  
+  sess.status = "idle";
+  if (sess.pendingMessages.length > 0) {
+    console.log(`[PlanSession] Session ${sess.id} has ${sess.pendingMessages.length} pending messages. Re-running...`);
+    sess.userMessages.push(...sess.pendingMessages);
+    sess.pendingMessages = [];
+    sess.textChunks = [];
+    sess.latestPlan = null;
+    sess.streamChunks.push({ 
+      agentRole: "epicDecoder", 
+      source: "orchestrator", 
+      streamKind: "plan_cleared", 
+      content: "", 
+      sequence: sess.streamChunks.length 
+    });
+    sess.status = "running";
+    // Recurse to handle pending messages
+    void runSession(sess, db, goalRunner);
+  }
+}
 
 type ModelAdapterOption = {
   id: string;
@@ -43,6 +476,7 @@ type AgentModelInfo = {
 
 const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
   epicDecoder: [
+    { id: "gemini-cli", label: "Gemini CLI", description: "Workspace-aware local Gemini CLI execution" },
     { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
@@ -50,16 +484,20 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" },
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
     { id: "ollama", label: "Ollama (Fallback)", description: "Pure LLM via local Ollama, no workspace tools" },
-    { id: "gemma4:26b", label: "Ollama (gemma4:26b)", description: "Pure LLM via local Ollama, no workspace tools" }
+    { id: "gemma4:26b", label: "Ollama (gemma4:26b)", description: "Pure LLM via local Ollama, no workspace tools" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
   ],
   epicReviewer: [
+    { id: "gemini-cli", label: "Gemini CLI", description: "Workspace-aware local Gemini CLI execution" },
     { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
+    { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware local Codex CLI execution" },
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" },
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
-    { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" }
+    { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
   ],
   reviewer: [
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
@@ -67,9 +505,11 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "mediated:gemma4:e4b", label: "Mediated (gemma4:e4b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
+    { id: "qwen3:14b", label: "Ollama (qwen3:14b)", description: "Pure LLM via local Ollama, no workspace tools" },
     { id: "qwen3.5:9b", label: "Ollama (qwen3.5:9b)", description: "Pure LLM via local Ollama, no workspace tools" },
     { id: "glm-4.7-flash:q4_K_M", label: "Ollama (glm-4.7-flash)", description: "Pure LLM via local Ollama, no workspace tools" },
-    { id: "gemma4:26b", label: "Ollama (gemma4:26b)", description: "Pure LLM via local Ollama, no workspace tools" }
+    { id: "gemma4:26b", label: "Ollama (gemma4:26b)", description: "Pure LLM via local Ollama, no workspace tools" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
   ],
   tester: [
     { id: "skip", label: "Skip Tester", description: "Bypass tester step and mark tests as skipped" },
@@ -78,6 +518,9 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" }
   ],
   builder: [
+    { id: "gemini-cli", label: "Gemini CLI", description: "Workspace-aware local Gemini CLI execution" },
+    { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
+    { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware local Codex CLI execution" },
     { id: "mediated:qwen3.5:9b", label: "Mediated (qwen3.5:9b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:e4b", label: "Mediated (gemma4:e4b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
@@ -89,7 +532,59 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" }
   ],
+  coder: [
+    { id: "gemini-cli", label: "Gemini CLI", description: "Workspace-aware local Gemini CLI execution" },
+    { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
+    { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware local Codex CLI execution" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
+    { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
+    { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:devstral-small-2:24b", label: "Mediated (devstral-small-2:24b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:gemma4:e4b", label: "Mediated (gemma4:e4b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:qwen3:14b", label: "Mediated (qwen3:14b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:qwen2.5-coder:14b", label: "Mediated (qwen2.5-coder:14b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:qwen2.5-coder:7b", label: "Mediated (qwen2.5-coder:7b)", description: "Local tool execution via Ollama + harness" },
+    { id: "qwen3-coder:30b", label: "Ollama (qwen3-coder:30b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "qwen3-coder:30b-32k", label: "Ollama (qwen3-coder:30b-32k)", description: "Direct Ollama call - no workspace tools" },
+    { id: "qwen3.5:27b", label: "Ollama (qwen3.5:27b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "gemma4:31b", label: "Ollama (gemma4:31b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "gemma4:26b", label: "Ollama (gemma4:26b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "gemma4:26b-a4b-it-q4_K_M", label: "Ollama (gemma4:26b-a4b-it-q4_K_M)", description: "Direct Ollama call - no workspace tools" },
+    { id: "glm-4.7-flash-32k:latest", label: "Ollama (glm-4.7-flash-32k)", description: "Direct Ollama call - no workspace tools" },
+    { id: "nemotron-3-nano:30b", label: "Ollama (nemotron-3-nano:30b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "gemopus-no-vision:latest", label: "Ollama (gemopus-no-vision)", description: "Direct Ollama call - no workspace tools" },
+    { id: "gemopus-test:latest", label: "Ollama (gemopus-test)", description: "Direct Ollama call - no workspace tools" },
+    { id: "hf.co/Jackrong/Gemopus-4-26B-A4B-it-GGUF:q4_K_M", label: "Ollama (Gemopus-4-26B-A4B-it (q4_K_M))", description: "Direct Ollama call - no workspace tools" },
+    { id: "codestral:latest", label: "Ollama (codestral)", description: "Direct Ollama call - no workspace tools" },
+    { id: "magistral:latest", label: "Ollama (magistral)", description: "Direct Ollama call - no workspace tools" },
+    { id: "devstral-small-2:24b", label: "Ollama (devstral-small-2:24b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "deepcoder:14b", label: "Ollama (deepcoder:14b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "deepseek-r1:14b", label: "Ollama (deepseek-r1:14b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "phi4-reasoning:14b", label: "Ollama (phi4-reasoning:14b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "qwen3:14b", label: "Ollama (qwen3:14b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "qwen2.5-coder:14b", label: "Ollama (qwen2.5-coder:14b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "gemma4:e4b", label: "Ollama (gemma4:e4b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "qwen3.5:9b-32k", label: "Ollama (qwen3.5:9b-32k)", description: "Direct Ollama call - no workspace tools" },
+    { id: "qwen3.5:9b", label: "Ollama (qwen3.5:9b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "qwen3.5:latest", label: "Ollama (qwen3.5:latest)", description: "Direct Ollama call - no workspace tools" },
+    { id: "glm-4.7-flash:latest", label: "Ollama (glm-4.7-flash)", description: "Direct Ollama call - no workspace tools" },
+    { id: "glm-4.7-flash:q4_K_M", label: "Ollama (glm-4.7-flash:q4_K_M)", description: "Direct Ollama call - no workspace tools" },
+    { id: "llama3.2-vision:11b", label: "Ollama (llama3.2-vision:11b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "qwen3-vl:8b", label: "Ollama (qwen3-vl:8b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "qwen3:8b", label: "Ollama (qwen3:8b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "deepseek-r1:8b", label: "Ollama (deepseek-r1:8b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "gemma3:12b", label: "Ollama (gemma3:12b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "qwen2.5-coder:7b", label: "Ollama (qwen2.5-coder:7b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "qwen2.5:7b", label: "Ollama (qwen2.5:7b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "nemotron-mini:latest", label: "Ollama (nemotron-mini)", description: "Direct Ollama call - no workspace tools" },
+    { id: "nemotron-3-nano:4b", label: "Ollama (nemotron-3-nano:4b)", description: "Direct Ollama call - no workspace tools" },
+    { id: "qwen3:4b", label: "Ollama (qwen3:4b)", description: "Direct Ollama call - no workspace tools" }
+  ],
   playWriter: [
+    { id: "gemini-cli", label: "Gemini CLI", description: "Workspace-aware local Gemini CLI execution" },
     { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" }
   ],
@@ -113,14 +608,6 @@ function getAgentModelsConfig(): Record<string, AgentModelInfo> {
   const models = loadConfig().models;
   const result: Record<string, AgentModelInfo> = {};
   for (const [role, rawModel] of Object.entries(models)) {
-    if (role === "epicReviewer") {
-      result[role] = {
-        currentModel: "qwen-cli",
-        adapters: [{ id: "qwen-cli", label: "Qwen CLI (Forced)", description: "Temporarily locked to Qwen CLI for epic review stability" }],
-        switchable: false
-      };
-      continue;
-    }
     const { adapter, model } = parseAdapter(rawModel);
     const switchableOptions = SWITCHABLE_ADAPTORS[role];
     const adapters: ModelAdapterOption[] = switchableOptions
@@ -131,6 +618,13 @@ function getAgentModelsConfig(): Record<string, AgentModelInfo> {
           return opt;
         })
       : [{ id: rawModel, label: rawModel, description: "Configured adapter" }];
+    if (!adapters.some((opt) => opt.id === rawModel)) {
+      adapters.unshift({
+        id: rawModel,
+        label: inferModelLabel(rawModel),
+        description: "Configured model"
+      });
+    }
     result[role] = {
       currentModel: rawModel,
       adapters,
@@ -140,8 +634,19 @@ function getAgentModelsConfig(): Record<string, AgentModelInfo> {
   return result;
 }
 
+function inferModelLabel(rawModel: string): string {
+  if (rawModel.startsWith("mediated:")) return `Mediated (${rawModel.slice("mediated:".length)})`;
+  if (rawModel.startsWith("opencode:")) return `OpenCode (${rawModel.slice("opencode:".length)})`;
+  if (rawModel === "gemini-cli") return "Gemini CLI";
+  if (rawModel === "qwen-cli") return "Qwen CLI";
+  if (rawModel.startsWith("zai:")) return `Z AI (${rawModel.slice(4)})`;
+  if (rawModel === "codex-cli") return "Codex CLI";
+  if (rawModel === "skip") return "Skip Tester";
+  return `Ollama (${rawModel})`;
+}
+
 function isAgentRole(value: string): value is AgentRole {
-  return ["epicDecoder", "builder", "reviewer", "tester", "epicReviewer", "playWriter", "playTester", "doctor", "system"].includes(value);
+  return ["epicDecoder", "builder", "reviewer", "tester", "epicReviewer", "playWriter", "playTester", "doctor", "system", "coder"].includes(value);
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -169,6 +674,24 @@ function writeSseEvent(res: http.ServerResponse, event: string, data: unknown, i
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
+function resolveSseCursor(input: {
+  searchParam?: string | null;
+  lastEventIdHeader?: string | string[] | undefined;
+  defaultValue?: number;
+}): number {
+  const defaultValue = input.defaultValue ?? 0;
+  const fromQuery = Number(input.searchParam ?? "");
+  if (Number.isFinite(fromQuery) && fromQuery >= 0) return fromQuery;
+
+  const headerValue = Array.isArray(input.lastEventIdHeader)
+    ? input.lastEventIdHeader[0]
+    : input.lastEventIdHeader;
+  const fromHeader = Number(headerValue ?? "");
+  if (Number.isFinite(fromHeader) && fromHeader >= 0) return fromHeader + 1;
+
+  return defaultValue;
+}
+
 async function main() {
   const { config, db, goalRunner, lifecycle, ticketRunner } = await bootstrap();
   const server = http.createServer(async (req, res) => {
@@ -182,7 +705,13 @@ async function main() {
       if (!req.url) return json(res, 400, { error: "missing_url" });
       const url = new URL(req.url, `http://${req.headers.host}`);
       if (url.pathname === "/health") return json(res, 200, { ok: true, dryRun: config.dryRun, useLangGraph: config.useLangGraph });
-      if (url.pathname === "/api/epics" && req.method === "GET") return json(res, 200, db.listEpics());
+      if (url.pathname === "/api/epics" && req.method === "GET") {
+        const limit = Number(url.searchParams.get("limit") ?? 50);
+        const offset = Number(url.searchParams.get("offset") ?? 0);
+        const epics = db.listEpics({ limit, offset });
+        const total = db.countEpics();
+        return json(res, 200, { epics, total, limit, offset });
+      }
       if (url.pathname === "/api/tickets" && req.method === "GET") return json(res, 200, db.listTickets(url.searchParams.get("epicId") || undefined));
       if (url.pathname === "/api/runs" && req.method === "GET") return json(res, 200, db.listRuns());
       if (url.pathname === "/api/jobs" && req.method === "GET") return json(res, 200, db.listJobs());
@@ -243,7 +772,12 @@ async function main() {
         const summary = await lifecycle.cancelEpic(decodeURIComponent(cancelEpicMatch[1]));
         return json(res, 200, { ok: true, ...summary });
       }
-      const reviewEpicMatch = /^\/api\/epics\/([^/]+)\/review$/.exec(url.pathname);
+      const doneEpicMatch = /^\/api\/epics\/([^/]+)\/done$/.exec(url.pathname);
+      if (doneEpicMatch && req.method === "POST") {
+        const id = decodeURIComponent(doneEpicMatch[1]);
+        db.updateEpicStatus(id, "done");
+        return json(res, 200, { ok: true });
+      }      const reviewEpicMatch = /^\/api\/epics\/([^/]+)\/review$/.exec(url.pathname);
       if (reviewEpicMatch && req.method === "POST") {
         const epicId = decodeURIComponent(reviewEpicMatch[1]);
         const epic = db.getEpic(epicId);
@@ -266,7 +800,14 @@ async function main() {
           .find((run) => {
             if (run.status !== "queued" && run.status !== "running" && run.status !== "waiting") return false;
             const node = String(run.currentNode ?? "").toLowerCase();
-            return node.includes("review");
+            if (!node.includes("review")) return false;
+
+            // If it's over 15 minutes old and stalled, allow a new one
+            const heartbeatAtMs = run.heartbeatAt ? new Date(run.heartbeatAt).getTime() : 0;
+            const stalledForMs = heartbeatAtMs > 0 ? Date.now() - heartbeatAtMs : Number.MAX_SAFE_INTEGER;
+            if (stalledForMs > 15 * 60 * 1000) return false;
+
+            return true;
           });
         if (activeReviewRun) {
           return json(res, 200, {
@@ -294,9 +835,67 @@ async function main() {
         const epicId = decodeURIComponent(retryEpicMatch[1]);
         const epic = db.getEpic(epicId);
         if (!epic) return json(res, 404, { error: "epic_not_found" });
+
+        // Cancel any active ticket runs
+        const tickets = db.listTickets(epicId);
+        for (const ticket of tickets) {
+          if (ticket.status === "queued" || ticket.status === "building" || ticket.status === "reviewing" || ticket.status === "testing") {
+            await lifecycle.cancelTicket(ticket.id);
+          }
+        }
+
+        // Clean up stale worktrees for the target branch
+        try {
+          const { execSync } = require("child_process");
+          const worktreeList = execSync("git worktree list --porcelain", { cwd: epic.targetDir, encoding: "utf8" });
+          const worktreeEntries = worktreeList.split("\n\n");
+          for (const entry of worktreeEntries) {
+            const pathLine = entry.split("\n").find((l: string) => l.startsWith("worktree "));
+            const branchLine = entry.split("\n").find((l: string) => l.startsWith("branch refs/heads/"));
+            if (pathLine && branchLine && branchLine.includes(epic.targetBranch || "")) {
+              const wtPath = pathLine.replace("worktree ", "");
+              try { execSync(`git worktree remove --force "${wtPath}"`, { cwd: epic.targetDir, stdio: "pipe" }); } catch {}
+            }
+          }
+          execSync("git worktree prune", { cwd: epic.targetDir, stdio: "pipe" });
+        } catch {}
+
+        // Fail stale jobs for this epic's tickets
+        for (const job of db.listJobRecords()) {
+          const payload = (job.payload ?? {}) as Record<string, unknown>;
+          if (job.kind !== "run_ticket") continue;
+          if (payload.epicId !== epicId) continue;
+          if (job.status !== "queued" && job.status !== "running") continue;
+          db.failJob(job.id, "Superseded by epic retry.", false);
+        }
+
+        // Reset tickets and re-queue
         db.updateEpicStatus(epicId, "executing");
-        const runId = await goalRunner.enqueueGoal(epicId);
-        return json(res, 200, { ok: true, epicId, runId });
+        const runIds: string[] = [];
+        for (const ticket of tickets) {
+          db.updateTicketRunState({
+            ticketId: ticket.id,
+            status: "queued",
+            currentRunId: null,
+            currentNode: null,
+            lastHeartbeatAt: null,
+            lastMessage: "Re-queued by epic retry."
+          });
+          const runId = await ticketRunner.start(ticket.id, epicId);
+          runIds.push(runId);
+        }
+
+        db.recordEvent({
+          aggregateType: "epic",
+          aggregateId: epicId,
+          runId: null,
+          ticketId: null,
+          kind: "epic_retry",
+          message: "Epic retry: all tickets re-queued.",
+          payload: { epicId, ticketRunIds: runIds }
+        });
+
+        return json(res, 200, { ok: true, epicId, ticketRunIds: runIds });
       }
       const deleteEpicMatch = /^\/api\/epics\/([^/]+)$/.exec(url.pathname);
       if (deleteEpicMatch && req.method === "DELETE") {
@@ -521,6 +1120,29 @@ async function main() {
         });
         return json(res, 200, { ok: true, runId: run.id, ticketId: ticket.id, stalledForMs, supersededJobIds });
       }
+      const rerunDirectMatch = /^\/api\/tickets\/([^/]+)\/rerun-direct$/.exec(url.pathname);
+      if (rerunDirectMatch && req.method === "POST") {
+        const ticketId = decodeURIComponent(rerunDirectMatch[1]);
+        const ticket = db.getTicket(ticketId);
+        if (!ticket) return json(res, 404, { error: "ticket_not_found" });
+        const activeRuns = db
+          .listRunsForTicket(ticket.id)
+          .filter((run) => run.status === "queued" || run.status === "running" || run.status === "waiting");
+        if (activeRuns.length) {
+          await lifecycle.cancelTicket(ticket.id);
+        }
+        const runId = await ticketRunner.startDirect(ticket.id, ticket.epicId);
+        db.recordEvent({
+          aggregateType: "ticket",
+          aggregateId: ticket.id,
+          runId,
+          ticketId: ticket.id,
+          kind: "ticket_rerun_direct_queued",
+          message: "Ticket direct rerun queued (skip explorer).",
+          payload: { ticketId: ticket.id, runId, cancelledPreviousRuns: activeRuns.map((run) => run.id) }
+        });
+        return json(res, 200, { ok: true, runId, ticketId: ticket.id });
+      }
       const deleteTicketMatch = /^\/api\/tickets\/([^/]+)$/.exec(url.pathname);
       if (deleteTicketMatch && req.method === "DELETE") {
         const summary = await lifecycle.deleteTicket(decodeURIComponent(deleteTicketMatch[1]));
@@ -533,7 +1155,12 @@ async function main() {
         const currentBranch = await git(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
           .then(r => r.stdout.trim())
           .catch(() => null);
-        return json(res, 200, { ...wsConfig, currentBranch, models: getAgentModelsConfig() });
+        return json(res, 200, { 
+          targetDir: repoRoot,
+          ...wsConfig, 
+          currentBranch, 
+          models: getAgentModelsConfig() 
+        });
       }
       if (url.pathname === "/api/models" && req.method === "GET") {
         return json(res, 200, getAgentModelsConfig());
@@ -544,9 +1171,6 @@ async function main() {
         const model = String(body.model || "").trim();
         if (!isAgentRole(role)) return json(res, 400, { error: "invalid_role" });
         if (!model) return json(res, 400, { error: "missing_model" });
-        if (role === "epicReviewer" && model !== "qwen-cli") {
-          return json(res, 409, { error: "model_locked", message: "epicReviewer is temporarily locked to qwen-cli." });
-        }
         updateAgentModel(role, model);
         return json(res, 200, { ok: true, models: getAgentModelsConfig() });
       }
@@ -580,7 +1204,7 @@ async function main() {
                 }
               },
             });
-            // Ollama fallback: onStream was never called — push rawText as a stream chunk
+            // Ollama fallback: onStream was never called - push rawText as a stream chunk
             if (!sess.latestPlan) {
               sess.latestPlan = result.plan;
               if (result.rawText) {
@@ -662,7 +1286,11 @@ async function main() {
           "cache-control": "no-cache, no-transform",
           connection: "keep-alive"
         });
-        let afterIndex = Number(url.searchParams.get("afterIndex") || 0);
+        let afterIndex = resolveSseCursor({
+          searchParam: url.searchParams.get("afterIndex"),
+          lastEventIdHeader: req.headers["last-event-id"],
+          defaultValue: 0
+        });
         let closed = false;
         req.on("close", () => { closed = true; });
         writeSseEvent(res, "ready", { ok: true, afterIndex, status: session.status });
@@ -674,7 +1302,11 @@ async function main() {
             writeSseEvent(res, "agent", { ...chunk, id: afterIndex }, afterIndex);
             afterIndex++;
           }
-          writeSseEvent(res, "session_status", { status: session.status, hasPlan: session.latestPlan !== null });
+          writeSseEvent(res, "session_status", {
+            status: session.status,
+            hasPlan: session.latestPlan !== null,
+            awaitingClarification: planNeedsClarification(session.latestPlan)
+          });
           if (session.latestPlan) {
             writeSseEvent(res, "plan_ready", session.latestPlan);
           }
@@ -714,6 +1346,18 @@ async function main() {
         const session = planSessions.get(sessionId);
         if (!session) return json(res, 404, { error: "plan_session_not_found" });
         if (!session.latestPlan) return json(res, 409, { error: "no_plan_ready", message: "The planner has not produced a plan yet." });
+        if (planNeedsClarification(session.latestPlan)) {
+          return json(res, 409, {
+            error: "clarification_required",
+            message: "The planner is waiting for clarification before the plan can be approved."
+          });
+        }
+        if (session.latestPlan.tickets.length === 0) {
+          return json(res, 409, {
+            error: "empty_plan",
+            message: "The planner has not produced any tickets yet."
+          });
+        }
 
         const approveBody = await readBody(req);
         // Allow approve-time override; fall back to branch set at session creation
@@ -743,6 +1387,101 @@ async function main() {
         return json(res, 201, { epicId: epic.id, runId });
       }
 
+      // Direct Chat Routes
+      if (url.pathname === "/api/direct-chats" && req.method === "GET") {
+        return json(res, 200, db.listDirectChatSessions());
+      }
+      if (url.pathname === "/api/direct-chats" && req.method === "POST") {
+        const body = await readBody(req);
+        const session = db.createDirectChatSession({
+          id: randomId("chat"),
+          title: String(body.title || "New Chat"),
+          targetDir: String(body.targetDir || process.cwd()),
+          branchName: String(body.branchName || "main"),
+          model: String(body.model || "")
+        });
+        return json(res, 201, session);
+      }
+      const chatMessagesMatch = /^\/api\/direct-chats\/([^/]+)\/messages$/.exec(url.pathname);
+      if (chatMessagesMatch && req.method === "GET") {
+        return json(res, 200, db.listDirectChatMessages(decodeURIComponent(chatMessagesMatch[1])));
+      }
+      if (chatMessagesMatch && req.method === "POST") {
+        const sessionId = decodeURIComponent(chatMessagesMatch[1]);
+        const body = await readBody(req);
+        const msg = db.appendDirectChatMessage({
+          sessionId,
+          role: "user",
+          content: String(body.content || ""),
+          toolCallsJson: null,
+          toolResultsJson: null
+        });
+        void runDirectChat(sessionId, db);
+        return json(res, 201, msg);
+      }
+      const chatStreamMatch = /^\/api\/direct-chats\/([^/]+)\/stream$/.exec(url.pathname);
+      if (chatStreamMatch && req.method === "GET") {
+        const sessionId = decodeURIComponent(chatStreamMatch[1]);
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache, no-transform",
+          connection: "keep-alive"
+        });
+        let emitter = chatEmitters.get(sessionId);
+        if (!emitter) {
+          emitter = new EventEmitter();
+          chatEmitters.set(sessionId, emitter);
+        }
+        const onEvent = (event: any) => writeSseEvent(res, "agent", event);
+        emitter.on("event", onEvent);
+        req.on("close", () => {
+          emitter.off("event", onEvent);
+        });
+        writeSseEvent(res, "ready", { ok: true });
+        return;
+      }
+      const chatDiffMatch = /^\/api\/direct-chats\/([^/]+)\/diff$/.exec(url.pathname);
+      if (chatDiffMatch && req.method === "GET") {
+        const sessionId = decodeURIComponent(chatDiffMatch[1]);
+        const session = db.getDirectChatSession(sessionId);
+        if (!session) return json(res, 404, { error: "chat_not_found" });
+        const diff = await git(session.targetDir, ["diff", "main"]).then(r => r.stdout).catch(() => "");
+        return json(res, 200, { diff });
+      }
+      const chatDeleteMatch = /^\/api\/direct-chats\/([^/]+)$/.exec(url.pathname);
+      if (chatDeleteMatch && req.method === "DELETE") {
+        const sessionId = decodeURIComponent(chatDeleteMatch[1]);
+        db.deleteDirectChatSession(sessionId);
+        return json(res, 200, { ok: true });
+      }
+      const chatCompressMatch = /^\/api\/direct-chats\/([^/]+)\/compress$/.exec(url.pathname);
+      if (chatCompressMatch && req.method === "POST") {
+        const sessionId = decodeURIComponent(chatCompressMatch[1]);
+        const session = db.getDirectChatSession(sessionId);
+        if (!session) return json(res, 404, { error: "chat_not_found" });
+
+        const messages = db.listDirectChatMessages(sessionId);
+        const context = await buildDirectChatContext(session.model, messages, { compressionThreshold: 0.1 }); // Force compression
+        
+        if (context.didCompress) {
+          db.clearDirectChatMessages(sessionId);
+          for (const m of context.messages) {
+            db.appendDirectChatMessage({
+              sessionId,
+              role: m.role,
+              content: m.content || "",
+              toolCallsJson: m.tool_calls ? JSON.stringify(m.tool_calls.map(tc => ({
+                id: tc.id,
+                name: tc.function.name,
+                arguments: tc.function.arguments
+              }))) : null,
+              toolResultsJson: m.role === "tool" ? JSON.stringify({ callId: m.tool_call_id, output: m.content }) : null
+            });
+          }
+        }
+        return json(res, 200, { ok: true, didCompress: context.didCompress });
+      }
+
       const builtIndex = path.join(config.uiDistDir, "index.html");
       if (req.method === "GET" && !url.pathname.startsWith("/api")) {
         const filePath = existsSync(builtIndex)
@@ -762,6 +1501,40 @@ async function main() {
           }
         }
       }
+      // ─── Tetris Score API ───
+      if (url.pathname === "/api/tetris/scores" && req.method === "GET") {
+        return json(res, 200, db.getTetrisHighScores(10));
+      }
+      if (url.pathname === "/api/tetris/scores" && req.method === "POST") {
+        const body = await readBody(req);
+        if (!body || typeof body.name !== "string" || typeof body.score !== "number") {
+          return json(res, 400, { error: "name (string) and score (number) required" });
+        }
+        db.addTetrisScore(body.name.slice(0, 3).toUpperCase(), body.score, body.level || 0, body.lines || 0);
+        return json(res, 200, { ok: true });
+      }
+      if (url.pathname === "/api/tetris/scores" && req.method === "DELETE") {
+        db.clearTetrisScores();
+        return json(res, 200, { ok: true });
+      }
+
+      // ─── Pac-Man Score API ───
+      if (url.pathname === "/api/pacman/scores" && req.method === "GET") {
+        return json(res, 200, db.getPacmanHighScores(10));
+      }
+      if (url.pathname === "/api/pacman/scores" && req.method === "POST") {
+        const body = await readBody(req);
+        if (!body || typeof body.name !== "string" || typeof body.score !== "number") {
+          return json(res, 400, { error: "name (string) and score (number) required" });
+        }
+        db.addPacmanScore(body.name.slice(0, 3).toUpperCase(), body.score, body.level || 0);
+        return json(res, 200, { ok: true });
+      }
+      if (url.pathname === "/api/pacman/scores" && req.method === "DELETE") {
+        db.clearPacmanScores();
+        return json(res, 200, { ok: true });
+      }
+
       json(res, 404, { error: "not_found" });
     } catch (error) {
       json(res, 500, { error: (error as Error).message });

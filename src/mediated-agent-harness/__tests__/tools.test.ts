@@ -58,8 +58,8 @@ function createMockContext(cwd: string): ToolExecutionContext {
 
 // ─── Tool definitions ───────────────────────────────────────────────────────
 
-test("WORKSPACE_TOOLS has 17 tools including finish and web_search", () => {
-  assert.equal(WORKSPACE_TOOLS.length, 17);
+test("WORKSPACE_TOOLS has 20 tools including finish and web_search", () => {
+  assert.equal(WORKSPACE_TOOLS.length, 20);
   const names = WORKSPACE_TOOLS.map(t => t.function.name);
   assert.ok(names.includes("finish"));
   assert.ok(names.includes("glob_files"));
@@ -270,6 +270,21 @@ test("run_command executes whitelisted command", async () => {
 
   assert.equal(result.isError, false);
   assert.equal(result.output, "output of test");
+
+  await rm(tmpDir, { recursive: true, force: true });
+});
+
+test("run_command rejects command names outside workspace availability", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-test-"));
+  const ctx = createMockContext(tmpDir);
+
+  const result = await executeToolCall(
+    { id: "call_1", name: "run_command", args: { name: "install" } },
+    ctx
+  );
+
+  assert.equal(result.isError, true);
+  assert.ok(result.output.includes("not available"));
 
   await rm(tmpDir, { recursive: true, force: true });
 });

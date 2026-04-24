@@ -22,6 +22,7 @@ import {
   isCompletedEvent,
   isRunActiveForRole,
   normalizeAgentRole,
+  normalizeDisplayedTicketId,
   normalizeTicketTitleKey,
   ticketStatusScore,
   truncateId,
@@ -31,6 +32,8 @@ import { AgentModal } from "./components/AgentModal.tsx";
 import { EpicModal } from "./components/EpicModal.tsx";
 import { PlanningModal } from "./components/PlanningModal.tsx";
 import { TicketModal } from "./components/TicketModal.tsx";
+import { DirectChatModal } from "./components/DirectChatModal.tsx";
+import { GameModal } from "./components/GameModal.tsx";
 
 export function App() {
   const [data, setData] = useState<Dashboard>({ epics: [], tickets: [], runs: [], agentEvents: [] });
@@ -43,12 +46,22 @@ export function App() {
   const [targetBranch, setTargetBranch] = useState("");
   const [epicMode, setEpicMode] = useState<"build" | "plan">("build");
   const [planSessionId, setPlanSessionId] = useState<string | null>(null);
+  const [planMinimized, setPlanMinimized] = useState(false);
+  const [planReady, setPlanReady] = useState(false);
+  const [planAwaitingClarification, setPlanAwaitingClarification] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [epicPage, setEpicPage] = useState(0);
+  const [epicPageSize] = useState(50);
+  const [epicTotal, setEpicTotal] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [openRole, setOpenRole] = useState<string | null>(null);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [isTetrisOpen, setIsTetrisOpen] = useState(false);
+  const [isPacmanOpen, setIsPacmanOpen] = useState(false);
+  const [isTamagotchiOpen, setIsTamagotchiOpen] = useState(false);
   const [selectedEpic, setSelectedEpic] = useState<string | null>(null);
   const [selectedEpicDetails, setSelectedEpicDetails] = useState<Epic | null>(null);
   const [selectedTicket, setSelectedTicket] = useState<Ticket | null>(null);
@@ -82,19 +95,22 @@ export function App() {
   async function refresh() {
     try {
       setLoading(true);
-      const [epics, tickets, runs, fetchedAgentEvents] = await Promise.all([
-        fetchJson<Epic[]>("/api/epics"),
+      const [epicResult, tickets, runs, fetchedAgentEvents] = await Promise.all([
+        fetchJson<{ epics: Epic[]; total: number }>("/api/epics?limit=" + epicPageSize + "&offset=" + (epicPage * epicPageSize)),
         fetchJson<Ticket[]>("/api/tickets"),
         fetchJson<Run[]>("/api/runs"),
         fetchJson<AgentEvent[]>("/api/agent-events?limit=600"),
       ]);
+      
+      setEpicTotal(epicResult.total);
+
       // Merge fetched events with any SSE-captured events to avoid losing recent ones
       setData((current) => {
         const merged = new Map<number, AgentEvent>();
         for (const e of fetchedAgentEvents) merged.set(e.id, e);
         for (const e of current.agentEvents) merged.set(e.id, e);
         const agentEvents = [...merged.values()].sort((a, b) => a.id - b.id).slice(-600);
-        return { epics, tickets, runs, agentEvents };
+        return { epics: epicResult.epics, tickets, runs, agentEvents };
       });
       void refreshModels();
       setError(null);
@@ -226,11 +242,12 @@ export function App() {
         "playWriter",
         "playTester",
         "epicDecoder",
-        "builder",
+        "explorer",
+        "coder",
         "reviewer",
-        "tester",
         "epicReviewer",
         "doctor",
+        "builder",
       ];
       const ia = order.indexOf(a);
       const ib = order.indexOf(b);
@@ -398,6 +415,22 @@ export function App() {
     } catch (err) {
       setError((err as Error).message);
       toast.error(`Failed to delete epic: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function markEpicDone(id: string) {
+    if (actionBusy) return;
+    const toastId = toast.loading("Marking epic as done...");
+    try {
+      setActionBusy(`mark-done-epic-${id}`);
+      const res = await fetch(`/api/epics/${encodeURIComponent(id)}/done`, { method: "POST" });
+      if (!res.ok) throw new Error("Failed to mark epic as done");
+      toast.success("Epic marked as done.", { id: toastId });
+      void refresh();
+    } catch (err) {
+      toast.error(`Error: ${(err as Error).message}`, { id: toastId });
     } finally {
       setActionBusy(null);
     }
@@ -607,6 +640,31 @@ export function App() {
     }
   }
 
+  async function rerunDirectTicket(ticketId: string) {
+    const confirmed = await confirmToast({
+      title: "Skip explorer and rerun?",
+      description: "This queues a new run that skips the explorer and goes directly to coding, using previous analysis or ticket allowedPaths.",
+      confirmLabel: "Skip Explorer & Rerun",
+    });
+    if (!confirmed) return;
+    const toastId = toast.loading("Queuing direct rerun (skip explorer)...");
+    try {
+      setActionBusy(`rerun-direct-ticket-${ticketId}`);
+      await fetchJson(`/api/tickets/${encodeURIComponent(ticketId)}/rerun-direct`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cancelActive: true }),
+      });
+      await refresh();
+      toast.success("Direct rerun queued (skip explorer).", { id: toastId });
+    } catch (err) {
+      setError((err as Error).message);
+      toast.error(`Failed to direct rerun: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
   async function updateAgentModel(role: string, model: string) {
     const current = modelsConfig[role]?.currentModel;
     if (!current || current === model) return;
@@ -710,6 +768,18 @@ export function App() {
             <span className="subtitle-mono">workspace: {targetDir}</span>
           </div>
           <div className="topbar-actions">
+            <button className="btn" onClick={() => setIsTetrisOpen(true)}>
+              🎮 Tetris
+            </button>
+            <button className="btn" onClick={() => setIsPacmanOpen(true)}>
+              🕹️ Pac-Man
+            </button>
+            <button className="btn" onClick={() => setIsTamagotchiOpen(true)}>
+              🐾 Tamagotchi
+            </button>
+            <button className="btn" onClick={() => setIsChatOpen(true)}>
+              💬 Direct Chat
+            </button>
             <button className="btn" onClick={() => void refresh()} disabled={loading}>
               {loading ? "⏳ Refresh..." : "🔄 Refresh"}
             </button>
@@ -831,6 +901,25 @@ export function App() {
             <div
               className={`win-content win-inset ${collapsedPanels.has("epics") ? "collapsed" : ""}`}
             >
+              <div className="pagination-bar">
+                <button 
+                  className="mini-btn" 
+                  disabled={epicPage === 0} 
+                  onClick={() => setEpicPage(p => p - 1)}
+                >
+                  &lt; Prev
+                </button>
+                <span className="pagination-info">
+                  Page {epicPage + 1} of {Math.ceil(epicTotal / epicPageSize) || 1}
+                </span>
+                <button 
+                  className="mini-btn" 
+                  disabled={(epicPage + 1) * epicPageSize >= epicTotal} 
+                  onClick={() => setEpicPage(p => p + 1)}
+                >
+                  Next &gt;
+                </button>
+              </div>
               <div className="epic-list">
                 {data.epics.length ? (
                   data.epics.map((epic) => (
@@ -912,7 +1001,7 @@ export function App() {
                       <div className="ticket-top">
                         <div style={{ flex: 1 }}>
                           <div className="ticket-id-row">
-                            <span className="ticket-id">{truncateId(ticket.id)}</span>
+                            <span className="ticket-id">{truncateId(normalizeDisplayedTicketId(ticket.id))}</span>
                             {ticket.priority && (
                               <span className={`priority-${ticket.priority}`}>{ticket.priority}</span>
                             )}
@@ -1182,6 +1271,25 @@ export function App() {
                 collapsedPanels.has("epicsDesktop") ? "collapsed" : ""
               }`}
             >
+              <div className="pagination-bar">
+                <button 
+                  className="mini-btn" 
+                  disabled={epicPage === 0} 
+                  onClick={() => setEpicPage(p => p - 1)}
+                >
+                  &lt; Prev
+                </button>
+                <span className="pagination-info">
+                  Page {epicPage + 1} of {Math.ceil(epicTotal / epicPageSize) || 1}
+                </span>
+                <button 
+                  className="mini-btn" 
+                  disabled={(epicPage + 1) * epicPageSize >= epicTotal} 
+                  onClick={() => setEpicPage(p => p + 1)}
+                >
+                  Next &gt;
+                </button>
+              </div>
               <div className="epic-list">
                 {data.epics.length ? (
                   data.epics.map((epic) => (
@@ -1268,7 +1376,7 @@ export function App() {
                       <div className="ticket-top">
                         <div style={{ flex: 1 }}>
                           <div className="ticket-id-row">
-                            <span className="ticket-id">{truncateId(ticket.id)}</span>
+                            <span className="ticket-id">{truncateId(normalizeDisplayedTicketId(ticket.id))}</span>
                             {ticket.priority && (
                               <span className={`priority-${ticket.priority}`}>{ticket.priority}</span>
                             )}
@@ -1356,16 +1464,48 @@ export function App() {
           sessionId={planSessionId}
           epicTitle={title}
           initialBranch={targetBranch || undefined}
-          open={true}
-          onClose={() => setPlanSessionId(null)}
+          open={!planMinimized}
+          onMinimize={() => setPlanMinimized(true)}
+          onReady={() => setPlanReady(true)}
+          onStateChange={({ hasPlan, awaitingClarification }) => {
+            setPlanReady(hasPlan && !awaitingClarification);
+            setPlanAwaitingClarification(awaitingClarification);
+          }}
+          onClose={() => {
+            setPlanSessionId(null);
+            setPlanMinimized(false);
+            setPlanReady(false);
+            setPlanAwaitingClarification(false);
+          }}
           onApproved={(epicId) => {
             setPlanSessionId(null);
+            setPlanMinimized(false);
+            setPlanReady(false);
+            setPlanAwaitingClarification(false);
             setTitle("");
             setGoalText("");
             setTargetBranch("");
             void refresh();
           }}
         />
+      )}
+
+      {planMinimized && planSessionId && (
+        <div 
+          className={`minimized-planner-indicator ${planReady ? 'is-ready' : planAwaitingClarification ? 'is-ready' : ''}`}
+          onClick={() => setPlanMinimized(false)}
+          title={
+            planReady
+              ? "Plan is ready. Click to open."
+              : planAwaitingClarification
+              ? "Planner needs clarification. Click to answer."
+              : "Planning in progress... Click to open."
+          }
+        >
+          <span className="min-icon">📐</span>
+          <span className="min-label">Planning: {title}</span>
+          {(planReady || planAwaitingClarification) && <span className="min-ready-dot" />}
+        </div>
       )}
 
       {openRole && (
@@ -1383,13 +1523,14 @@ export function App() {
       {selectedTicket && (
         <TicketModal
           ticket={selectedTicket}
-          events={data.agentEvents}
+          events={selectedTicketEvents}
           runs={data.runs}
           open={true}
           onClose={() => setSelectedTicket(null)}
           onCancel={() => void cancelTicket(selectedTicket.id)}
           onRerun={() => void rerunTicket(selectedTicket.id)}
           onForceRerunInPlace={() => void forceRerunTicketInPlace(selectedTicket.id)}
+          onRerunDirect={() => void rerunDirectTicket(selectedTicket.id)}
           onForceRescue={() => void forceRescueTicket(selectedTicket.id)}
           onDelete={() => void deleteTicket(selectedTicket.id)}
           actionBusy={actionBusy !== null}
@@ -1404,6 +1545,7 @@ export function App() {
           onRetry={() => void retryEpic(selectedEpicDetails.id)}
           onReview={() => void reviewEpic(selectedEpicDetails.id)}
           onPlayLoop={() => void playLoopEpic(selectedEpicDetails.id)}
+          onMarkDone={() => void markEpicDone(selectedEpicDetails.id)}
           onCancel={() => void cancelEpic(selectedEpicDetails.id)}
           onDelete={() => void deleteEpic(selectedEpicDetails.id)}
           actionBusy={actionBusy !== null}
@@ -1411,6 +1553,17 @@ export function App() {
           epicTickets={data.tickets.filter((t) => t.epicId === selectedEpicDetails.id)}
         />
       )}
+
+      <DirectChatModal
+        isOpen={isChatOpen}
+        onClose={() => setIsChatOpen(false)}
+        modelsConfig={modelsConfig}
+        defaultTargetDir={targetDir}
+      />
+
+      <GameModal isOpen={isTetrisOpen} onClose={() => setIsTetrisOpen(false)} game="tetris" />
+      <GameModal isOpen={isPacmanOpen} onClose={() => setIsPacmanOpen(false)} game="pacman" />
+      <GameModal isOpen={isTamagotchiOpen} onClose={() => setIsTamagotchiOpen(false)} game="tamagotchi" />
     </div>
   );
 }

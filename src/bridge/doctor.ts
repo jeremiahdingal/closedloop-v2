@@ -11,10 +11,15 @@ export function deterministicDoctor(input: {
     return { decision: "retry_same_node", reason: input.infraFailure ? "Transient infrastructure failure." : "Agent stalled; restarting at current node." };
   }
   if (input.noDiff) {
-    return { decision: "retry_builder", reason: "Builder produced no diff." };
+    // If there are no repeated blockers or test failures, the code likely already satisfies the criteria.
+    // Approve to avoid escalation loops on re-runs of already-completed tickets.
+    if (!input.repeatedBlockers && !input.repeatedTestFailure) {
+      return { decision: "approve", reason: "No diff produced but no blockers or test failures — code likely already satisfies acceptance criteria." };
+    }
+    return { decision: "escalate", reason: "No diff produced with repeated blockers — escalating to avoid retry loop." };
   }
   if (input.repeatedBlockers || input.repeatedTestFailure) {
     return { decision: "escalate", reason: "The same blocker or test failure repeated." };
   }
-  return { decision: "retry_builder", reason: "The ticket needs another build attempt." };
+  return { decision: "escalate", reason: "Unrecoverable failure - escalating to avoid retry loop." };
 }

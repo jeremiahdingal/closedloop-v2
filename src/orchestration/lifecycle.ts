@@ -196,7 +196,10 @@ export class LifecycleService {
       if (remoteDeleted === false) failedRemoteBranches.push(workspace.branchName);
 
       await this.bridge.cleanupWorkspace(workspace.id, true).catch(async () => {
-        await rm(workspace.worktreePath, { recursive: true, force: true }).catch(() => undefined);
+        // Only rm if it's a separate worktree directory, not the target repo itself
+        if (workspace.worktreePath !== workspace.repoRoot) {
+          await rm(workspace.worktreePath, { recursive: true, force: true }).catch(() => undefined);
+        }
       });
     }
 

@@ -155,6 +155,85 @@ test("goal runner fails the epic when tickets never become approved", async () =
   }
 });
 
+test("goal runner aliases planner ANA ticket ids to execution ticket ids", async () => {
+  const repoRoot = await makeTempDir("repo-");
+  const dataDir = await makeTempDir("data-");
+  await initGitRepo(repoRoot);
+
+  const services = await bootstrapForTest({
+    REPO_ROOT: repoRoot,
+    DATA_DIR: dataDir,
+    TEST_COMMAND: 'node --eval "process.exit(0)"',
+    LINT_COMMAND: 'node --eval "process.exit(0)"',
+    TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
+  }, { dryRun: true });
+
+  try {
+    const gateway = new MockGateway({
+      goalDecomposition: {
+        summary: "Create one ticket",
+        tickets: [
+          {
+            id: "ANA-06",
+            title: "Implement trend report",
+            description: "Add the trend report endpoint.",
+            acceptanceCriteria: ["trend report exists"],
+            dependencies: [],
+            allowedPaths: ["src"],
+            priority: "high"
+          }
+        ]
+      },
+      builderPlans: [
+        {
+          summary: "Create src/trend.ts",
+          intendedFiles: ["src/trend.ts"],
+          operations: [
+            {
+              kind: "replace_file",
+              path: "src/trend.ts",
+              content: 'export const trend = true;\n'
+            }
+          ]
+        }
+      ],
+      reviewerVerdicts: [
+        {
+          approved: true,
+          blockers: [],
+          suggestions: [],
+          riskLevel: "low"
+        }
+      ],
+      goalReview: {
+        verdict: "approved",
+        summary: "approved",
+        followupTickets: []
+      }
+    });
+    const ticketRunner = new TicketRunner(services.db, services.bridge, gateway, services.lifecycle);
+    const goalRunner = new GoalRunner(services.db, ticketRunner, gateway, services.lifecycle);
+
+    const epic = GoalRunner.createEpic(services.db, {
+      id: "epic_analysis_alias",
+      title: "Analysis alias cleanup",
+      goalText: "Create a trend report ticket",
+      targetDir: repoRoot
+    });
+
+    const runId = await goalRunner.enqueueGoal(epic.id);
+    await goalRunner.runExisting(runId);
+
+    const cleanTicket = services.db.getTicket(`${epic.id}__T-001`);
+    assert.ok(cleanTicket);
+    assert.equal(cleanTicket.title, "Implement trend report");
+    assert.equal((cleanTicket.metadata as Record<string, unknown>).sourceTicketId, "ANA-06");
+    assert.equal(services.db.getTicket(`${epic.id}__ANA-06`), null);
+  } finally {
+    services.restore();
+  }
+});
+
 test("goal runner manual review runs checks and invokes epic reviewer for approved tickets", async () => {
   const repoRoot = await makeTempDir("repo-");
   const dataDir = await makeTempDir("data-");

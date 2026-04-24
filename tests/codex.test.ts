@@ -1,4 +1,4 @@
-import test from "node:test";
+﻿import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
@@ -57,9 +57,9 @@ test("CodexRunner launches non-interactively and sends the prompt over stdin", a
   assert.deepEqual(result.tickets, []);
   assert.equal(launches.length, 1);
   assert.equal(launches[0].command, "codex");
-  assert.deepEqual(launches[0].args.slice(0, 5), ["exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-C", cwd]);
+  assert.deepEqual(launches[0].args.slice(0, 5), ["exec", "--yolo", "--skip-git-repo-check", "-C", cwd]);
   assert.equal(launches[0].args.at(-1), "-");
-  assert.equal(launches[0].options.shell, true);
+  assert.equal(launches[0].options.shell, process.platform === 'win32' ? 'cmd.exe' : true);
   assert.equal(launches[0].stdinText, "Inspect the repo and return ticket JSON.");
 });
 

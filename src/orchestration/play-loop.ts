@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { AppDatabase } from "../db/database.ts";
 import { randomId, nowIso } from "../utils.ts";
-import { epicDecoderPrompt, epicDecoderToolingPrompt, epicReviewerPrompt, epicReviewerToolingPrompt, epicReviewerCodexPrompt, epicReviewerBuildFixPrompt, ticketRedecomposerPrompt, playWriterPrompt, playTesterPrompt } from "./prompts.ts";
+import { epicDecoderPrompt, epicDecoderToolingPrompt, epicReviewerPrompt, epicReviewerToolingPrompt, epicReviewerCodexPrompt, epicReviewerBuildFixPrompt, playWriterPrompt, playTesterPrompt } from "./prompts.ts";
 import type { ModelGateway } from "./models.ts";
 import type { AgentStreamPayload, EpicRecord, GoalDecomposition, GoalReview, GoalTicketPlan, TicketRecord } from "../types.ts";
 import { TicketRunner } from "./ticket-runner.ts";

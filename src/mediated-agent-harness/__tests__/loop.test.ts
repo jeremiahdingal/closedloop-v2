@@ -264,6 +264,138 @@ test("loop executes tools and feeds results back in multi-step flow", async () =
   }
 });
 
+test("loop requires builder role to finish through the tool interface", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
+
+  let requestCount = 0;
+  const server = await new Promise<{ server: Server; port: number }>((resolve) => {
+    const srv = createServer((req, res) => {
+      if (req.method === "POST" && req.url?.endsWith("/chat/completions")) {
+        req.on("data", () => {});
+        req.on("end", () => {
+          requestCount++;
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+
+          if (requestCount === 1) {
+            res.write(makeTextChunk('{"summary":"done","filesChanged":["src/app.ts"]}') + "\n");
+          } else {
+            res.write(makeToolCallChunk({
+              id: "call_finish",
+              name: "finish",
+              args: { summary: "done", result: '{"summary":"done","filesChanged":["src/app.ts"]}' },
+            }) + "\n");
+          }
+
+          res.write("data: [DONE]\n");
+          res.end();
+        });
+      } else {
+        res.writeHead(404);
+        res.end("not found");
+      }
+    });
+    srv.listen(0, () => {
+      resolve({ server: srv, port: (srv.address() as any).port });
+    });
+  });
+
+  try {
+    const result = await runMediatedLoop({
+      systemPrompt: "You are a builder.",
+      userPrompt: "Make a change.",
+      config: {
+        baseURL: `http://localhost:${server.port}/v1`,
+        apiKey: "test",
+        model: "test-model",
+        cwd: tmpDir,
+        role: "builder",
+        temperature: 0,
+        maxIterations: 3,
+      },
+      toolContext: createMockContext(tmpDir),
+    });
+
+    assert.equal(requestCount, 2);
+    assert.equal(result.iterations, 2);
+    assert.equal(result.toolCalls.length, 1);
+    assert.equal(result.toolCalls[0].name, "finish");
+  } finally {
+    server.server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("loop supports direct-chat style builder history with tool completion", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
+  await writeFile(path.join(tmpDir, "package.json"), '{"name":"direct-chat-check"}', "utf-8");
+
+  let requestCount = 0;
+  const server = await new Promise<{ server: Server; port: number }>((resolve) => {
+    const srv = createServer((req, res) => {
+      if (req.method === "POST" && req.url?.endsWith("/chat/completions")) {
+        req.on("data", () => {});
+        req.on("end", () => {
+          requestCount++;
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+
+          if (requestCount === 1) {
+            res.write(makeToolCallChunk({
+              id: "call_1",
+              name: "read_file",
+              args: { path: "package.json" },
+            }) + "\n");
+          } else {
+            res.write(makeToolCallChunk({
+              id: "call_2",
+              name: "finish",
+              args: { summary: "read package", result: '{"ok":true,"mode":"direct-chat"}' },
+            }) + "\n");
+          }
+
+          res.write("data: [DONE]\n");
+          res.end();
+        });
+      } else {
+        res.writeHead(404);
+        res.end("not found");
+      }
+    });
+    srv.listen(0, () => {
+      resolve({ server: srv, port: (srv.address() as any).port });
+    });
+  });
+
+  try {
+    const result = await runMediatedLoop({
+      systemPrompt: "You are the Local Builder.",
+      userPrompt: "",
+      messages: [
+        { role: "system", content: "You are the Local Builder. Help the user with their coding task in the current repository. Use the tools available to inspect and modify code." },
+        { role: "user", content: "Please inspect package.json and tell me what you found." },
+      ],
+      config: {
+        baseURL: `http://localhost:${server.port}/v1`,
+        apiKey: "test",
+        model: "test-model",
+        cwd: tmpDir,
+        role: "builder",
+        temperature: 0,
+        maxIterations: 3,
+      },
+      toolContext: createMockContext(tmpDir),
+    });
+
+    assert.equal(requestCount, 2);
+    assert.equal(result.toolCalls.length, 2);
+    assert.equal(result.toolCalls[0].name, "read_file");
+    assert.equal(result.toolCalls[1].name, "finish");
+    assert.match(result.text, /"mode":"direct-chat"/);
+  } finally {
+    server.server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("loop executes strict JSON tool-call text fallback", async () => {
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
   await writeFile(path.join(tmpDir, "hello.txt"), "Hello from json fallback", "utf-8");

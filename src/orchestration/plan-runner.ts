@@ -29,6 +29,10 @@ export interface PlanRunResult {
   rawText: string;
 }
 
+export function planNeedsClarification(plan: GoalDecomposition | null | undefined): boolean {
+  return Boolean(plan?.clarificationQuestions?.some((question) => question.trim().length > 0));
+}
+
 /**
  * Run the epic decoder in plan mode and return the resulting GoalDecomposition.
  * Uses the mediated/qwen/codex/opencode path depending on the configured epicDecoder model.
@@ -82,10 +86,15 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
   // Mirror the same routing logic as GoalRunner.runEpicDecoder
   // to avoid sending qwen-cli/codex-cli as model IDs to OpenCode.
 
-  // qwen-cli / codex-cli — runs via QwenRunner / CodexRunner
+  // qwen-cli / codex-cli / gemini-cli — runs via QwenRunner / CodexRunner / GeminiRunner
   if (
     gateway.runEpicDecoderInWorkspace &&
-    (configuredModel === "codex-cli" || configuredModel === "qwen-cli")
+    (
+      configuredModel === "codex-cli" ||
+      configuredModel === "qwen-cli" ||
+      configuredModel === "gemini-cli" ||
+      configuredModel.startsWith("zai:")
+    )
   ) {
     try {
       const result = await gateway.runEpicDecoderInWorkspace({
@@ -146,10 +155,13 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
  */
 export function extractPlanFromStream(chunks: string[]): GoalDecomposition | null {
   const combined = chunks.join("");
-  const match = combined.match(/<FINAL_JSON>([\s\S]*?)<\/FINAL_JSON>/);
-  if (!match) return null;
+  const tagged = combined.match(/<FINAL_JSON>([\s\S]*?)<\/FINAL_JSON>/i);
+  const fenced = combined.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const rawJson = (tagged?.[1] ?? fenced?.[1])?.trim();
+  
+  if (!rawJson) return null;
   try {
-    return validateGoalDecomposition(JSON.parse(match[1].trim()));
+    return validateGoalDecomposition(JSON.parse(rawJson));
   } catch {
     return null;
   }

@@ -50,3 +50,34 @@ export function truncate(value: string, max = 16_000): string {
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+export interface FuzzyMatchResult {
+  index: number;
+  matchedLength: number;
+}
+
+const normalizeWs = (s: string): string =>
+  s.replace(/\r\n/g, "\n").replace(/\t/g, "  ").replace(/[ \t]+$/gm, "");
+
+export function fuzzyMatch(content: string, search: string): FuzzyMatchResult | null {
+  const normContent = normalizeWs(content);
+  const normSearch = normalizeWs(search);
+  const normIndex = normContent.indexOf(normSearch);
+  if (normIndex === -1) return null;
+
+  for (let scanStart = Math.max(0, normIndex - 50); scanStart < Math.min(content.length, normIndex + 200); scanStart++) {
+    const candidate = content.slice(scanStart, scanStart + search.length + 100);
+    const normCandidate = normalizeWs(candidate);
+    if (normCandidate.startsWith(normSearch)) {
+      let endOffset = 0;
+      let normOffset = 0;
+      while (normOffset < normSearch.length && scanStart + endOffset < content.length) {
+        const ch = content[scanStart + endOffset];
+        endOffset++;
+        normOffset += normalizeWs(ch).length;
+      }
+      return { index: scanStart, matchedLength: endOffset };
+    }
+  }
+  return null;
+}

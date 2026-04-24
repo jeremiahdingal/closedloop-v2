@@ -1,9 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { AgentEvent, Run, Ticket, TicketDiffResponse } from "../types.ts";
 import {
   diffLineClass,
   fetchJson,
   normalizeCompareUrl,
+  normalizeDisplayedTicketId,
   parseUnifiedDiff,
   truncateId,
 } from "../utils.ts";
@@ -18,6 +21,7 @@ export function TicketModal(props: {
   onCancel: () => void;
   onRerun: () => void;
   onForceRerunInPlace: () => void;
+  onRerunDirect: () => void;
   onForceRescue: () => void;
   onDelete: () => void;
   actionBusy: boolean;
@@ -25,8 +29,11 @@ export function TicketModal(props: {
   if (!props.open) return null;
   const ticketRun =
     props.runs.find((run) => run.id === props.ticket.currentRunId) ?? null;
+  const hasCurrentRunId = Boolean(props.ticket.currentRunId);
   const ticketEvents = props.events.filter(
-    (e) => e.ticket_id === props.ticket.id || e.run_id === props.ticket.currentRunId
+    (e) =>
+      e.ticket_id === props.ticket.id ||
+      (hasCurrentRunId && e.run_id === props.ticket.currentRunId)
   );
   const feedEndRef = useRef<HTMLDivElement>(null);
   const [ticketDiff, setTicketDiff] = useState<TicketDiffResponse | null>(null);
@@ -103,7 +110,7 @@ export function TicketModal(props: {
           {/* Left column — ticket details */}
           <div className="ticket-modal-left">
             <div className="ticket-detail-header">
-              <span className="ticket-detail-id">{props.ticket.id}</span>
+              <span className="ticket-detail-id">{normalizeDisplayedTicketId(props.ticket.id)}</span>
               {props.ticket.priority && (
                 <span className={`priority-${props.ticket.priority}`}>{props.ticket.priority}</span>
               )}
@@ -112,7 +119,9 @@ export function TicketModal(props: {
             {props.ticket.description ? (
               <div className="ticket-detail-message">
                 <span className="detail-label">Description</span>
-                <p className="detail-message">{props.ticket.description}</p>
+                <div className="plan-md-content">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{props.ticket.description}</ReactMarkdown>
+                </div>
               </div>
             ) : null}
 
@@ -245,7 +254,9 @@ export function TicketModal(props: {
             {props.ticket.lastMessage && (
               <div className="ticket-detail-message">
                 <span className="detail-label">Last Message</span>
-                <p className="detail-message">{props.ticket.lastMessage}</p>
+                <div className="plan-md-content">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{props.ticket.lastMessage}</ReactMarkdown>
+                </div>
               </div>
             )}
           </div>
@@ -279,6 +290,13 @@ export function TicketModal(props: {
             disabled={props.actionBusy}
           >
             🔄 Force In-Place
+          </button>
+          <button
+            className="btn btn-modal-direct"
+            onClick={props.onRerunDirect}
+            disabled={props.actionBusy}
+          >
+            Skip to Coder
           </button>
           <button
             className="btn btn-modal-rescue"

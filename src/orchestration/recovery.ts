@@ -220,7 +220,6 @@ export class RecoveryService {
     staleAfterMs = this.config.staleRunAfterMs,
     maxRecoveries = this.config.staleRunMaxRecoveries
   ): Promise<string[]> {
-    const threshold = Date.now() - staleAfterMs;
     const staleRunIds: string[] = [];
     for (const run of this.db.listRuns("running")) {
       if (run.epicId && (run.currentNode === "goal_review" || run.currentNode === "manual_goal_review")) {
@@ -231,6 +230,12 @@ export class RecoveryService {
         const allDone = tickets.every(t => t.status === "approved" || t.status === "failed" || t.status === "escalated");
         if (allDone) continue;
       }
+
+      // Determine timeout based on node
+      const node = (run.currentNode ?? "").toLowerCase();
+      const effectiveStaleAfterMs = node === "coder" ? this.config.staleCoderRunAfterMs : staleAfterMs;
+      const threshold = Date.now() - effectiveStaleAfterMs;
+
       const heartbeat = run.heartbeatAt ? new Date(run.heartbeatAt).getTime() : 0;
       if (heartbeat < threshold) {
         staleRunIds.push(run.id);
@@ -351,6 +356,22 @@ export class RecoveryService {
     if (job.kind === "run_ticket") {
       const run = this.db.getRun(String(job.payload.runId));
       if (!run || run.status !== "queued") return;
+
+      // Gate: check that all dependency tickets are approved before starting
+      const ticket = run.ticketId ? this.db.getTicket(run.ticketId) : null;
+      if (ticket && ticket.dependencies?.length) {
+        const unmet = ticket.dependencies.filter(depId => {
+          const dep = this.db.getTicket(depId);
+          return !dep || dep.status !== "approved";
+        });
+        if (unmet.length) {
+          // Re-queue instead of running — dependencies not yet met
+          this.db.failJob(job.id, `Waiting for dependencies: ${unmet.join(", ")}`, false);
+          this.db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id });
+          return;
+        }
+      }
+
       await this.ticketRunner.runExisting(run.id);
       return;
     }

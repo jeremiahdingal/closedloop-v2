@@ -72,6 +72,11 @@ test("ticket runner completes a successful build-review-test loop", async () => 
   }
 });
 
+test("config defaults reviewer to direct qwen3:14b", () => {
+  const models = readModelsFile();
+  assert.equal(models.reviewer, "qwen3:14b");
+});
+
 test("ticket runner approves via guard-only path when reviewer mode is off", async () => {
   const repoRoot = await makeTempDir("repo-");
   const dataDir = await makeTempDir("data-");
@@ -578,6 +583,266 @@ test("ticket runner surfaces clearer reviewer infrastructure errors", async () =
   }
 });
 
+test("ticket runner rejects schema-valid nonsense reviewer blockers", async () => {
+  const repoRoot = await makeTempDir("repo-");
+  const dataDir = await makeTempDir("data-");
+  await initGitRepo(repoRoot);
+
+  const services = await bootstrapForTest({
+    REPO_ROOT: repoRoot,
+    DATA_DIR: dataDir,
+    TEST_COMMAND: 'node --eval "process.exit(0)"',
+    LINT_COMMAND: 'node --eval "process.exit(0)"',
+    TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
+  }, { dryRun: true });
+
+  try {
+    const epic = GoalRunner.createEpic(services.db, {
+      id: "epic_reviewer_nonsense_blockers",
+      title: "Reviewer nonsense blockers epic",
+      goalText: "Reject bogus blocker lists.",
+      targetDir: repoRoot
+    });
+    services.db.createTicket({
+      id: "ticket_reviewer_nonsense_blockers",
+      epicId: epic.id,
+      title: "Update README",
+      description: "Append a controlled change.",
+      acceptanceCriteria: ["README updated"],
+      dependencies: [],
+      allowedPaths: ["README.md"],
+      priority: "high",
+      status: "queued",
+      metadata: { maxBuildAttempts: 2 }
+    });
+
+    class NonsenseReviewerGateway extends MockGateway {
+      override async getReviewerVerdict(_prompt: string): Promise<ReviewerVerdict> {
+        return {
+          approved: false,
+          blockers: ["Barny", "Barky", "Barmy", "Barn"],
+          suggestions: ["Barny", "Barn"],
+          riskLevel: "high"
+        };
+      }
+    }
+
+    const gateway = new NonsenseReviewerGateway({
+      builderPlans: [
+        {
+          summary: "Append line to README",
+          intendedFiles: ["README.md"],
+          operations: [{ kind: "append_file", path: "README.md", content: "\nNonsense reviewer\n" }]
+        }
+      ]
+    });
+
+    const runner = new TicketRunner(services.db, services.bridge, gateway, services.lifecycle);
+    const runId = await runner.start("ticket_reviewer_nonsense_blockers", epic.id);
+    await assert.rejects(() => runner.runExisting(runId), /Reviewer returned invalid\/unreliable output/);
+  } finally {
+    services.restore();
+  }
+});
+
+test("ticket runner rejects typo-fix reviewer suggestion spam", async () => {
+  const repoRoot = await makeTempDir("repo-");
+  const dataDir = await makeTempDir("data-");
+  await initGitRepo(repoRoot);
+
+  const services = await bootstrapForTest({
+    REPO_ROOT: repoRoot,
+    DATA_DIR: dataDir,
+    TEST_COMMAND: 'node --eval "process.exit(0)"',
+    LINT_COMMAND: 'node --eval "process.exit(0)"',
+    TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
+  }, { dryRun: true });
+
+  try {
+    const epic = GoalRunner.createEpic(services.db, {
+      id: "epic_reviewer_typo_spam",
+      title: "Reviewer typo spam epic",
+      goalText: "Reject typo-fix spam.",
+      targetDir: repoRoot
+    });
+    services.db.createTicket({
+      id: "ticket_reviewer_typo_spam",
+      epicId: epic.id,
+      title: "Update README",
+      description: "Append a controlled change.",
+      acceptanceCriteria: ["README updated"],
+      dependencies: [],
+      allowedPaths: ["README.md"],
+      priority: "high",
+      status: "queued",
+      metadata: { maxBuildAttempts: 2 }
+    });
+
+    class TypoSpamReviewerGateway extends MockGateway {
+      override async getReviewerVerdict(_prompt: string): Promise<ReviewerVerdict> {
+        return {
+          approved: true,
+          blockers: [],
+          suggestions: [
+            'The word "suggestion" contains a typo. It should be "Suggestion".',
+            'The word "approve" contains a typo. It should be "approved".'
+          ],
+          riskLevel: "low"
+        };
+      }
+    }
+
+    const gateway = new TypoSpamReviewerGateway({
+      builderPlans: [
+        {
+          summary: "Append line to README",
+          intendedFiles: ["README.md"],
+          operations: [{ kind: "append_file", path: "README.md", content: "\nTypo spam reviewer\n" }]
+        }
+      ]
+    });
+
+    const runner = new TicketRunner(services.db, services.bridge, gateway, services.lifecycle);
+    const runId = await runner.start("ticket_reviewer_typo_spam", epic.id);
+    await assert.rejects(() => runner.runExisting(runId), /Reviewer returned invalid\/unreliable output/);
+  } finally {
+    services.restore();
+  }
+});
+
+test("ticket runner rejects reviewer blockers unrelated to changed files or acceptance criteria", async () => {
+  const repoRoot = await makeTempDir("repo-");
+  const dataDir = await makeTempDir("data-");
+  await initGitRepo(repoRoot);
+
+  const services = await bootstrapForTest({
+    REPO_ROOT: repoRoot,
+    DATA_DIR: dataDir,
+    TEST_COMMAND: 'node --eval "process.exit(0)"',
+    LINT_COMMAND: 'node --eval "process.exit(0)"',
+    TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
+  }, { dryRun: true });
+
+  try {
+    const epic = GoalRunner.createEpic(services.db, {
+      id: "epic_reviewer_ungrounded_blockers",
+      title: "Reviewer ungrounded blockers epic",
+      goalText: "Reject unrelated taxonomy blockers.",
+      targetDir: repoRoot
+    });
+    services.db.createTicket({
+      id: "ticket_reviewer_ungrounded_blockers",
+      epicId: epic.id,
+      title: "Update README",
+      description: "Append a controlled change.",
+      acceptanceCriteria: ["README updated"],
+      dependencies: [],
+      allowedPaths: ["README.md"],
+      priority: "high",
+      status: "queued",
+      metadata: { maxBuildAttempts: 2 }
+    });
+
+    class UngroundedReviewerGateway extends MockGateway {
+      override async getReviewerVerdict(_prompt: string): Promise<ReviewerVerdict> {
+        return {
+          approved: false,
+          blockers: ["Ecological factors", "Human activity", "Historical factors"],
+          suggestions: ["Review plant distribution factors"],
+          riskLevel: "high"
+        };
+      }
+    }
+
+    const gateway = new UngroundedReviewerGateway({
+      builderPlans: [
+        {
+          summary: "Append line to README",
+          intendedFiles: ["README.md"],
+          operations: [{ kind: "append_file", path: "README.md", content: "\nUngrounded reviewer\n" }]
+        }
+      ]
+    });
+
+    const runner = new TicketRunner(services.db, services.bridge, gateway, services.lifecycle);
+    const runId = await runner.start("ticket_reviewer_ungrounded_blockers", epic.id);
+    await assert.rejects(() => runner.runExisting(runId), /Reviewer returned invalid\/unreliable output/);
+  } finally {
+    services.restore();
+  }
+});
+
+test("ticket runner compacts large reviewer prompts", async () => {
+  const repoRoot = await makeTempDir("repo-");
+  const dataDir = await makeTempDir("data-");
+  await initGitRepo(repoRoot);
+
+  const services = await bootstrapForTest({
+    REPO_ROOT: repoRoot,
+    DATA_DIR: dataDir,
+    TEST_COMMAND: 'node --eval "process.exit(0)"',
+    LINT_COMMAND: 'node --eval "process.exit(0)"',
+    TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
+  }, { dryRun: true });
+
+  try {
+    const epic = GoalRunner.createEpic(services.db, {
+      id: "epic_reviewer_prompt_compaction",
+      title: "Reviewer prompt compaction epic",
+      goalText: "Compact large diff prompts.",
+      targetDir: repoRoot
+    });
+    services.db.createTicket({
+      id: "ticket_reviewer_prompt_compaction",
+      epicId: epic.id,
+      title: "Update README",
+      description: "Append a very large controlled change.",
+      acceptanceCriteria: ["README updated"],
+      dependencies: [],
+      allowedPaths: ["README.md"],
+      priority: "high",
+      status: "queued",
+      metadata: { maxBuildAttempts: 2 }
+    });
+
+    let capturedPrompt = "";
+    class CaptureReviewerPromptGateway extends MockGateway {
+      override async getReviewerVerdict(prompt: string): Promise<ReviewerVerdict> {
+        capturedPrompt = prompt;
+        return {
+          approved: true,
+          blockers: [],
+          suggestions: [],
+          riskLevel: "low"
+        };
+      }
+    }
+
+    const hugeContent = Array.from({ length: 1500 }, (_, index) => `line-${index}-reviewer-prompt-compaction`).join("\n");
+    const gateway = new CaptureReviewerPromptGateway({
+      builderPlans: [
+        {
+          summary: "Append many lines to README",
+          intendedFiles: ["README.md"],
+          operations: [{ kind: "append_file", path: "README.md", content: `\n${hugeContent}\n` }]
+        }
+      ]
+    });
+
+    const runner = new TicketRunner(services.db, services.bridge, gateway, services.lifecycle);
+    const runId = await runner.start("ticket_reviewer_prompt_compaction", epic.id);
+    const result = await runner.runExisting(runId);
+
+    assert.equal(result.status, "approved");
+    assert.match(capturedPrompt, /Changed files:/);
+    assert.match(capturedPrompt, /Diff excerpt:/);
+    assert.match(capturedPrompt, /\[diff truncated for review\]/);
+    assert.ok(capturedPrompt.length < hugeContent.length);
+  } finally {
+    services.restore();
+  }
+});
+
 test("ticket runner times out stalled reviewer calls and fails clearly", async () => {
   const repoRoot = await makeTempDir("repo-");
   const dataDir = await makeTempDir("data-");
@@ -820,6 +1085,67 @@ test("ticket runner uses mediated reviewer path when reviewer model is mediated"
     assert.equal(result.status, "approved");
   } finally {
     writeModelsFile(originalModels);
+    services.restore();
+  }
+});
+
+test("ticket runner no longer blocks changes outside ticket allowed paths", async () => {
+  const repoRoot = await makeTempDir("repo-");
+  const dataDir = await makeTempDir("data-");
+  await initGitRepo(repoRoot);
+
+  const services = await bootstrapForTest({
+    REPO_ROOT: repoRoot,
+    DATA_DIR: dataDir,
+    TEST_COMMAND: 'node --eval "process.exit(0)"',
+    LINT_COMMAND: 'node --eval "process.exit(0)"',
+    TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
+  }, { dryRun: true });
+
+  try {
+    const epic = GoalRunner.createEpic(services.db, {
+      id: "epic_outside_allowed_paths",
+      title: "Outside allowed paths epic",
+      goalText: "Allow builders to change files outside the original scope.",
+      targetDir: repoRoot
+    });
+    services.db.createTicket({
+      id: "ticket_outside_allowed_paths",
+      epicId: epic.id,
+      title: "Create a new source file",
+      description: "Write a file outside the ticket's old allowed paths.",
+      acceptanceCriteria: ["src/generated.ts created"],
+      dependencies: [],
+      allowedPaths: ["README.md"],
+      priority: "high",
+      status: "queued",
+      metadata: { maxBuildAttempts: 2 }
+    });
+
+    const gateway = new MockGateway({
+      builderPlans: [
+        {
+          summary: "Create a generated source file",
+          intendedFiles: ["src/generated.ts"],
+          operations: [{ kind: "replace_file", path: "src/generated.ts", content: "export const generated = true;\n" }]
+        }
+      ],
+      reviewerVerdicts: [
+        {
+          approved: true,
+          blockers: [],
+          suggestions: [],
+          riskLevel: "low"
+        }
+      ]
+    });
+
+    const runner = new TicketRunner(services.db, services.bridge, gateway, services.lifecycle);
+    const runId = await runner.start("ticket_outside_allowed_paths", epic.id);
+    const result = await runner.runExisting(runId);
+
+    assert.equal(result.status, "approved");
+  } finally {
     services.restore();
   }
 });

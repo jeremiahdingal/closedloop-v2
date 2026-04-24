@@ -17,23 +17,29 @@ export function PlanningModal(props: {
   initialBranch?: string;
   open: boolean;
   onClose: () => void;
+  onMinimize: () => void;
   onApproved: (epicId: string) => void;
+  onReady?: () => void;
+  onStateChange?: (state: { hasPlan: boolean; awaitingClarification: boolean }) => void;
 }) {
   const [streamItems, setStreamItems] = useState<
     Array<{ id: number; agentRole: string; streamKind: string; content: string; source: string }>
   >([]);
   const [sessionStatus, setSessionStatus] = useState<"running" | "idle" | "error">("running");
   const [latestPlan, setLatestPlan] = useState<GoalDecomposition | null>(null);
+  const [awaitingClarification, setAwaitingClarification] = useState(false);
   const [messageInput, setMessageInput] = useState("");
   const [planBranch, setPlanBranch] = useState(props.initialBranch ?? "");
   const [sending, setSending] = useState(false);
   const [approving, setApproving] = useState(false);
   const [showRawOutput, setShowRawOutput] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
   const terminalRef = useRef<HTMLPreElement>(null);
   const mainAreaRef = useRef<HTMLDivElement>(null);
   const streamEndRef = useRef<HTMLDivElement>(null);
   const afterIndexRef = useRef(0);
   const esRef = useRef<EventSource | null>(null);
+  const hasAutoFocusedPlanRef = useRef(false);
 
   const reasoningText = useMemo(() => {
     return streamItems
@@ -49,15 +55,39 @@ export function PlanningModal(props: {
       .join("");
   }, [streamItems]);
 
+  const clarificationQuestions = useMemo(
+    () => (latestPlan?.clarificationQuestions ?? []).filter((question) => question.trim().length > 0),
+    [latestPlan]
+  );
+  const hasClarificationQuestions = clarificationQuestions.length > 0;
+
+  // Smarter auto-scroll for Phase 1
   useEffect(() => {
-    if (!latestPlan && terminalRef.current) {
+    if (!latestPlan && autoScroll && terminalRef.current) {
       terminalRef.current.scrollTop = terminalRef.current.scrollHeight;
     }
-  }, [reasoningText, latestPlan]);
+  }, [reasoningText, latestPlan, autoScroll]);
+
+  // Detect manual scroll up to disable auto-scroll
+  function handleTerminalScroll() {
+    const el = terminalRef.current;
+    if (!el) return;
+    const isAtBottom = el.scrollHeight - el.scrollTop <= el.clientHeight + 50;
+    if (!isAtBottom && autoScroll) {
+      setAutoScroll(false);
+    } else if (isAtBottom && !autoScroll) {
+      setAutoScroll(true);
+    }
+  }
 
   useEffect(() => {
-    if (latestPlan && mainAreaRef.current) {
+    if (!latestPlan) {
+      hasAutoFocusedPlanRef.current = false;
+      return;
+    }
+    if (!hasAutoFocusedPlanRef.current && mainAreaRef.current) {
       mainAreaRef.current.scrollTop = 0;
+      hasAutoFocusedPlanRef.current = true;
     }
   }, [latestPlan]);
 
@@ -87,8 +117,11 @@ export function PlanningModal(props: {
       afterIndexRef.current = data.id + 1;
       if (data.streamKind === "plan_cleared") {
         setLatestPlan(null);
+        setAwaitingClarification(false);
+        props.onStateChange?.({ hasPlan: false, awaitingClarification: false });
         setStreamItems([]);
         setShowRawOutput(false);
+        hasAutoFocusedPlanRef.current = false;
         return;
       }
       setStreamItems((prev) => [...prev, data]);
@@ -96,15 +129,27 @@ export function PlanningModal(props: {
     es.addEventListener("session_status", (e) => {
       const data = JSON.parse(e.data);
       setSessionStatus(data.status);
+      setAwaitingClarification(Boolean(data.awaitingClarification));
+      props.onStateChange?.({
+        hasPlan: Boolean(data.hasPlan),
+        awaitingClarification: Boolean(data.awaitingClarification)
+      });
     });
     es.addEventListener("plan_ready", (e) => {
-      setLatestPlan(JSON.parse(e.data));
+      const plan = JSON.parse(e.data) as GoalDecomposition;
+      setLatestPlan(plan);
+      setAwaitingClarification(Boolean(plan.clarificationQuestions?.length));
+      props.onStateChange?.({
+        hasPlan: true,
+        awaitingClarification: Boolean(plan.clarificationQuestions?.length)
+      });
+      props.onReady?.();
     });
     return () => {
       es.close();
       esRef.current = null;
     };
-  }, [props.open, props.sessionId]);
+  }, [props.open, props.sessionId, props]);
 
   async function sendMessage() {
     if (!messageInput.trim()) return;
@@ -145,7 +190,7 @@ export function PlanningModal(props: {
   }
 
   if (!props.open) return null;
-  const canApprove = latestPlan !== null && sessionStatus !== "running";
+  const canApprove = latestPlan !== null && sessionStatus !== "running" && !hasClarificationQuestions && latestPlan.tickets.length > 0;
 
   return (
     <div className="modal-backdrop" onClick={props.onClose}>
@@ -161,15 +206,20 @@ export function PlanningModal(props: {
                   ? "⏳ planning..."
                   : sessionStatus === "idle"
                   ? latestPlan
-                    ? "✅ plan ready"
+                    ? hasClarificationQuestions
+                      ? "💬 clarification needed"
+                      : "✅ plan ready"
                     : "💬 awaiting input"
                   : "⚠️ error"}
               </span>
             </div>
           </div>
           <div className="win-titlebar-buttons">
-            <button className="win-btn-box" onClick={props.onClose}>
-              ×
+            <button className="win-btn-box" onClick={props.onMinimize} title="Minimize">
+              &minus;
+            </button>
+            <button className="win-btn-box" onClick={props.onClose} title="Cancel session">
+              &times;
             </button>
           </div>
         </div>
@@ -195,19 +245,30 @@ export function PlanningModal(props: {
             )}
             {latestPlan && (
               <div className="plan-nav-group">
-                <div className="plan-nav-group-label">Plan · {latestPlan.tickets.length} tickets</div>
+                <div className="plan-nav-group-label">
+                  {hasClarificationQuestions ? `Questions · ${clarificationQuestions.length}` : `Plan · ${latestPlan.tickets.length} tickets`}
+                </div>
                 <div className="plan-nav-summary">{latestPlan.summary}</div>
-                {latestPlan.tickets.map((t, i) => (
-                  <div className="plan-nav-ticket" key={t.id}>
-                    <span className="plan-nav-ticket-num">{i + 1}</span>
-                    <div className="plan-nav-ticket-body">
-                      <div className="plan-nav-ticket-title">{t.title}</div>
-                      <span className={`priority-${t.priority} plan-nav-ticket-priority`}>
-                        {t.priority}
-                      </span>
-                    </div>
-                  </div>
-                ))}
+                {hasClarificationQuestions
+                  ? clarificationQuestions.map((question, index) => (
+                      <div className="plan-nav-ticket" key={`question-${index}`}>
+                        <span className="plan-nav-ticket-num">?</span>
+                        <div className="plan-nav-ticket-body">
+                          <div className="plan-nav-ticket-title">{question}</div>
+                        </div>
+                      </div>
+                    ))
+                  : latestPlan.tickets.map((t, i) => (
+                      <div className="plan-nav-ticket" key={t.id}>
+                        <span className="plan-nav-ticket-num">{i + 1}</span>
+                        <div className="plan-nav-ticket-body">
+                          <div className="plan-nav-ticket-title">{t.title}</div>
+                          <span className={`priority-${t.priority} plan-nav-ticket-priority`}>
+                            {t.priority}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
               </div>
             )}
             {headings.length === 0 && !latestPlan && (
@@ -224,10 +285,17 @@ export function PlanningModal(props: {
                   <span className="plan-terminal-title">◉ Planner output</span>
                   <span className="plan-terminal-chars">{reasoningText.length} chars</span>
                 </div>
-                <pre className="plan-terminal-output" ref={terminalRef}>
+                <pre 
+                  className="plan-terminal-output" 
+                  ref={terminalRef}
+                  onScroll={handleTerminalScroll}
+                >
                   {reasoningText || "Planner is exploring the repository…"}
                   {sessionStatus === "running" && <span className="plan-terminal-cursor"> ▌</span>}
                 </pre>
+                <div className={`plan-autoscroll-status ${autoScroll ? 'on' : 'off'}`}>
+                  {autoScroll ? "● Auto-scroll ON" : "○ Auto-scroll OFF (Scroll to bottom to resume)"}
+                </div>
               </div>
             ) : (
               /* Phase 2: structured plan + optional raw toggle */
@@ -245,35 +313,47 @@ export function PlanningModal(props: {
                   </div>
                 ) : (
                   <div className="modal-stream-list">
-                    {streamItems.length ? (
-                      streamItems.map((item) => (
-                        <div
-                          className={`modal-stream-item plan-stream-item plan-stream-${
-                            item.streamKind || "raw"
-                          }`}
-                          key={item.id}
-                        >
-                          <div className="modal-stream-meta">
-                            <span className={`pill pill-${item.streamKind || "raw"}`}>
-                              {item.streamKind || "raw"}
-                            </span>
-                            <span className="modal-stream-time">{item.source}</span>
+                    <div className="epic-main-section">
+                      <div className="epic-main-section-label">{hasClarificationQuestions ? "Planner Summary" : "Plan Summary"}</div>
+                      <div className="plan-md-content">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                          {latestPlan.summary}
+                        </ReactMarkdown>
+                      </div>
+                    </div>
+                    {hasClarificationQuestions ? (
+                      <div className="epic-main-section">
+                        <div className="epic-main-section-label">Questions From Planner</div>
+                        <div className="plan-md-content">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                            {clarificationQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n")}
+                          </ReactMarkdown>
+                        </div>
+                      </div>
+                    ) : (
+                      latestPlan.tickets.map((ticket, index) => (
+                        <div className="epic-main-section" key={ticket.id}>
+                          <div className="epic-main-section-label">
+                            Ticket {index + 1} · {ticket.title}
                           </div>
-                          {item.streamKind === "assistant" || item.streamKind === "thinking" ? (
-                            <div className="plan-md-content">
-                              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                                {item.content
-                                  .replace(/<FINAL_JSON>[\s\S]*?<\/FINAL_JSON>/g, "")
-                                  .trim()}
-                              </ReactMarkdown>
-                            </div>
-                          ) : (
-                            <pre className="plan-plain-text">{item.content}</pre>
-                          )}
+                          <div className="plan-md-content">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                              {[
+                                `**ID:** ${ticket.id}`,
+                                `**Priority:** ${ticket.priority}`,
+                                "",
+                                ticket.description,
+                                "",
+                                "**Acceptance Criteria**",
+                                ...ticket.acceptanceCriteria.map((criterion) => `- ${criterion}`),
+                                "",
+                                `**Allowed Paths:** ${ticket.allowedPaths.join(", ") || "(none)"}`,
+                                `**Dependencies:** ${ticket.dependencies.join(", ") || "(none)"}`
+                              ].join("\n")}
+                            </ReactMarkdown>
+                          </div>
                         </div>
                       ))
-                    ) : (
-                      <p className="modal-empty">No analysis items.</p>
                     )}
                     <div ref={streamEndRef} />
                   </div>
@@ -295,7 +375,7 @@ export function PlanningModal(props: {
                 void sendMessage();
               }
             }}
-            placeholder="Add context or answer questions from the planner..."
+            placeholder={awaitingClarification ? "Answer the planner's questions here..." : "Add context or answer questions from the planner..."}
             disabled={sending}
           />
           <button
@@ -321,7 +401,7 @@ export function PlanningModal(props: {
             onClick={() => void approvePlan()}
             disabled={!canApprove || approving}
           >
-            {approving ? "⏳ Creating epic..." : "✅ Approve Plan"}
+            {approving ? "⏳ Creating epic..." : hasClarificationQuestions ? "💬 Answer questions to continue" : "✅ Approve Plan"}
           </button>
           <button className="btn" onClick={props.onClose}>
             Cancel

@@ -94,10 +94,31 @@ export type Dashboard = {
   agentEvents: AgentEvent[];
 };
 
+export type DirectChatSessionRecord = {
+  id: string;
+  title: string;
+  targetDir: string;
+  branchName: string;
+  model: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type DirectChatMessageRecord = {
+  id: number;
+  sessionId: string;
+  role: "user" | "assistant" | "system" | "tool";
+  content: string;
+  toolCallsJson: string | null;
+  toolResultsJson: string | null;
+  createdAt: string;
+};
+
 export type AgentStreamStatus = "idle" | "running" | "stalled" | "completed";
 
 export type GoalDecomposition = {
   summary: string;
+  clarificationQuestions?: string[];
   tickets: Array<{
     id: string;
     title: string;

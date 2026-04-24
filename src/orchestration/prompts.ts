@@ -1,34 +1,82 @@
 import type {
+  CoderOutput,
+  CanonicalEditPacket,
+  EditOperation,
   EpicRecord,
+  ExplorerOutput,
   GoalTicketPlan,
   ReviewerVerdict,
   TicketContextPacket,
+  TicketEpicReviewPacket,
   TicketRecord
 } from "../types.ts";
+import { type VerificationResult } from "./verifier.ts";
 import { getCompactToolContract, getAvailableToolsList } from "../mediated-agent-harness/tools.ts";
 import type { BuiltContext } from "../rag/context-builder.ts";
 
+type EpicReviewerTicketGitContext = {
+  ticketId: string;
+  baseRef: string | null;
+  headRef: string | null;
+  allowedPaths: string[];
+  branchName?: string | null;
+  hasWorkspaceChanges?: boolean;
+};
+
+function promptShellQuote(value: string): string {
+  return JSON.stringify(String(value ?? "").replace(/\\/g, "/"));
+}
+
+function buildPromptPathArgs(paths: string[]): string {
+  const normalized = (paths ?? [])
+    .map((pathValue) => String(pathValue || "").trim())
+    .filter(Boolean)
+    .map((pathValue) => pathValue.replace(/\\/g, "/"))
+    .filter((pathValue) => pathValue !== "*" && pathValue !== ".");
+
+  return normalized.length ? ` -- ${normalized.map(promptShellQuote).join(" ")}` : "";
+}
+
+
 export function epicDecoderPrompt(epic: EpicRecord): string {
   return [
-    "You are the Goal Decomposer.",
-    "⚠️ EXECUTOR CONSTRAINT: Every ticket you create will be handed to a 20–30B parameter model with limited reasoning and a short context window. Tickets MUST be trivially simple — one cohesive change, touching 1–3 files at most, with no ambiguity. If a task seems big, split it into multiple tickets. Prefer 8 small tickets over 3 large ones.",
+    "You are the Goal Decomposer. Break the epic into detailed, self-contained tickets.",
+    "",
+    "EXECUTOR CONSTRAINT: Every ticket will be executed by a 20-30B model with limited reasoning. Tickets MUST be trivially simple — one cohesive change, 1-3 files max, zero ambiguity. Prefer 8-12 small tickets over 3 large ones.",
+    "",
+    "TICKET QUALITY REQUIREMENTS:",
+    "Each ticket description MUST include:",
+    "- WHAT: specific files to create/modify, with full paths",
+    "- WHERE: exact file paths and locations within those files (e.g. 'Add the import at the top, after the existing react import')",
+    "- HOW: key implementation details — which imports, which functions, which existing patterns to follow",
+    "- WHY: how this ticket contributes to the epic goal",
+    "- Reference existing code: 'Follow the pattern in src/components/ExistingWidget.tsx'",
+    "- For dependencies: exact npm package name",
+    "- For new files: expected exports/structure",
+    "",
+    "acceptanceCriteria MUST be specific and testable:",
+    "- BAD: 'UI looks good', 'Component works correctly'",
+    "- GOOD: 'Component renders a <table> with columns [Name, Qty, Revenue]', 'Clicking the Revenue toggle sorts rows descending by qty * price'",
+    "",
+    "dependencies: list ticket IDs that MUST complete before this one starts. Use this to enforce build order (e.g. install deps before using them, create types before importing them).",
+    "",
+    "allowedPaths: EXACT file/folder paths the ticket needs — NOT ticket IDs, NOT URLs. Example: ['src/components/TopItemsTable.tsx', 'src/hooks/']",
+    "",
     "Return JSON only with shape:",
     JSON.stringify({
-      summary: "string",
+      summary: "string — decomposition strategy",
       tickets: [
         {
-          id: "string",
-          title: "string",
-          description: "string",
-          acceptanceCriteria: ["string"],
-          dependencies: ["string"],
-          allowedPaths: ["string"],
+          id: "string — e.g. AN-01",
+          title: "string — short imperative, e.g. 'Add Revenue column to TopItemsTable'",
+          description: "string — multi-line with files, patterns, imports, and implementation details",
+          acceptanceCriteria: ["string — specific, testable criteria"],
+          dependencies: ["string — ticket IDs"],
+          allowedPaths: ["string — exact file/folder paths"],
           priority: "high|medium|low"
         }
       ]
     }, null, 2),
-    "IMPORTANT: allowedPaths must be actual file/folder paths (e.g., ['src', 'test', 'docs', 'lib']), NOT ticket IDs or external URLs.",
-    "Example: For a ticket about testing, use allowedPaths: ['test', '__tests__', 'spec']",
     `Epic: ${epic.title}`,
     `Goal: ${epic.goalText}`
   ].join("\n\n");
@@ -58,10 +106,10 @@ export function builderPrompt(ticket: TicketRecord, packet: TicketContextPacket)
   sections.push(
     `Ticket: ${ticket.title}`,
     `Description: ${ticket.description}`,
-    `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`,
+    `Acceptance criteria: ${(ticket.acceptanceCriteria ?? []).join("; ")}`,
     `Allowed paths: ${ticket.allowedPaths.join(", ") || "(none)"}`,
     `Review blockers: ${packet.reviewBlockers.join("; ") || "(none)"}`,
-    `Prior test failures: ${packet.priorTestFailures.join("; ") || "(none)"}`,
+    `Prior test failures: ${(packet.priorTestFailures ?? []).join("; ") || "(none)"}`,
     "Before making changes, read `.closedloop/PROJECT_STRUCTURE.md` from disk if it exists, then use the injected Project Structure snapshot.",
     "Follow the styling rules, component conventions, and UI elements described there.",
     "Preserve the existing design system and styling approach; extend it instead of inventing a new one.",
@@ -115,10 +163,14 @@ export function builderToolingPrompt(ticket: TicketRecord, packet: TicketContext
   sections.push(
     `Ticket: ${ticket.title}`,
     `Description: ${ticket.description}`,
-    `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`,
+    `Acceptance criteria: ${(ticket.acceptanceCriteria ?? []).join("; ")}`,
     `Allowed paths: ${ticket.allowedPaths.join(", ") || "(none)"}`,
     `Review blockers: ${packet.reviewBlockers.join("; ") || "(none)"}`,
-    `Prior test failures: ${packet.priorTestFailures.join("; ") || "(none)"}`,
+    `Prior test failures: ${(packet.priorTestFailures ?? []).join("; ") || "(none)"}`,
+    "CRITICAL: You MUST make actual code changes. Do NOT decide that existing code is sufficient without reading the relevant files first.",
+    "If ANY acceptance criterion is not fully met, you MUST write code to address it. Vague statements like 'existing implementation satisfies' are not acceptable.",
+    "If ALL acceptance criteria are already met (you verified by reading the actual files), produce an empty operations array and explain in the summary. Do NOT write identity transforms.",
+    "NEVER output 'retry_builder' or 'no changes needed'. If genuinely complete, write a trivial change and explain which criteria were already met.",
     "Make the smallest safe set of changes needed.",
     "After you finish, output exactly one FINAL_JSON block and nothing after it.",
     '<FINAL_JSON>{"summary":"brief summary of changes"}</FINAL_JSON>'
@@ -127,7 +179,14 @@ export function builderToolingPrompt(ticket: TicketRecord, packet: TicketContext
   return sections.join("\n\n");
 }
 
-export function reviewerPrompt(ticket: TicketRecord, diff: string): string {
+
+export function reviewerPrompt(
+  ticket: TicketRecord,
+  coderOutput: CoderOutput | null,
+  verificationResult: VerificationResult | null,
+  diff: string,
+  legacyContext?: string
+): string {
   return [
     "You are the Local Reviewer.",
     "A deterministic guard has already checked destructive changes, allowed paths, and project-structure invariants.",
@@ -140,7 +199,7 @@ export function reviewerPrompt(ticket: TicketRecord, diff: string): string {
     "Do NOT invent blockers about files 'not being in the diff' when the diff clearly shows file creation.",
     "BLOCKERS vs SUGGESTIONS:",
     "- Blockers are ONLY: syntax errors, wrong file names (e.g. wrong.js instead of right.js), wrong file paths, security issues, or changes that actively break the codebase.",
-    "- In Tamagui / React Native / mobile-facing code, using raw HTML tags (`div`, `span`, `button`, `input`, etc.) is a BLOCKER unless the file is clearly web-only.",
+    "- In Tamagui / React Native / mobile-facing code, using raw HTML tags (div, span, button, input, etc.) is a BLOCKER unless the file is clearly web-only.",
     "- Changes that ignore the established styling system or replace existing design primitives with incompatible ones are BLOCKERS.",
     "- Missing type annotations, missing module exports, missing comments, style preferences, or 'best practices' for simple scripts are SUGGESTIONS, NOT blockers.",
     "- For simple files (hello world, scripts, standalone files), do NOT block on missing exports or type annotations. These are optional improvements.",
@@ -155,8 +214,11 @@ export function reviewerPrompt(ticket: TicketRecord, diff: string): string {
     }, null, 2),
     `Ticket: ${ticket.title}`,
     `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`,
+    ...(coderOutput ? [`Coder Summary: ${coderOutput.summary}`, `Intended Files: ${coderOutput.intendedFiles.join(", ")}`] : []),
+    ...(verificationResult ? [`Verification Result: ${verificationResult.outcome} (${verificationResult.appliedOperations.length} applied, ${verificationResult.failedOperations.length} failed)`] : []),
     "Diff:",
-    diff || "(empty)"
+    diff || "(empty)",
+    ...(legacyContext ? ["Legacy Context:", legacyContext] : [])
   ].join("\n\n");
 }
 
@@ -178,6 +240,126 @@ export function reviewerToolingPrompt(ticket: TicketRecord): string {
     `Ticket: ${ticket.title}`,
     `Description: ${ticket.description}`,
     `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`
+  ].join("\n\n");
+}
+
+
+
+export function explorerPrompt(ticket: TicketRecord, packet: TicketContextPacket, seedFiles?: string[]): string {
+  const seedSection = seedFiles && seedFiles.length > 0
+    ? "PRE-DISCOVERED FILES (you do NOT need to re-read these):\n" + seedFiles.map(f => `  - ${f}`).join("\n")
+    : "";
+
+  return [
+    "You are the Explorer agent.",
+    "Analyze the ticket requirements and the provided context to determine which files need to be read or modified.",
+    "Return a structured analysis with: relevant files, recommended files for coding, key patterns to follow, and any blockers.",
+    "",
+    "TOOL USAGE STRATEGY:",
+    "PREFER explore_mode for ALL file discovery. It batches multiple read-only calls efficiently.",
+    "Use explore_mode to: read_file, read_files, glob_files, grep_files, list_dir, semantic_search, web_search.",
+    "You may also call read_file, read_files, glob_files, grep_files, list_dir, semantic_search directly outside explore_mode if needed.",
+    "If you need to find related files OUTSIDE the allowed paths, use glob_files and grep_files to discover them.",
+    "Example: If the ticket mentions 'Orders' and 'Items', search for those files with grep_files or glob_files.",
+    "DO NOT just re-read the same files. Use glob/list_dir/grep to find related schemas, models, types, and services.",
+    "",
+    `Ticket: ${ticket.title}`,
+    `Goal: ${ticket.description}`,
+    `Acceptance criteria: ${(ticket.acceptanceCriteria ?? []).join("; ")}`,
+    `Allowed paths: ${(ticket.allowedPaths ?? []).join(", ")}`,
+    `Review blockers from previous attempt: ${(packet.reviewBlockers ?? []).join("; ") || "(none)"}`,
+    `Prior test failures: ${(packet.priorTestFailures ?? []).join("; ") || "(none)"}`,
+    seedSection,
+    "Return JSON only with shape:",
+    JSON.stringify({
+      summary: "string",
+      relevantFiles: ["string"],
+      recommendedFilesForCoding: ["string"],
+      keyPatterns: ["string"],
+      unresolvedBlockers: ["string"]
+    }, null, 2),
+    "After you finish, output exactly one FINAL_JSON block and nothing after it."
+  ].join("\n\n");
+}
+
+export function coderPrompt(
+  ticket: TicketRecord,
+  explorerOutput: ExplorerOutput | null,
+  editPacket: CanonicalEditPacket,
+  reviewerContext?: { blockers: string[]; suggestions: string[] },
+  skipContext?: { skipped: boolean; reason?: string }
+): string {
+  return [
+    "You are the Coder agent.",
+    "Your job is to write the actual code changes to satisfy the ticket based on the Explorer's analysis and the provided file contents.",
+    "",
+    "## PREFERRED: Write files directly using tools",
+    "Use search_replace for targeted edits to existing files (preferred for small changes).",
+    "Use write_file for new files or when rewriting most of an existing file (you MUST read it first).",
+    "Use write_files for writing multiple files at once.",
+    "Write ALL files before calling finish.",
+    "",
+    "## FALLBACK: JSON edit plan",
+    "If you cannot use write tools, output your edits as JSON operations in a FINAL_JSON block.",
+    "",
+    "CRITICAL: Work from the edit packet below. The file contents are already provided — do NOT request or expect to read more files. Produce your edits directly from this context.",
+    `Ticket: ${ticket.title}`,
+    `Goal: ${ticket.description}`,
+    `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`,
+    "## Acceptance Criteria Mapping",
+    "CRITICAL: Every change you produce MUST address at least one acceptance criterion. This prevents scope drift.",
+    ...(skipContext?.skipped ? [
+      "",
+      "## IMPORTANT: Explorer Was Skipped",
+      skipContext.reason ?? "The explorer node was bypassed for this run.",
+      "You may have less file context than usual. Focus on the files listed in the edit packet and the ticket's allowedPaths.",
+      "If you are missing context, read the files you need rather than giving up."
+    ] : []),
+    "",
+    "## Explorer Analysis",
+    JSON.stringify(explorerOutput, null, 2),
+    "## Canonical Edit Packet (Current Source of Truth)",
+    JSON.stringify(editPacket, null, 2),
+    ...(reviewerContext && (reviewerContext.blockers?.length || reviewerContext.suggestions?.length)
+      ? [
+        "",
+        "## Previous Reviewer Feedback (address these issues)",
+        ...(reviewerContext.blockers?.length
+          ? ["Reviewer blockers (MUST resolve):", ...reviewerContext.blockers.map(b => "- " + b)]
+          : []),
+        ...(reviewerContext.suggestions?.length
+          ? ["Reviewer suggestions:", ...reviewerContext.suggestions.map(s => "- " + s)]
+          : []),
+        "Your changes MUST address every blocker listed above.",
+      ]
+      : []),
+    "## Rules",
+    "1. Use search_replace tool for existing files — provide the exact 'search' block and the 'replace' block.",
+    "2. Use write_file for new files. For existing files, you MUST read the file first.",
+    "3. Do NOT delete or rename files unless explicitly permitted in destructivePermissions.",
+    "4. If the edit packet is missing content you need, read the file first. NEVER give up — always try to get the context and produce edits.",
+    "5. If reading the edit packet shows that the file content ALREADY matches what the acceptance criteria require, produce ZERO changes and explain in summary.",
+    "6. Do NOT produce identity transforms where search === replace.",
+    "",
+    "## Finish Output",
+    "Call finish with JSON:",
+    JSON.stringify({
+      summary: "brief summary of what you implemented",
+      filesChanged: ["file1.ts", "file2.ts"]
+    }, null, 2),
+    "",
+    "## JSON Fallback (only if tools are unavailable)",
+    "Output a FINAL_JSON block with shape:",
+    JSON.stringify({
+      summary: "brief summary of what you implemented",
+      intendedFiles: ["string"],
+      unresolvedBlockers: ["string"],
+      operations: [
+        { kind: "search_replace", path: "string", expected_sha256: "string", search: "string", replace: "string", ac: "AC-1" },
+        { kind: "create_file", path: "string", content: "string", ac: "AC-2,AC-3" }
+      ]
+    }, null, 2),
+    "After you finish, output exactly one FINAL_JSON block and nothing after it."
   ].join("\n\n");
 }
 
@@ -300,7 +482,7 @@ export function doctorPrompt(input: {
     "You are the Agent Doctor.",
     "Return JSON only with shape:",
     JSON.stringify({ decision: "retry_builder", reason: "string" }, null, 2),
-    "Decisions: retry_builder (start over), retry_same_node (retry current agent), escalate (give up)",
+    "Decisions: retry_builder (start over), retry_same_node (retry current agent), escalate (give up), approve (code already satisfies criteria — accept as-is)",
     `Ticket: ${input.ticket.title}`,
     `Current node: ${input.currentNode ?? "unknown"}`,
     `Repeated blockers: ${String(input.repeatedBlockers)}`,
@@ -308,7 +490,9 @@ export function doctorPrompt(input: {
     `No diff: ${String(input.noDiff)}`,
     `Infrastructure failure: ${String(input.infraFailure)}`,
     `Latest review: ${JSON.stringify(input.reviewerVerdict)}`,
-    `Latest test summary: ${input.testSummary ?? "(none)"}`
+    `Latest test summary: ${input.testSummary ?? "(none)"}`,
+    "",
+    "Re-run Awareness: This ticket may have been run before. If noDiff is true and the coder/explorer reported that all acceptance criteria are already satisfied, you MUST choose 'approve'. Do NOT escalate tickets where the code is already correct."
   ].join("\n\n");
 }
 
@@ -330,15 +514,39 @@ export function epicDecoderToolingPrompt(
     `Epic: ${epic.title}`,
     `Goal: ${epic.goalText}`,
     [
-      "⚠️ EXECUTOR CONSTRAINT — read this before writing a single ticket:",
-      "Each ticket you create will be executed by a 20–30B parameter model. That model has limited reasoning capacity and a short context window.",
+      "EXECUTOR CONSTRAINT — read this before writing a single ticket:",
+      "Each ticket you create will be executed by a 20-30B parameter model. That model has limited reasoning capacity and a short context window.",
       "This means every ticket MUST be:",
-      "  • Atomic — one coherent, self-contained change only",
-      "  • Narrow — touches 1–3 files at most; never spans the whole codebase",
-      "  • Explicit — the description and acceptance criteria must be so clear that no further discovery is needed",
-      "  • Small — the full change should fit comfortably in a single LLM response",
+      "  - Atomic — one coherent, self-contained change only",
+      "  - Narrow — touches 1-3 files at most; never spans the whole codebase",
+      "  - Explicit — the description and acceptance criteria must be so clear that no further discovery is needed",
+      "  - Small — the full change should fit comfortably in a single LLM response",
       "If a task feels large or multi-faceted, SPLIT IT. Prefer 10 simple tickets over 4 complex ones.",
       "Do NOT create tickets like 'Implement the feature end-to-end' or 'Refactor the module'. Break those into individual file-level changes.",
+    ].join("\n"),
+    "",
+    [
+      "TICKET QUALITY REQUIREMENTS — every ticket MUST have:",
+      "",
+      "Description must include:",
+      "  - WHAT: specific files to create/modify, with full paths",
+      "  - WHERE: exact locations within files (e.g. 'Add import at top after existing react import')",
+      "  - HOW: key implementation details — which imports, which functions, which existing patterns to follow",
+      "  - WHY: how this ticket contributes to the epic goal",
+      "  - Reference existing code by file path: 'Follow the pattern used in src/components/ExistingWidget.tsx'",
+      "  - For npm dependencies: exact package name",
+      "  - For new files: expected exports/structure",
+      "",
+      "acceptanceCriteria must be specific and testable:",
+      "  - BAD: 'UI looks good', 'Component works correctly'",
+      "  - GOOD: 'Component renders a <table> with columns [Name, Qty, Revenue]'",
+      "  - GOOD: 'Clicking the Revenue toggle sorts rows descending by qty * price without any API call'",
+      "",
+      "dependencies: list ticket IDs that MUST complete before this one starts.",
+      "  - Use to enforce build order: install deps before using them, create types before importing them, build foundation components before pages that use them.",
+      "",
+      "allowedPaths: EXACT file/folder paths — NOT ticket IDs, NOT URLs.",
+      "  - Example: ['src/components/TopItemsTable.tsx', 'src/hooks/useTopItems.ts']",
     ].join("\n"),
   ];
 
@@ -353,10 +561,10 @@ export function epicDecoderToolingPrompt(
 
   sections.push(
     "Steps:",
-    "1. Explore the repo structure with glob/grep and read key files",
-    "2. Understand existing code patterns and architecture",
-    "3. Decompose the epic into atomic, file-scoped tickets (keep each one small!)",
-    "4. Each ticket must have literal acceptance criteria and tight allowedPaths",
+    "1. Explore the repo structure with glob/grep to understand layout",
+    "2. Read 1-2 representative files per area to understand existing patterns (imports, exports, component structure, function signatures)",
+    "3. Decompose the epic into atomic, file-scoped tickets — each one a junior developer could execute independently",
+    "4. Each ticket must have rich descriptions, specific acceptance criteria, and tight allowedPaths",
     "After you finish, output exactly one FINAL_JSON block and nothing after it.",
     `<FINAL_JSON>${JSON.stringify({
       summary: "string",
@@ -447,6 +655,183 @@ export function epicReviewerCodexPrompt(
   );
 
   return sections.join("\n\n");
+}
+
+/**
+ * Unified prompt for epic review via direct CLI (codex, gemini, qwen).
+ * Includes actual git diffs from ticket workspaces and reviewer packets for failing tickets.
+ * The reviewer works directly on the merged review workspace and can apply fixes.
+ */
+export function epicReviewerDirectCliPrompt(input: {
+  epic: EpicRecord;
+  tickets: TicketRecord[];
+  reviewPackets: Map<string, TicketEpicReviewPacket>;
+  ticketGitContext?: EpicReviewerTicketGitContext[];
+  ragContext?: { codeContext: string; docContext: string } | null;
+  projectStructure?: string | null;
+  targetBranch?: string | null;
+  /** Git ref (branch or commit) that serves as the base for the review diff */
+  diffBase?: string | null;
+}): string {
+  const { epic, tickets, reviewPackets, ticketGitContext = [], ragContext, projectStructure, targetBranch, diffBase } = input;
+  const gitContextByTicket = new Map(ticketGitContext.map((entry) => [entry.ticketId, entry]));
+  const holisticRange = diffBase ? `${diffBase}..HEAD` : "HEAD";
+
+  // ── Ticket metadata sections (info the CLI cannot discover from the workspace) ──
+  const ticketSections = tickets.map(t => {
+    const packet = reviewPackets.get(t.id);
+    const gitContext = gitContextByTicket.get(t.id);
+    const criteria = t.acceptanceCriteria.map(c => `  - ${c}`).join("\n");
+    const paths = t.allowedPaths.join(", ");
+    const pathArgs = buildPromptPathArgs(gitContext?.allowedPaths ?? t.allowedPaths);
+    const ticketRange = gitContext?.baseRef && gitContext?.headRef
+      ? `${gitContext.baseRef}..${gitContext.headRef}`
+      : diffBase
+        ? `${diffBase}..HEAD`
+        : null;
+
+    const lines: string[] = [
+      `### Ticket: ${t.id}`,
+      `Title: ${t.title}`,
+      `Status: ${t.status}`,
+      `Description: ${t.description}`,
+      `Allowed Paths: ${paths}`,
+      `Acceptance Criteria:`,
+      criteria,
+    ];
+
+    if (t.prUrl) {
+      lines.push(`PR: ${t.prUrl}`);
+    }
+
+    lines.push("");
+    lines.push("Git Review Commands:");
+    if (ticketRange) {
+      lines.push(`- Ticket diff: git diff ${ticketRange}${pathArgs}`);
+      lines.push(`- Ticket diff stat: git diff --stat ${ticketRange}${pathArgs}`);
+      lines.push(`- Ticket changed files: git diff --name-only ${ticketRange}${pathArgs}`);
+    } else {
+      lines.push(`- Ticket diff: git diff${pathArgs}`);
+      lines.push(`- Ticket diff stat: git diff --stat${pathArgs}`);
+    }
+    if (gitContext?.headRef) {
+      lines.push(`- Ticket commits: git log --oneline ${gitContext.headRef} -n 5`);
+      lines.push(`- Final ticket commit summary: git show --stat --summary ${gitContext.headRef}`);
+    }
+    if (gitContext?.branchName) {
+      lines.push(`- Ticket branch/worktree hint: ${gitContext.branchName}`);
+    }
+    if (gitContext?.hasWorkspaceChanges && !gitContext.headRef) {
+      lines.push("- This ticket may include uncommitted workspace changes. Inspect `git status --short` and `git diff` in addition to commit-based review.");
+    }
+
+    // Include reviewer verdict for failing/problematic tickets
+    if (packet) {
+      lines.push("");
+      lines.push(`#### Review Packet (from ticket execution)`);
+      lines.push(`Disposition: ${packet.epicReviewDisposition}`);
+      lines.push(`Ready for epic review: ${packet.epicReviewReadiness}`);
+      if (packet.builderSummary) {
+        lines.push(`Builder Summary: ${packet.builderSummary}`);
+      }
+      if (packet.review) {
+        lines.push(`Ticket Review Verdict: ${packet.review.verdict ? "APPROVED" : "REJECTED"}`);
+        if (packet.review.blockers.length > 0) {
+          lines.push(`Blockers:`);
+          packet.review.blockers.forEach(b => lines.push(`  - ${b}`));
+        }
+        if (packet.review.suggestions.length > 0) {
+          lines.push(`Suggestions:`);
+          packet.review.suggestions.forEach(s => lines.push(`  - ${s}`));
+        }
+      }
+      if (packet.failure) {
+        lines.push(`Failure Stage: ${packet.failure.stage}`);
+        lines.push(`Failure Reason: ${packet.failure.reason}`);
+      }
+    }
+
+    return lines.join("\n");
+  }).join("\n\n");
+
+  // ── System instructions ──
+  const sections: string[] = [
+    "You are the Epic Reviewer agent. You have access to the full workspace with all ticket changes already merged in.",
+    "",
+    "IMPORTANT: All ticket code changes are already present in your working directory.",
+    "Do NOT rely on embedded/truncated diffs in the prompt. Pull the git history and diffs yourself.",
+    "Use git in two passes: first holistically for the whole epic, then ticket-by-ticket using the command hints below.",
+    "",
+    "Recommended whole-epic commands:",
+    "1. Run: git status --short",
+    `2. Run: git diff --stat ${holisticRange}`,
+    `3. Run: git diff ${holisticRange}`,
+    `4. Run: git diff --name-only ${holisticRange}`,
+    "5. If the holistic diff is large, switch to ticket-specific diff commands from the ticket metadata below.",
+    "6. Read source files directly after locating suspicious hunks.",
+    "",
+    "Your job is to:",
+    "1. Review ALL ticket changes against the epic goal and acceptance criteria",
+    "2. Check for destructive patterns, integration issues, and missing acceptance criteria",
+    "3. Use the ticket-specific git commands below to verify each ticket in isolation when needed",
+    "4. FIX any issues you find DIRECTLY in the workspace",
+    "5. Push your fixes to the target branch if one is specified",
+    "",
+    "Destructive patterns to check for:",
+    "- Large file deletions (>10 files or >1000 lines)",
+    "- Security-sensitive changes (auth, tokens, env vars)",
+    "- Database migrations that could cause data loss",
+    "- Breaking API changes without deprecation warnings",
+    "- Mass refactoring that touches >20 files",
+    "",
+    "Pay special attention to tickets with REJECTED reviews or failures — these may have incomplete or broken changes.",
+  ];
+
+  if (targetBranch) {
+    sections.push("");
+    sections.push(`TARGET BRANCH: ${targetBranch}`);
+    sections.push("After applying any fixes, commit them and push to this target branch.");
+    sections.push("Use: git add -A && git commit -m 'epic-review-fixes' && git push origin HEAD:" + targetBranch);
+  }
+
+  if (projectStructure) {
+    sections.push("");
+    sections.push(`## Project Structure`);
+    sections.push("```");
+    sections.push(projectStructure.slice(0, 6000));
+    sections.push("```");
+  }
+
+  if (ragContext?.docContext) {
+    sections.push("");
+    sections.push(ragContext.docContext);
+  }
+  if (ragContext?.codeContext) {
+    sections.push("");
+    sections.push(ragContext.codeContext);
+  }
+
+  sections.push("");
+  sections.push(`## Epic: ${epic.title}`);
+  sections.push(`Goal: ${epic.goalText}`);
+  sections.push("");
+  sections.push(`## Tickets (${tickets.length} total)`);
+  sections.push("Each ticket's metadata is below, including git commands for isolated review. Use those commands instead of relying on prompt-injected diffs.");
+  sections.push(ticketSections);
+  sections.push("");
+  sections.push("## Instructions");
+  sections.push(`1. Start with the whole-epic diff: \`git diff ${holisticRange}\``);
+  sections.push("2. For each ticket, run the ticket-specific `git diff` command listed in that ticket section to inspect only its scoped paths");
+  sections.push("3. Cross-reference each ticket's changes against its acceptance criteria above");
+  sections.push("4. Check for cross-ticket integration issues (conflicting changes, missing imports, broken shared types, etc.)");
+  sections.push("5. If you find issues, FIX THEM DIRECTLY by editing the files");
+  sections.push("6. Commit and push any fixes to the target branch");
+  sections.push("7. Do NOT create followup tickets unless the issue cannot be fixed");
+  sections.push("");
+  sections.push("After you finish, output exactly one FINAL_JSON block and nothing after it.");
+  sections.push('<FINAL_JSON>{"verdict":"approved|needs_followups|failed","summary":"brief summary","followupTickets":[]}</FINAL_JSON>');
+
+  return sections.join("\n");
 }
 
 /**
@@ -577,8 +962,9 @@ export function epicDecoderPlanModePrompt(
     "1. Explore the repo structure — read key files, understand existing patterns and architecture",
     "2. Identify what is already implemented vs what needs to be built",
     "3. Note ambiguities, risks, or things you are unsure about",
-    "4. Decompose the epic into well-scoped, independently executable tickets",
-    "5. Each ticket must have clear acceptance criteria, file scope (allowedPaths), dependencies, and priority",
+    "4. If a critical ambiguity would materially change ticket boundaries or acceptance criteria, pause and ask concise clarification questions instead of guessing",
+    "5. Otherwise, decompose the epic into well-scoped, independently executable tickets",
+    "6. Each ticket must have clear acceptance criteria, file scope (allowedPaths), dependencies, and priority",
     "Think carefully. Be specific about what each ticket changes and why.",
     [
       "⚠️ EXECUTOR CONSTRAINT — critical for ticket design:",
@@ -593,9 +979,28 @@ export function epicDecoderPlanModePrompt(
       "Avoid vague titles like 'Update module X' — be precise: 'Add exportFoo() to src/foo.ts'.",
     ].join("\n"),
     "## Required Output Format",
-    "Before outputting FINAL_JSON, you MUST write a structured analysis in plain text so the user can follow your reasoning. Use this exact format:\n\n## Codebase Analysis\n[Describe what you found: key files, existing patterns, relevant architecture, important types/interfaces]\n\n## What Exists vs What Needs Building\n[Enumerate what is already implemented and what is missing or incomplete]\n\n## Risks & Unknowns\n[List ambiguities, potential issues, or things that need clarification]\n\n## Ticket Overview\n[For each ticket: name, 1-sentence rationale, key files it touches]\n\nThen, after this analysis, output exactly one FINAL_JSON block:",
+    [
+      "Before outputting FINAL_JSON, you MUST write a structured analysis in plain text so the user can follow your reasoning. Use this exact format:",
+      "",
+      "## Codebase Analysis",
+      "[Describe what you found: key files, existing patterns, relevant architecture, important types/interfaces]",
+      "",
+      "## What Exists vs What Needs Building",
+      "[Enumerate what is already implemented and what is missing or incomplete]",
+      "",
+      "## Risks & Unknowns",
+      "[List ambiguities, potential issues, or things that need clarification]",
+      "",
+      "## Ticket Overview",
+      "[For each ticket: name, 1-sentence rationale, key files it touches]",
+      "",
+      "Then, after this analysis, output exactly one FINAL_JSON block.",
+      "If you need clarification before planning, return `tickets: []` and set `clarificationQuestions` to 1-3 specific questions the user can answer directly.",
+      "Only use clarificationQuestions for genuinely plan-shaping unknowns. If the repo inspection gives enough signal, produce the full plan instead."
+    ].join("\n"),
     `<FINAL_JSON>${JSON.stringify({
       summary: "brief summary of overall plan",
+      clarificationQuestions: [],
       tickets: [{
         id: "string",
         title: "string",
@@ -605,6 +1010,15 @@ export function epicDecoderPlanModePrompt(
         allowedPaths: ["string"],
         priority: "high|medium|low"
       }]
+    })}</FINAL_JSON>`,
+    `Clarification example:\n<FINAL_JSON>${JSON.stringify({
+      summary: "Need a few answers before I can break this into reliable tickets.",
+      clarificationQuestions: [
+        "Which existing route or screen should own this feature?",
+        "Should this behavior be gated behind a feature flag or replace the current flow?",
+        "Do you want tests included in this epic or handled separately?"
+      ],
+      tickets: []
     })}</FINAL_JSON>`
   );
 

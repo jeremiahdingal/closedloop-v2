@@ -23,6 +23,7 @@ export function EpicModal(props: {
   onRetry: () => void;
   onReview: () => void;
   onPlayLoop: () => void;
+  onMarkDone: () => void;
   onCancel: () => void;
   onDelete: () => void;
   actionBusy: boolean;
@@ -230,7 +231,7 @@ export function EpicModal(props: {
 
         {/* Footer */}
         <div className="modal-footer">
-          {props.epic.status === "failed" && (
+          {["failed", "escalated", "executing"].includes(props.epic.status) && (
             <button className="btn btn-modal-retry" onClick={props.onRetry} disabled={props.actionBusy}>
               ▶ Retry Epic
             </button>
@@ -238,6 +239,11 @@ export function EpicModal(props: {
           <button className="btn btn-modal-review" onClick={props.onReview} disabled={props.actionBusy}>
             🔍 Review
           </button>
+          {props.epic.status !== "done" && (
+            <button className="btn btn-modal-rescue" onClick={props.onMarkDone} disabled={props.actionBusy}>
+              ✅ Force Done
+            </button>
+          )}
           <button className="btn" onClick={props.onPlayLoop} disabled={props.actionBusy}>
             🧪 Play Loop
           </button>

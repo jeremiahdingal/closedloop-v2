@@ -1,3 +1,5 @@
 {
-  "targetDir": "C:\\Users\\dinga\\Projects\\shop-diary-v3"
+  "targetDir": "C:\\Users\\dinga\\Projects\\shop-diary-apps",
+  "role": "epicReviewer",
+  "modelId": "mediated:qwen3.5:27b"
 }

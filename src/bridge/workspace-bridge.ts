@@ -41,15 +41,40 @@ export class WorkspaceBridge {
 
   async createWorkspace(input: { ticketId: string; runId: string; baseRef?: string; owner: string; targetDir: string; useTargetBranch?: boolean }): Promise<WorkspaceRecord> {
     const isGitRepo = await stat(path.join(input.targetDir, ".git")).then(() => true).catch(() => false);
-    
+
     const workspaceId = randomId("ws");
     const useTargetBranch = input.useTargetBranch ?? false;
     const branchName = useTargetBranch ? input.baseRef ?? "HEAD" : `ticket/${input.ticketId}-${workspaceId.slice(-6)}`;
-    const worktreePath = path.join(this.config.workspacesDir, workspaceId);
-    await ensureDir(this.config.workspacesDir);
 
+    let worktreePath: string;
     let baseCommit = "";
+    let savedBranch: string | null = null;
+
     if (isGitRepo) {
+      worktreePath = input.targetDir;
+
+      // Fetch latest from origin
+      try { await git(input.targetDir, ["fetch", "origin"]); } catch {}
+
+      // Save current branch for restore on cleanup (best-effort — may fail on empty repos)
+      try {
+        const branchResult = await git(input.targetDir, ["rev-parse", "--abbrev-ref", "HEAD"]);
+        savedBranch = branchResult.stdout.trim() || null;
+        if (savedBranch === "HEAD") {
+          const headResult = await git(input.targetDir, ["rev-parse", "HEAD"]);
+          savedBranch = headResult.stdout.trim();
+        }
+      } catch {}
+
+      // Stash any uncommitted changes (best-effort)
+      try {
+        const statusResult = await git(input.targetDir, ["status", "--porcelain"]);
+        if (statusResult.stdout.trim().length > 0) {
+          await git(input.targetDir, ["stash", "push", "-m", `orchestrator-auto-${workspaceId}`]);
+        }
+      } catch {}
+
+      // Resolve base commit
       const baseRef = input.baseRef ?? "HEAD";
       try {
         baseCommit = await this.resolveBaseCommit(input.targetDir, baseRef);
@@ -58,6 +83,7 @@ export class WorkspaceBridge {
         if (baseRef !== "HEAD" && (errMsg.includes("could not resolve") || errMsg.includes("fatal: ambiguous"))) {
           console.warn(`Branch '${baseRef}' not found, attempting to create from origin/${baseRef} or main`);
           try {
+            await git(input.targetDir, ["fetch", "origin", baseRef]).catch(() => {});
             baseCommit = await this.resolveBaseCommit(input.targetDir, `origin/${baseRef}`);
           } catch {
             try {
@@ -71,12 +97,22 @@ export class WorkspaceBridge {
           throw resolveError;
         }
       }
+
+      // Checkout ticket branch
       if (useTargetBranch) {
-        await git(input.targetDir, ["worktree", "add", worktreePath, baseCommit]);
+        await git(input.targetDir, ["checkout", "-B", branchName, baseCommit]);
       } else {
-        await git(input.targetDir, ["worktree", "add", "-b", branchName, worktreePath, baseCommit]);
+        try {
+          await git(input.targetDir, ["checkout", "-b", branchName, baseCommit]);
+        } catch {
+          // Branch may already exist — force reset
+          await git(input.targetDir, ["checkout", "-B", branchName, baseCommit]);
+        }
       }
     } else {
+      // Non-git fallback: copy to temp directory
+      worktreePath = path.join(this.config.workspacesDir, workspaceId);
+      await ensureDir(this.config.workspacesDir);
       await cp(input.targetDir, worktreePath, { recursive: true });
       await git(worktreePath, ["init"]);
       await git(worktreePath, ["add", "-A"]);
@@ -93,11 +129,12 @@ export class WorkspaceBridge {
       branchName,
       baseCommit,
       headCommit: null,
+      savedBranch,
       status: "active",
       leaseOwner: input.owner
     });
 
-    await this.logAudit("workspace.log", `created workspace=${workspaceId} ticket=${input.ticketId} path=${worktreePath} target=${input.targetDir}`);
+    await this.logAudit("workspace.log", `created workspace=${workspaceId} ticket=${input.ticketId} path=${worktreePath} target=${input.targetDir} savedBranch=${savedBranch}`);
     return workspace;
   }
 
@@ -128,12 +165,48 @@ export class WorkspaceBridge {
   async cleanupWorkspace(workspaceId: string, force = false): Promise<void> {
     const workspace = this.db.getWorkspace(workspaceId);
     if (!workspace) return;
-    try {
-      await git(workspace.repoRoot, ["worktree", "remove", workspace.worktreePath, ...(force ? ["--force"] : [])]);
-    } catch {
-      await rm(workspace.worktreePath, { recursive: true, force: true });
+
+    const isDirectCheckout = workspace.worktreePath === workspace.repoRoot;
+
+    if (isDirectCheckout && workspace.savedBranch) {
+      // Direct branch checkout mode — restore original branch
+      try {
+        // Discard any uncommitted changes left by the agent
+        await git(workspace.repoRoot, ["reset", "--hard", "HEAD"]);
+        await git(workspace.repoRoot, ["clean", "-fd"]);
+
+        // Switch back to the original branch
+        await git(workspace.repoRoot, ["checkout", workspace.savedBranch]);
+
+        // Pop stashed changes if we stashed any
+        try {
+          const stashList = await git(workspace.repoRoot, ["stash", "list"]);
+          const stashLine = stashList.stdout.split('\n').find(
+            line => line.includes(`orchestrator-auto-${workspaceId}`)
+          );
+          if (stashLine) {
+            const stashRef = stashLine.split(':')[0];
+            await git(workspace.repoRoot, ["stash", "pop", stashRef]);
+          }
+        } catch { /* best effort */ }
+      } catch (err) {
+        console.warn(`Failed to restore branch ${workspace.savedBranch}: ${err}`);
+      }
+
+      // Delete ticket branch (only for ticket/* branches, not target branches)
+      if (workspace.branchName.startsWith("ticket/")) {
+        await this.deleteWorkspaceBranch(workspace);
+      }
+    } else if (!isDirectCheckout) {
+      // Legacy worktree path — remove the directory
+      try {
+        await git(workspace.repoRoot, ["worktree", "remove", "--force", workspace.worktreePath]);
+      } catch {
+        await rm(workspace.worktreePath, { recursive: true, force: true });
+      }
+      await this.deleteWorkspaceBranch(workspace);
     }
-    await this.deleteWorkspaceBranch(workspace);
+
     this.db.updateWorkspace({ workspaceId, status: "cleaned", leaseOwner: null });
     this.db.deleteLease("workspace", workspaceId);
     await this.logAudit("workspace.log", `cleaned workspace=${workspaceId}`);
@@ -159,8 +232,27 @@ export class WorkspaceBridge {
     const cleaned: WorkspaceRecord[] = [];
 
     for (const workspace of archived) {
-      await this.removeWorkspaceWorktree(workspace);
-      await this.deleteWorkspaceBranch(workspace);
+      const isDirectCheckout = workspace.worktreePath === workspace.repoRoot;
+
+      if (isDirectCheckout) {
+        // Direct checkout — restore branch and delete ticket branch
+        if (workspace.savedBranch && workspace.branchName.startsWith("ticket/")) {
+          try {
+            const currentBranch = await git(workspace.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
+            if (currentBranch.stdout.trim() === workspace.branchName) {
+              await git(workspace.repoRoot, ["checkout", workspace.savedBranch]);
+            }
+          } catch {}
+        }
+        if (workspace.branchName.startsWith("ticket/")) {
+          await this.deleteWorkspaceBranch(workspace);
+        }
+      } else {
+        // Legacy worktree — remove directory
+        await this.removeWorkspaceWorktree(workspace);
+        await this.deleteWorkspaceBranch(workspace);
+      }
+
       this.db.updateWorkspace({ workspaceId: workspace.id, status: "cleaned", leaseOwner: null });
       this.db.deleteLease("workspace", workspace.id);
       cleaned.push({ ...workspace, status: "cleaned", leaseOwner: null });
@@ -172,6 +264,89 @@ export class WorkspaceBridge {
 
   policyFor(workspace: WorkspaceRecord, allowedPaths: string[]): PathPolicy {
     return new PathPolicy(workspace.worktreePath, allowedPaths);
+  }
+
+  async cleanupOrphanedWorkspaces(maxAgeHours = 2): Promise<WorkspaceRecord[]> {
+    const cutoffIso = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString();
+    const orphans = this.db.listOrphanedWorkspaces(cutoffIso);
+    const cleaned: WorkspaceRecord[] = [];
+
+    for (const workspace of orphans) {
+      const lease = this.db.getLease("workspace", workspace.id);
+      if (lease && new Date(lease.expiresAt).getTime() > Date.now()) continue;
+
+      console.warn(`[CLEANUP] Removing orphaned workspace ${workspace.id} (ticket=${workspace.ticketId}, age>${maxAgeHours}h, no valid lease)`);
+
+      const isDirectCheckout = workspace.worktreePath === workspace.repoRoot;
+      try {
+        if (isDirectCheckout) {
+          if (workspace.savedBranch && workspace.branchName.startsWith("ticket/")) {
+            try {
+              const currentBranch = await git(workspace.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
+              if (currentBranch.stdout.trim() === workspace.branchName) {
+                await git(workspace.repoRoot, ["checkout", workspace.savedBranch]);
+              }
+            } catch {}
+          }
+          if (workspace.branchName.startsWith("ticket/")) {
+            await this.deleteWorkspaceBranch(workspace);
+          }
+        } else {
+          await this.removeWorkspaceWorktree(workspace);
+          await this.deleteWorkspaceBranch(workspace);
+        }
+      } catch (err) {
+        console.error(`[CLEANUP] Failed to clean workspace ${workspace.id}:`, err);
+      }
+
+      this.db.updateWorkspace({ workspaceId: workspace.id, status: "cleaned", leaseOwner: null });
+      this.db.deleteLease("workspace", workspace.id);
+      cleaned.push({ ...workspace, status: "cleaned", leaseOwner: null });
+      await this.logAudit("workspace.log", `orphan-cleaned workspace=${workspace.id} branch=${workspace.branchName}`);
+    }
+
+    return cleaned;
+  }
+
+  async cleanupOldWorkspacesForTicket(ticketId: string, keepWorkspaceId?: string): Promise<WorkspaceRecord[]> {
+    const all = this.db.listWorkspacesForTicket(ticketId);
+    const cleaned: WorkspaceRecord[] = [];
+
+    for (const workspace of all) {
+      if (workspace.id === keepWorkspaceId) continue;
+      if (workspace.status === "cleaned") continue;
+
+      console.log(`[CLEANUP] Removing prior workspace ${workspace.id} for ticket ${ticketId} (keeping ${keepWorkspaceId ?? "none"})`);
+
+      const isDirectCheckout = workspace.worktreePath === workspace.repoRoot;
+      try {
+        if (isDirectCheckout) {
+          if (workspace.savedBranch && workspace.branchName.startsWith("ticket/")) {
+            try {
+              const currentBranch = await git(workspace.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
+              if (currentBranch.stdout.trim() === workspace.branchName) {
+                await git(workspace.repoRoot, ["checkout", workspace.savedBranch]);
+              }
+            } catch {}
+          }
+          if (workspace.branchName.startsWith("ticket/")) {
+            await this.deleteWorkspaceBranch(workspace);
+          }
+        } else {
+          await this.removeWorkspaceWorktree(workspace);
+          await this.deleteWorkspaceBranch(workspace);
+        }
+      } catch (err) {
+        console.error(`[CLEANUP] Failed to clean workspace ${workspace.id}:`, err);
+      }
+
+      this.db.updateWorkspace({ workspaceId: workspace.id, status: "cleaned", leaseOwner: null });
+      this.db.deleteLease("workspace", workspace.id);
+      cleaned.push({ ...workspace, status: "cleaned", leaseOwner: null });
+      await this.logAudit("workspace.log", `ticket-rerun-cleaned workspace=${workspace.id} branch=${workspace.branchName}`);
+    }
+
+    return cleaned;
   }
 
   async acquireWorkspaceLease(workspaceId: string, owner: string): Promise<void> {
@@ -214,7 +389,7 @@ export class WorkspaceBridge {
     files: WriteFileInput[];
   }): Promise<string[]> {
     const workspace = this.requireWorkspace(input.workspaceId);
-    const policy = this.policyFor(workspace, input.allowedPaths);
+    const policy = this.policyFor(workspace, []);
     policy.assertAllowedWrites(input.files);
 
     const changed: string[] = [];
@@ -239,13 +414,32 @@ export class WorkspaceBridge {
 
   async readFiles(workspaceId: string, allowedPaths: string[], files: string[]): Promise<Record<string, string>> {
     const workspace = this.requireWorkspace(workspaceId);
-    const policy = this.policyFor(workspace, allowedPaths);
+    const policy = this.policyFor(workspace, []);
     const output: Record<string, string> = {};
     for (const file of files) {
       policy.assertAllowed(file);
       output[file] = await readFile(safeJoin(workspace.worktreePath, file), "utf8");
     }
     return output;
+  }
+
+  async mergeTicketBranchIntoEpic(workspaceId: string, ticketBranch: string): Promise<void> {
+    const workspace = this.requireWorkspace(workspaceId);
+    
+    // 1. Fetch latest from origin to ensure we can see the ticket branch
+    await git(workspace.worktreePath, ["fetch", "origin", ticketBranch]);
+    
+    // 2. Merge the ticket branch into current HEAD
+    try {
+      await git(workspace.worktreePath, ["merge", "--no-edit", `origin/${ticketBranch}`]);
+    } catch (error) {
+      const errText = error instanceof Error ? error.message : String(error);
+      if (errText.includes("conflict")) {
+        await git(workspace.worktreePath, ["merge", "--abort"]).catch(() => undefined);
+        throw new Error(`Merge conflict while merging ${ticketBranch} into epic branch: ${errText}`);
+      }
+      throw error;
+    }
   }
 
   async gitDiff(workspaceId: string): Promise<string> {
@@ -534,117 +728,6 @@ export class WorkspaceBridge {
     const workspace = this.requireWorkspace(workspaceId);
     const fullPath = safeJoin(workspace.worktreePath, filePath);
     return readFile(fullPath, "utf8");
-  }
-
-  /**
-   * Create a temporary worktree from an existing branch (without adding it to the database)
-   */
-  async createTempWorktreeFromBranch(repoRoot: string, branchName: string, fallbackRef?: string | null): Promise<string> {
-    const tempId = randomId("tmp");
-    const tempWorktreePath = path.join(this.config.workspacesDir, tempId);
-    await ensureDir(this.config.workspacesDir);
-
-    // Use detached HEAD pointing at the branch tip — avoids "already in use" error
-    // when the branch is currently checked out in another active worktree.
-    const candidateRefs = [
-      branchName,
-      `origin/${branchName}`,
-      `refs/remotes/origin/${branchName}`,
-      fallbackRef ?? ""
-    ]
-      .map((value) => value.trim())
-      .filter(Boolean);
-
-    let resolvedRef: string | null = null;
-    for (const candidate of candidateRefs) {
-      try {
-        const parsed = await git(repoRoot, ["rev-parse", "--verify", `${candidate}^{commit}`]);
-        const commit = parsed.stdout.trim();
-        if (commit) {
-          resolvedRef = commit;
-          break;
-        }
-      } catch {
-        // Try next ref candidate.
-      }
-    }
-
-    if (!resolvedRef) {
-      throw new Error(
-        `Cannot resolve branch '${branchName}' for temp worktree (tried local, origin, remote ref${fallbackRef ? ", and fallback commit" : ""}).`
-      );
-    }
-
-    await git(repoRoot, ["worktree", "add", "--detach", tempWorktreePath, resolvedRef]);
-    return tempWorktreePath;
-  }
-
-  /**
-   * Remove a temporary worktree
-   */
-  async removeTempWorktree(worktreePath: string): Promise<void> {
-    try {
-      // Remove the worktree
-      const repoRoot = path.dirname(worktreePath);
-      await git(repoRoot, ["worktree", "remove", worktreePath]);
-    } catch (error) {
-      // If removal fails, try rm -rf as fallback
-      try {
-        await rm(worktreePath, { recursive: true, force: true });
-      } catch {
-        // Ignore errors
-      }
-    }
-  }
-
-  /**
-   * Commit and push changes from a worktree path (used for temp worktrees)
-   */
-  async commitAndPushFromPath(worktreePath: string, branchName: string, message: string): Promise<string> {
-    this.assertAutomationPushAllowed(branchName, "commitAndPushFromPath");
-    // Stage all changes
-    await git(worktreePath, ["add", "-A"]);
-
-    // Commit
-    try {
-      await git(worktreePath, ["commit", "-m", message]);
-    } catch (error) {
-      // If nothing to commit, just get the current HEAD
-      const head = await git(worktreePath, ["rev-parse", "HEAD"]);
-      return head.stdout.trim();
-    }
-
-    const pushArgs = ["push", "-u", "origin", `HEAD:refs/heads/${branchName}`];
-    try {
-      // Push detached HEAD explicitly to the target branch name.
-      await git(worktreePath, pushArgs);
-    } catch (error) {
-      const errText = error instanceof Error ? error.message : String(error);
-      const isNonFastForward = /non-fast-forward|fetch first|rejected/i.test(errText);
-      if (!isNonFastForward) {
-        throw error;
-      }
-
-      // Another process likely updated the same remote branch.
-      // Rebase our commit on top of latest remote branch and retry once.
-      try {
-        await git(worktreePath, ["fetch", "origin", branchName]);
-        await git(worktreePath, ["rebase", `origin/${branchName}`]);
-      } catch (rebaseError) {
-        // Best effort cleanup before surfacing a clearer failure.
-        await git(worktreePath, ["rebase", "--abort"]).catch(() => undefined);
-        const rebaseText = rebaseError instanceof Error ? rebaseError.message : String(rebaseError);
-        throw new Error(
-          `Push to '${branchName}' was non-fast-forward and automatic rebase failed: ${rebaseText}`
-        );
-      }
-
-      await git(worktreePath, pushArgs);
-    }
-
-    // Return commit SHA
-    const head = await git(worktreePath, ["rev-parse", "HEAD"]);
-    return head.stdout.trim();
   }
 
   private assertAutomationPushAllowed(branchName: string, operation: string): void {
