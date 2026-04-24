@@ -111,8 +111,12 @@ function buildArgs(cwd: string, model: string): string[] {
   return [
     "-p",
     "--output-format",
-    "text",
+    "stream-json",
+    "--include-partial-messages",
+    "--verbose",
     "--dangerously-skip-permissions",
+    "--permission-mode",
+    "bypassPermissions",
     "--add-dir",
     cwd,
     "--model",
@@ -223,6 +227,75 @@ function tryExtractJson(raw: string): any {
   if (fallback != null) return fallback;
   if (lastError) throw lastError;
   throw new Error("Z AI Claude output did not contain a valid final JSON object.");
+}
+
+function extractTextFromClaudeEvent(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (!value || typeof value !== "object") return [];
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => extractTextFromClaudeEvent(item));
+  }
+
+  const record = value as Record<string, unknown>;
+  const texts: string[] = [];
+
+  if (typeof record.text === "string") texts.push(record.text);
+  if (typeof record.content === "string") texts.push(record.content);
+  if (typeof record.message === "string") texts.push(record.message);
+
+  if (Array.isArray(record.content)) {
+    texts.push(...extractTextFromClaudeEvent(record.content));
+  }
+  if (record.message && typeof record.message === "object") {
+    texts.push(...extractTextFromClaudeEvent(record.message));
+  }
+  if (record.delta && typeof record.delta === "object") {
+    texts.push(...extractTextFromClaudeEvent(record.delta));
+  }
+  if (record.result && typeof record.result === "object") {
+    texts.push(...extractTextFromClaudeEvent(record.result));
+  }
+
+  return texts;
+}
+
+function summarizeClaudeToolEvent(event: Record<string, unknown>): { kind: "tool_call" | "tool_result" | "status"; text: string } | null {
+  const type = typeof event.type === "string" ? event.type : "";
+  const subtype = typeof event.subtype === "string" ? event.subtype : "";
+  const toolName = typeof event.tool_name === "string"
+    ? event.tool_name
+    : typeof event.name === "string"
+      ? event.name
+      : typeof (event.tool as Record<string, unknown> | undefined)?.name === "string"
+        ? String((event.tool as Record<string, unknown>).name)
+        : "";
+
+  if (type.includes("tool_use") || type.includes("tool_call") || subtype.includes("tool_use") || subtype.includes("tool_call")) {
+    const args = event.input ?? event.arguments ?? event.args ?? {};
+    return {
+      kind: "tool_call",
+      text: `${toolName || "tool"}(${JSON.stringify(args).slice(0, 500)})`
+    };
+  }
+
+  if (type.includes("tool_result") || subtype.includes("tool_result")) {
+    const resultText = extractTextFromClaudeEvent(event).join("");
+    return {
+      kind: "tool_result",
+      text: resultText || `${toolName || "tool"} completed`
+    };
+  }
+
+  if (type.includes("status") || subtype.includes("status")) {
+    const statusText = extractTextFromClaudeEvent(event).join("");
+    return {
+      kind: "status",
+      text: statusText || type || subtype
+    };
+  }
+
+  return null;
 }
 
 export function formatZaiFailure(error: unknown): string {
@@ -491,9 +564,38 @@ export class ZaiRunner {
       child.stdout?.setEncoding("utf8");
       child.stderr?.setEncoding("utf8");
 
+      let stdoutBuffer = "";
       child.stdout?.on("data", (chunk: string) => {
-        chunks.push(chunk);
-        emit("assistant", chunk);
+        stdoutBuffer += chunk;
+        const lines = stdoutBuffer.split(/\r?\n/u);
+        stdoutBuffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+
+          try {
+            const event = JSON.parse(trimmed) as Record<string, unknown>;
+            const toolEvent = summarizeClaudeToolEvent(event);
+            if (toolEvent) {
+              emit(toolEvent.kind, toolEvent.text);
+              continue;
+            }
+
+            const type = typeof event.type === "string" ? event.type : "";
+            const maybeText = extractTextFromClaudeEvent(event).join("");
+            if (maybeText) {
+              chunks.push(maybeText);
+              emit(type.includes("thinking") ? "thinking" : "assistant", maybeText);
+              continue;
+            }
+
+            emit("status", trimmed);
+          } catch {
+            chunks.push(line);
+            emit("assistant", line);
+          }
+        }
       });
       child.stderr?.on("data", (chunk: string) => {
         const kind = /think|reason/i.test(chunk) ? "thinking" : "stderr";
@@ -503,6 +605,25 @@ export class ZaiRunner {
         reject(new ZaiLaunchError("spawn_error", `Z AI Claude spawn failed: ${(error as Error).message}`, launch.info, { cause: error }))
       );
       child.on("close", (code) => {
+        const trailing = stdoutBuffer.trim();
+        if (trailing) {
+          try {
+            const event = JSON.parse(trailing) as Record<string, unknown>;
+            const toolEvent = summarizeClaudeToolEvent(event);
+            if (toolEvent) {
+              emit(toolEvent.kind, toolEvent.text);
+            } else {
+              const maybeText = extractTextFromClaudeEvent(event).join("");
+              if (maybeText) {
+                chunks.push(maybeText);
+                emit("assistant", maybeText);
+              }
+            }
+          } catch {
+            chunks.push(trailing);
+            emit("assistant", trailing);
+          }
+        }
         emit("status", code === 0 ? "completed" : `failed (${code ?? 1})`, true);
         if (code === 0) {
           resolve();

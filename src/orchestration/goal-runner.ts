@@ -597,11 +597,27 @@ export class GoalRunner {
   private async runEpicDecoder(epic: EpicRecord, runId: string): Promise<GoalDecomposition> {
     const ragCtx = await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`);
     const projectStructure = await ensureProjectStructureFile(epic.targetDir).catch(() => null);
-    if (this.gateway.runEpicDecoderInWorkspace && (this.gateway.models.epicDecoder === "codex-cli" || this.gateway.models.epicDecoder === "qwen-cli" || this.gateway.models.epicDecoder === "gemini-cli")) {
+    const configuredModel = this.gateway.models.epicDecoder;
+    if (
+      this.gateway.runEpicDecoderInWorkspace &&
+      (
+        configuredModel === "codex-cli" ||
+        configuredModel === "qwen-cli" ||
+        configuredModel === "gemini-cli" ||
+        configuredModel.startsWith("zai:") ||
+        configuredModel.startsWith("mediated:")
+      )
+    ) {
       try {
         const result = await this.gateway.runEpicDecoderInWorkspace({ cwd: epic.targetDir, prompt: epicDecoderToolingPrompt(epic, ragCtx, projectStructure), runId, epicId: epic.id, onStream: (e) => this.recordAgentStream(e) });
         return result;
       } catch (err) { console.warn(`Decoder failed: ${err}`); }
+    }
+    if (this.gateway.runEpicDecoderOpenCode && configuredModel.startsWith("opencode:")) {
+      try {
+        const result = await this.gateway.runEpicDecoderOpenCode({ cwd: epic.targetDir, prompt: epicDecoderToolingPrompt(epic, ragCtx, projectStructure), runId, epicId: epic.id, onStream: (e) => this.recordAgentStream(e) });
+        return result;
+      } catch (err) { console.warn(`OpenCode decoder failed: ${err}`); }
     }
     return this.gateway.getGoalDecomposition(epicDecoderPrompt(epic));
   }
