@@ -513,6 +513,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
   ],
   tester: [
     { id: "skip", label: "Skip Tester", description: "Bypass tester step and mark tests as skipped" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
     { id: "mediated:gemma4:e4b", label: "Mediated (gemma4:e4b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" }
@@ -521,6 +522,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "gemini-cli", label: "Gemini CLI", description: "Workspace-aware local Gemini CLI execution" },
     { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware local Codex CLI execution" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
     { id: "mediated:qwen3.5:9b", label: "Mediated (qwen3.5:9b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:e4b", label: "Mediated (gemma4:e4b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
@@ -537,6 +539,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware local Codex CLI execution" },
     { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
+    { id: "zai:glm-4.7", label: "Z AI (glm-4.7)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3.6:27b", label: "Mediated (qwen3.6:27b)", description: "Local tool execution via Ollama + harness" },
