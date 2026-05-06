@@ -665,8 +665,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     const toolContext = this.buildToolContext(input.cwd, "reviewer");
     const harness = new MediatedAgentHarness({
-      baseURL: `${this.ollamaBaseURL}/v1`,
-      apiKey: "ollama",
+      baseURL: this.ollamaBaseURL,
+      apiKey: "",
       model,
       braveApiKey: this.braveApiKey,
       toolContext,
@@ -800,8 +800,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const toolContext = this.buildToolContext(input.cwd, "epicDecoder", { ragIndexId: input.ragIndexId, db: input.db });
 
     const harness = new MediatedAgentHarness({
-      baseURL: `${this.ollamaBaseURL}/v1`,
-      apiKey: "ollama",
+      baseURL: this.ollamaBaseURL,
+      apiKey: "",
       model,
       braveApiKey: this.braveApiKey,
       toolContext,
@@ -896,8 +896,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const toolContext = this.buildToolContext(input.cwd, "epicReviewer", { ragIndexId: input.ragIndexId, db: input.db });
 
     const harness = new MediatedAgentHarness({
-      baseURL: `${this.ollamaBaseURL}/v1`,
-      apiKey: "ollama",
+      baseURL: this.ollamaBaseURL,
+      apiKey: "",
       model,
       braveApiKey: this.braveApiKey,
       toolContext,
@@ -1002,8 +1002,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : []);
     const harness = new MediatedAgentHarness({
-      baseURL: `${this.ollamaBaseURL}/v1`,
-      apiKey: "ollama",
+      baseURL: this.ollamaBaseURL,
+      apiKey: "",
       model,
       braveApiKey: this.braveApiKey,
       toolContext,
@@ -1112,8 +1112,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : []);
     const harness = new MediatedAgentHarness({
-      baseURL: `${this.ollamaBaseURL}/v1`,
-      apiKey: "ollama",
+      baseURL: this.ollamaBaseURL,
+      apiKey: "",
       model,
       braveApiKey: this.braveApiKey,
       toolContext,
@@ -1309,8 +1309,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const toolContext = this.buildToolContext(input.cwd, "tester");
 
     const harness = new MediatedAgentHarness({
-      baseURL: `${this.ollamaBaseURL}/v1`,
-      apiKey: "ollama",
+      baseURL: this.ollamaBaseURL,
+      apiKey: "",
       model,
       braveApiKey: this.braveApiKey,
       toolContext,
@@ -1414,8 +1414,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
   ): Promise<OpenCodeBuilderResult> {
     const toolContext = this.buildToolContext(input.cwd, "builder");
     const harness = new MediatedAgentHarness({
-      baseURL: `${this.ollamaBaseURL}/v1`,
-      apiKey: "ollama",
+      baseURL: this.ollamaBaseURL,
+      apiKey: "",
       model,
       braveApiKey: this.braveApiKey,
       toolContext,

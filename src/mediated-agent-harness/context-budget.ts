@@ -150,7 +150,6 @@ export async function summarizeMessages(
   windowTokens: number,
   model: string,
   baseURL: string,
-  apiKey: string,
   state: CompactionState,
 ): Promise<CompactionResult> {
   const before = estimateMessagesTokens(messages);
@@ -172,12 +171,11 @@ export async function summarizeMessages(
   // Build summarization prompt
   const historyText = formatMessagesForSummary(oldHistory);
 
-  // Call the model to summarize
-  const summaryResponse = await fetch(`${baseURL}/chat/completions`, {
+  // Call the model to summarize via Ollama native /api/chat
+  const summaryResponse = await fetch(`${baseURL}/api/chat`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
     },
     signal: AbortSignal.timeout(120_000),
     body: JSON.stringify({
@@ -187,14 +185,16 @@ export async function summarizeMessages(
         { role: "user", content: historyText },
       ],
       stream: false,
-      temperature: 0.3,
+      options: {
+        temperature: 0.3,
+      },
     }),
   });
 
   let summaryText: string;
   if (summaryResponse.ok) {
-    const payload = await summaryResponse.json() as { choices?: { message?: { content?: string } }[] };
-    summaryText = payload.choices?.[0]?.message?.content?.trim() ?? "";
+    const payload = await summaryResponse.json() as { message?: { content?: string } };
+    summaryText = payload.message?.content?.trim() ?? "";
   } else {
     // If summarization fails, fall back to aggressive truncation of old history
     const errorText = await summaryResponse.text().catch(() => "unknown error");

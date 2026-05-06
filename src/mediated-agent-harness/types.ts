@@ -69,6 +69,7 @@ export interface StreamState {
 
 export interface MediatedHarnessConfig {
   baseURL?: string;
+  /** @deprecated Not needed for Ollama native API */
   apiKey?: string;
   model: string;
   cwd: string;
@@ -169,5 +170,35 @@ export interface ToolCallDelta {
   function?: {
     name?: string;
     arguments?: string;
+  };
+}
+
+// ─── Ollama native API types ─────────────────────────────────────────────────
+
+export interface OllamaChatResponse {
+  model: string;
+  created_at: string;
+  message: OllamaChatMessage;
+  done: boolean;
+  done_reason?: string;
+  total_duration?: number;
+  load_duration?: number;
+  prompt_eval_count?: number;
+  prompt_eval_duration?: number;
+  eval_count?: number;
+  eval_duration?: number;
+}
+
+export interface OllamaChatMessage {
+  role: string;
+  content: string;
+  thinking?: string;
+  tool_calls?: OllamaNativeToolCall[];
+}
+
+export interface OllamaNativeToolCall {
+  function: {
+    name: string;
+    arguments: Record<string, unknown>;
   };
 }

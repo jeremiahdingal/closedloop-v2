@@ -179,8 +179,8 @@ async function main(): Promise<void> {
   };
 
   const harness = new MediatedAgentHarness({
-    baseURL: `${OLLAMA_BASE}/v1`,
-    apiKey: "ollama",
+    baseURL: OLLAMA_BASE,
+    apiKey: "",
     model: MODEL,
     braveApiKey: process.env.BRAVE_API_KEY,
     toolContext

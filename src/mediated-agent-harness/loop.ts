@@ -56,8 +56,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     toolContext,
   } = input;
 
-  const baseURL = config.baseURL ?? "http://localhost:11434/v1";
-  const apiKey = config.apiKey ?? "ollama";
+  const baseURL = config.baseURL ?? "http://localhost:11434";
   const toolMode = config.toolMode ?? "native";
   const maxIterations = config.maxIterations ?? 80;
   const timeoutMs = config.timeoutMs ?? 900_000;
@@ -201,7 +200,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         const passNum = stallState.compaction.passCount + 1;
         emit({ kind: "text", text: `[context] Budget at ${Math.round(budget.usedFraction * 100)}%, summarizing history (pass ${passNum})...` });
 
-        const result = await summarizeMessages(messages, numCtx, config.model, baseURL, apiKey, stallState.compaction);
+        const result = await summarizeMessages(messages, numCtx, config.model, baseURL, stallState.compaction);
         if (result.removedTokens > 0) {
           messages.length = 0;
           messages.push(...result.messages);
@@ -220,22 +219,18 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
     const effectiveToolMode = stallState.toolModeOverride ?? toolMode;
 
-    // Make streaming request
+    // Make streaming request to Ollama native /api/chat
     let response: Response;
     try {
-      response = await fetch(`${baseURL}/chat/completions`, {
+      response = await fetch(`${baseURL}/api/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
         },
         signal: AbortSignal.timeout(900_000),
         body: JSON.stringify({
           model: config.model,
-          messages: messages.map((message) => ({
-            ...message,
-            content: message.content ?? "",
-          })),
+          messages: messages.map(convertToOllamaMessage),
           ...(effectiveToolMode === "native" ? {
             tools: tools.map(t => ({
               type: t.type,
@@ -247,10 +242,12 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
             })),
           } : {}),
           stream: true,
-          temperature,
-          top_p: topP,
-          top_k: topK,
-          num_ctx: numCtx,
+          options: {
+            temperature,
+            top_p: topP,
+            top_k: topK,
+            num_ctx: numCtx,
+          },
         }),
       });
     } catch (err) {
@@ -904,4 +901,44 @@ function parseXmlParameterValue(toolName: string, paramName: string, rawValue: s
   }
 
   return value;
+}
+
+// ─── Ollama message conversion ────────────────────────────────────────────────
+
+function convertToOllamaMessage(msg: ChatMessage): Record<string, unknown> {
+  if (msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0) {
+    return {
+      role: "assistant",
+      content: msg.content ?? "",
+      tool_calls: msg.tool_calls.map(tc => ({
+        function: {
+          name: tc.function.name,
+          arguments: parseArgsToObject(tc.function.arguments),
+        },
+      })),
+    };
+  }
+
+  if (msg.role === "tool") {
+    return {
+      role: "tool",
+      content: msg.content ?? "",
+      tool_call_id: msg.tool_call_id,
+    };
+  }
+
+  return {
+    role: msg.role,
+    content: msg.content ?? "",
+  };
+}
+
+function parseArgsToObject(argsStr: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(argsStr);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch {}
+  return {};
 }

@@ -77,8 +77,8 @@ console.log(`Task: ${TASK.slice(0, 80)}...`);
 console.log(`Ollama: ${OLLAMA_BASE}\n`);
 
 const harness = new MediatedAgentHarness({
-  baseURL: `${OLLAMA_BASE}/v1`,
-  apiKey: "ollama",
+  baseURL: OLLAMA_BASE,
+  apiKey: "",
   model: MODEL,
   braveApiKey: process.env.BRAVE_API_KEY,
   toolContext,

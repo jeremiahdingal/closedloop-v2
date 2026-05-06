@@ -48,49 +48,55 @@ function createMockContext(cwd: string): ToolExecutionContext {
   };
 }
 
-function makeSSE(data: object): string {
-  return `data: ${JSON.stringify(data)}`;
-}
-
 function makeToolCallChunk(opts: {
   id: string;
   name: string;
   args: Record<string, unknown>;
 }): string {
-  return makeSSE({
-    choices: [{
-      delta: {
-        tool_calls: [{
-          index: 0,
-          id: opts.id,
-          type: "function",
-          function: {
-            name: opts.name,
-            arguments: JSON.stringify(opts.args),
-          },
-        }],
-      },
-    }],
+  return JSON.stringify({
+    model: "test",
+    created_at: "2026-01-01T00:00:00Z",
+    message: {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        function: { name: opts.name, arguments: opts.args },
+      }],
+    },
+    done: false,
   });
 }
 
 function makeTextChunk(text: string): string {
-  return makeSSE({ choices: [{ delta: { content: text } }] });
+  return JSON.stringify({
+    model: "test",
+    created_at: "2026-01-01T00:00:00Z",
+    message: { role: "assistant", content: text },
+    done: false,
+  });
 }
 
-function createMockServer(sseLines: string[]): Promise<{ server: Server; port: number }> {
+const DONE_LINE = JSON.stringify({
+  model: "test",
+  created_at: "2026-01-01T00:00:00Z",
+  message: { role: "assistant", content: "" },
+  done: true,
+  prompt_eval_count: 10,
+  eval_count: 5,
+});
+
+function createMockServer(ndjsonLines: string[]): Promise<{ server: Server; port: number }> {
   return new Promise((resolve) => {
     const server = createServer((req, res) => {
-      if (req.method === "POST" && req.url?.endsWith("/chat/completions")) {
-        // Drain the request body
+      if (req.method === "POST" && req.url?.endsWith("/api/chat")) {
         let body = "";
         req.on("data", (chunk) => { body += chunk; });
         req.on("end", () => {
-          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.writeHead(200, { "Content-Type": "application/x-ndjson" });
           let i = 0;
           const send = () => {
-            if (i < sseLines.length) {
-              res.write(sseLines[i] + "\n");
+            if (i < ndjsonLines.length) {
+              res.write(ndjsonLines[i] + "\n");
               i++;
               setTimeout(send, 1);
             } else {
@@ -115,11 +121,11 @@ function createMockServer(sseLines: string[]): Promise<{ server: Server; port: n
 test("loop handles model that returns text directly (no tools)", async () => {
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
 
-  const sseLines = [
+  const ndjsonLines = [
     makeTextChunk('{"summary":"done","tickets":[]}'),
-    "data: [DONE]",
+    DONE_LINE,
   ];
-  const { server, port } = await createMockServer(sseLines);
+  const { server, port } = await createMockServer(ndjsonLines);
 
   try {
     const events: any[] = [];
@@ -127,8 +133,8 @@ test("loop handles model that returns text directly (no tools)", async () => {
       systemPrompt: "You are a test agent.",
       userPrompt: "Do something.",
       config: {
-        baseURL: `http://localhost:${port}/v1`,
-        apiKey: "test",
+        baseURL: `http://localhost:${port}`,
+        apiKey: "",
         model: "test-model",
         cwd: tmpDir,
         temperature: 0,
@@ -151,15 +157,15 @@ test("loop handles model that returns text directly (no tools)", async () => {
 test("loop handles finish tool call and terminates", async () => {
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
 
-  const sseLines = [
+  const ndjsonLines = [
     makeToolCallChunk({
       id: "call_1",
       name: "finish",
       args: { summary: "analysis complete", result: '{"ok":true}' },
     }),
-    "data: [DONE]",
+    DONE_LINE,
   ];
-  const { server, port } = await createMockServer(sseLines);
+  const { server, port } = await createMockServer(ndjsonLines);
 
   try {
     const events: any[] = [];
@@ -167,8 +173,8 @@ test("loop handles finish tool call and terminates", async () => {
       systemPrompt: "Test",
       userPrompt: "Analyze.",
       config: {
-        baseURL: `http://localhost:${port}/v1`,
-        apiKey: "test",
+        baseURL: `http://localhost:${port}`,
+        apiKey: "",
         model: "test-model",
         cwd: tmpDir,
         temperature: 0,
@@ -195,32 +201,29 @@ test("loop executes tools and feeds results back in multi-step flow", async () =
   await writeFile(path.join(tmpDir, "hello.txt"), "Hello from file", "utf-8");
 
   let requestCount = 0;
-  // We need to create a server that handles each request differently
   const server = await new Promise<{ server: Server; port: number }>((resolve) => {
     const srv = createServer((req, res) => {
-      if (req.method === "POST" && req.url?.endsWith("/chat/completions")) {
+      if (req.method === "POST" && req.url?.endsWith("/api/chat")) {
         let body = "";
         req.on("data", (chunk) => { body += chunk; });
         req.on("end", () => {
           requestCount++;
-          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.writeHead(200, { "Content-Type": "application/x-ndjson" });
 
           if (requestCount === 1) {
-            // First request: model calls read_file
             res.write(makeToolCallChunk({
               id: "call_1",
               name: "read_file",
               args: { path: "hello.txt" },
             }) + "\n");
-            res.write("data: [DONE]\n");
+            res.write(DONE_LINE + "\n");
           } else {
-            // Second request: model calls finish
             res.write(makeToolCallChunk({
               id: "call_2",
               name: "finish",
               args: { summary: "read file", result: '{"content":"found"}' },
             }) + "\n");
-            res.write("data: [DONE]\n");
+            res.write(DONE_LINE + "\n");
           }
           res.end();
         });
@@ -239,8 +242,8 @@ test("loop executes tools and feeds results back in multi-step flow", async () =
       systemPrompt: "Test",
       userPrompt: "Read hello.txt and report.",
       config: {
-        baseURL: `http://localhost:${resolvedServer.port}/v1`,
-        apiKey: "test",
+        baseURL: `http://localhost:${resolvedServer.port}`,
+        apiKey: "",
         model: "test-model",
         cwd: tmpDir,
         temperature: 0,
@@ -270,11 +273,11 @@ test("loop requires builder role to finish through the tool interface", async ()
   let requestCount = 0;
   const server = await new Promise<{ server: Server; port: number }>((resolve) => {
     const srv = createServer((req, res) => {
-      if (req.method === "POST" && req.url?.endsWith("/chat/completions")) {
+      if (req.method === "POST" && req.url?.endsWith("/api/chat")) {
         req.on("data", () => {});
         req.on("end", () => {
           requestCount++;
-          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.writeHead(200, { "Content-Type": "application/x-ndjson" });
 
           if (requestCount === 1) {
             res.write(makeTextChunk('{"summary":"done","filesChanged":["src/app.ts"]}') + "\n");
@@ -286,7 +289,7 @@ test("loop requires builder role to finish through the tool interface", async ()
             }) + "\n");
           }
 
-          res.write("data: [DONE]\n");
+          res.write(DONE_LINE + "\n");
           res.end();
         });
       } else {
@@ -304,8 +307,8 @@ test("loop requires builder role to finish through the tool interface", async ()
       systemPrompt: "You are a builder.",
       userPrompt: "Make a change.",
       config: {
-        baseURL: `http://localhost:${server.port}/v1`,
-        apiKey: "test",
+        baseURL: `http://localhost:${server.port}`,
+        apiKey: "",
         model: "test-model",
         cwd: tmpDir,
         role: "builder",
@@ -332,11 +335,11 @@ test("loop supports direct-chat style builder history with tool completion", asy
   let requestCount = 0;
   const server = await new Promise<{ server: Server; port: number }>((resolve) => {
     const srv = createServer((req, res) => {
-      if (req.method === "POST" && req.url?.endsWith("/chat/completions")) {
+      if (req.method === "POST" && req.url?.endsWith("/api/chat")) {
         req.on("data", () => {});
         req.on("end", () => {
           requestCount++;
-          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.writeHead(200, { "Content-Type": "application/x-ndjson" });
 
           if (requestCount === 1) {
             res.write(makeToolCallChunk({
@@ -352,7 +355,7 @@ test("loop supports direct-chat style builder history with tool completion", asy
             }) + "\n");
           }
 
-          res.write("data: [DONE]\n");
+          res.write(DONE_LINE + "\n");
           res.end();
         });
       } else {
@@ -374,8 +377,8 @@ test("loop supports direct-chat style builder history with tool completion", asy
         { role: "user", content: "Please inspect package.json and tell me what you found." },
       ],
       config: {
-        baseURL: `http://localhost:${server.port}/v1`,
-        apiKey: "test",
+        baseURL: `http://localhost:${server.port}`,
+        apiKey: "",
         model: "test-model",
         cwd: tmpDir,
         role: "builder",
@@ -403,23 +406,23 @@ test("loop executes strict JSON tool-call text fallback", async () => {
   let requestCount = 0;
   const server = await new Promise<{ server: Server; port: number }>((resolve) => {
     const srv = createServer((req, res) => {
-      if (req.method === "POST" && req.url?.endsWith("/chat/completions")) {
+      if (req.method === "POST" && req.url?.endsWith("/api/chat")) {
         let body = "";
         req.on("data", (chunk) => { body += chunk; });
         req.on("end", () => {
           requestCount++;
-          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.writeHead(200, { "Content-Type": "application/x-ndjson" });
 
           if (requestCount === 1) {
             res.write(makeTextChunk('{"tool_name":"read_file","arguments":{"path":"hello.txt"}}') + "\n");
-            res.write("data: [DONE]\n");
+            res.write(DONE_LINE + "\n");
           } else {
             res.write(makeToolCallChunk({
               id: "call_2",
               name: "finish",
               args: { summary: "done", result: '{"ok":true}' },
             }) + "\n");
-            res.write("data: [DONE]\n");
+            res.write(DONE_LINE + "\n");
           }
           res.end();
         });
@@ -437,8 +440,8 @@ test("loop executes strict JSON tool-call text fallback", async () => {
       systemPrompt: "Test",
       userPrompt: "Read hello.txt and report.",
       config: {
-        baseURL: `http://localhost:${resolvedServer.port}/v1`,
-        apiKey: "test",
+        baseURL: `http://localhost:${resolvedServer.port}`,
+        apiKey: "",
         model: "test-model",
         cwd: tmpDir,
         temperature: 0,
@@ -460,19 +463,19 @@ test("loop executes strict JSON tool-call text fallback", async () => {
 test("loop executes batched JSON tool-call payloads", async () => {
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
 
-  const sseLines = [
+  const ndjsonLines = [
     makeTextChunk('{"tool_calls":[{"name":"list_dir","arguments":{"path":"."}},{"name":"finish","arguments":{"summary":"done","result":"{\\"ok\\":true}"}}]}'),
-    "data: [DONE]",
+    DONE_LINE,
   ];
-  const { server, port } = await createMockServer(sseLines);
+  const { server, port } = await createMockServer(ndjsonLines);
 
   try {
     const result = await runMediatedLoop({
       systemPrompt: "Test",
       userPrompt: "List the directory then finish.",
       config: {
-        baseURL: `http://localhost:${port}/v1`,
-        apiKey: "test",
+        baseURL: `http://localhost:${port}`,
+        apiKey: "",
         model: "test-model",
         cwd: tmpDir,
         temperature: 0,
@@ -501,8 +504,8 @@ test("loop handles model connection error", async () => {
           systemPrompt: "Test",
           userPrompt: "Test.",
           config: {
-            baseURL: "http://localhost:19999/v1",
-            apiKey: "test",
+            baseURL: "http://localhost:19999",
+            apiKey: "",
             model: "test-model",
             cwd: tmpDir,
             temperature: 0,
@@ -520,11 +523,11 @@ test("loop handles model connection error", async () => {
 test("loop rejects non-JSON text response", async () => {
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
 
-  const sseLines = [
+  const ndjsonLines = [
     makeTextChunk("I'm done! Here are my results."),
-    "data: [DONE]",
+    DONE_LINE,
   ];
-  const { server, port } = await createMockServer(sseLines);
+  const { server, port } = await createMockServer(ndjsonLines);
 
   try {
     // Non-JSON text should be fed back asking for finish
@@ -535,8 +538,8 @@ test("loop rejects non-JSON text response", async () => {
           systemPrompt: "Test",
           userPrompt: "Do something.",
           config: {
-            baseURL: `http://localhost:${port}/v1`,
-            apiKey: "test",
+            baseURL: `http://localhost:${port}`,
+            apiKey: "",
             model: "test-model",
             cwd: tmpDir,
             temperature: 0,

@@ -31,9 +31,9 @@ async function summarizeConversation(model: string, messages: ChatMessage[]): Pr
   const builderModel = rawModel || adapter;
   const actualModel = builderModel.startsWith("mediated:") ? builderModel.slice(9) : builderModel;
   
-  const baseURL = "http://localhost:11434/v1"; 
-  
-  const prompt = `Please summarize the following conversation history between a User and a Local Builder. 
+  const baseURL = "http://localhost:11434";
+
+  const prompt = `Please summarize the following conversation history between a User and a Local Builder.
 Focus on:
 1. The main goal of the session.
 2. Important facts discovered about the repository.
@@ -48,19 +48,19 @@ ${messages.map(m => `[${m.role.toUpperCase()}] ${m.content || (m.tool_calls ? "C
 `;
 
   try {
-    const response = await fetch(`${baseURL}/chat/completions`, {
+    const response = await fetch(`${baseURL}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: actualModel,
         messages: [{ role: "user", content: prompt }],
         stream: false,
-        temperature: 0.3,
+        options: { temperature: 0.3 },
       })
     });
     if (!response.ok) throw new Error(`Summary failed: ${response.status}`);
-    const data: any = await response.json();
-    return data.choices[0].message.content;
+    const data = await response.json() as { message?: { content?: string } };
+    return data.message?.content ?? "";
   } catch (err) {
     console.error("Auto-compression summary failed:", err);
     return "Summarization failed. Previous history omitted due to context limits.";

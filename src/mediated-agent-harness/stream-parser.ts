@@ -1,21 +1,18 @@
 import type {
-  ChatCompletionChunk,
   CompleteToolCall,
+  OllamaChatResponse,
   StreamState,
-  ToolCallDelta,
   Usage,
 } from "./types.ts";
 
-interface AccumulatedToolDelta {
-  index: number;
-  id: string | null;
-  name: string | null;
+interface AccumulatedToolCall {
+  name: string;
   argsBuffer: string;
 }
 
 export class StreamParser {
   private content = "";
-  private toolDeltas = new Map<number, AccumulatedToolDelta>();
+  private toolCalls = new Map<number, AccumulatedToolCall>();
   private done = false;
   private usage: Usage | null = null;
   private thinking = "";
@@ -24,90 +21,95 @@ export class StreamParser {
 
   feed(rawLine: string): void {
     const line = rawLine.trim();
-
     if (!line) return;
 
-    // Handle [DONE] sentinel
-    if (line === "data: [DONE]") {
-      this.done = true;
-      return;
-    }
+    // Accumulate into buffer and try to parse complete JSON objects
+    this.buffer += line;
 
-    // Handle data: prefix
-    let jsonStr = line;
-    if (line.startsWith("data: ")) {
-      jsonStr = line.slice(6);
-    } else if (line.startsWith("data:")) {
-      jsonStr = line.slice(5);
-    } else {
-      // Not an SSE data line — might be a comment line or partial chunk
-      return;
-    }
-
-    jsonStr = jsonStr.trim();
-    if (!jsonStr) return;
-
-    let chunk: ChatCompletionChunk;
+    let chunk: OllamaChatResponse;
     try {
-      chunk = JSON.parse(jsonStr);
+      chunk = JSON.parse(this.buffer);
+      this.buffer = "";
     } catch {
-      // Partial or malformed JSON — buffer it for retry
-      this.buffer += jsonStr;
-      try {
-        chunk = JSON.parse(this.buffer);
+      // Might be incomplete JSON — keep buffering.
+      // But if the buffer is getting very large without parsing, clear it.
+      if (this.buffer.length > 1_000_000) {
         this.buffer = "";
-      } catch {
-        return; // still incomplete
+      }
+      return;
+    }
+
+    // Handle done flag
+    if (chunk.done) {
+      this.done = true;
+
+      // Extract usage from final chunk
+      if (chunk.prompt_eval_count != null || chunk.eval_count != null) {
+        const promptTokens = chunk.prompt_eval_count ?? 0;
+        const completionTokens = chunk.eval_count ?? 0;
+        this.usage = {
+          promptTokens,
+          completionTokens,
+          totalTokens: promptTokens + completionTokens,
+        };
       }
     }
 
-    // Capture usage from final chunk (some servers put it here)
-    if (chunk.usage) {
-      this.usage = chunk.usage;
+    const message = chunk.message;
+    if (!message) return;
+
+    // Accumulate content
+    if (message.content) {
+      this.accumulateContent(message.content);
     }
 
-    // Process choices
-    if (!chunk.choices || chunk.choices.length === 0) return;
-
-    const choice = chunk.choices[0];
-
-    // Handle finish_reason
-    if (choice.finish_reason === "stop" || choice.finish_reason === "tool_calls") {
-      // Stream is ending — continue processing the delta though
+    // Accumulate native thinking field
+    if (message.thinking) {
+      this.thinking += message.thinking;
     }
 
-    const delta = choice.delta;
-    if (!delta) return;
+    // Accumulate tool calls (Ollama sends complete tool calls per line)
+    if (message.tool_calls && Array.isArray(message.tool_calls)) {
+      for (let i = 0; i < message.tool_calls.length; i++) {
+        const tc = message.tool_calls[i];
+        if (!tc.function?.name) continue;
 
-    // Accumulate thinking text (some models use <think> tags or reasoning_content)
-    if (delta.content !== undefined && delta.content !== null) {
-      this.accumulateContent(delta.content);
-    }
+        const argsObj = tc.function.arguments ?? {};
+        const argsStr = typeof argsObj === "string" ? argsObj : JSON.stringify(argsObj);
 
-    // Accumulate tool call deltas
-    if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-      for (const tc of delta.tool_calls) {
-        this.accumulateToolDelta(tc);
+        // Merge with existing entry at this index
+        const existing = this.toolCalls.get(i);
+        if (existing) {
+          // If we already have args and new args are non-empty, append
+          if (argsStr && argsStr !== "{}") {
+            existing.argsBuffer += argsStr;
+          }
+        } else {
+          this.toolCalls.set(i, {
+            name: tc.function.name,
+            argsBuffer: argsStr,
+          });
+        }
       }
     }
   }
 
   private accumulateContent(text: string): void {
-    // Detect thinking tags — models vary in how they emit reasoning
-    if (text.includes("<think>")) {
+    // Detect thinking tags — some models still use tags even with native thinking
+    if (text.includes("<think")) {
       this.inThinking = true;
-      const afterThink = text.split("<think>").pop() ?? "";
+      const afterThink = text.split("<think").pop() ?? "";
       this.thinking += afterThink;
       return;
     }
-    if (text.includes("</think>")) {
+    if (text.includes("</think")) {
       this.inThinking = false;
-      const beforeClose = text.split("</think>")[0] ?? "";
+      const beforeClose = text.split("</think")[0] ?? "";
       this.thinking += beforeClose;
-      // Content after </think> is regular content
-      const parts = text.split("</think>");
+      // Content after </think is regular content
+      const parts = text.split("</think");
       if (parts.length > 1) {
-        this.content += parts.slice(1).join("</think>");
+        this.content += parts.slice(1).join("</think");
       }
       return;
     }
@@ -119,43 +121,11 @@ export class StreamParser {
     }
   }
 
-  private accumulateToolDelta(tc: ToolCallDelta): void {
-    const idx = tc.index;
-    let existing = this.toolDeltas.get(idx);
-
-    if (!existing) {
-      existing = {
-        index: idx,
-        id: tc.id ?? null,
-        name: tc.function?.name ?? null,
-        argsBuffer: "",
-      };
-      this.toolDeltas.set(idx, existing);
-    }
-
-    // Merge id if not set yet
-    if (tc.id && !existing.id) {
-      existing.id = tc.id;
-    }
-
-    // Merge name if not set yet
-    if (tc.function?.name && !existing.name) {
-      existing.name = tc.function.name;
-    }
-
-    // Append argument fragments
-    if (tc.function?.arguments) {
-      existing.argsBuffer += tc.function.arguments;
-    }
-  }
-
   drain(): StreamState {
     const toolCalls: CompleteToolCall[] = [];
 
-    for (const delta of this.toolDeltas.values()) {
-      if (!delta.name) continue;
-
-      let args = delta.argsBuffer.trim();
+    for (const [idx, accumulated] of this.toolCalls.entries()) {
+      let args = accumulated.argsBuffer.trim();
       if (!args) {
         args = "{}";
       }
@@ -164,14 +134,12 @@ export class StreamParser {
       try {
         JSON.parse(args);
       } catch {
-        // Some models emit trailing commas or incomplete JSON
-        // Try basic repair: add closing braces/brackets
         args = this.attemptJsonRepair(args);
       }
 
       toolCalls.push({
-        id: delta.id ?? `call_${delta.index}`,
-        name: delta.name,
+        id: `call_${idx}`,
+        name: accumulated.name,
         arguments: args,
       });
     }
@@ -199,7 +167,7 @@ export class StreamParser {
 
   reset(): void {
     this.content = "";
-    this.toolDeltas.clear();
+    this.toolCalls.clear();
     this.done = false;
     this.usage = null;
     this.thinking = "";
@@ -224,7 +192,6 @@ export class StreamParser {
     // Add missing closing characters
     const diff = opens - closes;
     for (let i = 0; i < diff; i++) {
-      // Determine what to close based on the last unclosed opener
       const lastOpenBrace = repaired.lastIndexOf("{");
       const lastOpenBracket = repaired.lastIndexOf("[");
       if (lastOpenBrace > lastOpenBracket) {
@@ -246,7 +213,7 @@ export class StreamParser {
   }
 }
 
-export function parseSSELines(text: string): string[] {
+export function parseNDJSONLines(text: string): string[] {
   const lines: string[] = [];
   for (const line of text.split("\n")) {
     const trimmed = line.trim();

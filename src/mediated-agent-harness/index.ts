@@ -35,8 +35,8 @@ export class MediatedAgentHarness {
   private readonly toolContext: ToolExecutionContext;
 
   constructor(options: MediatedAgentHarnessOptions) {
-    this.baseURL = options.baseURL ?? "http://localhost:11434/v1";
-    this.apiKey = options.apiKey ?? "ollama";
+    this.baseURL = options.baseURL ?? "http://localhost:11434";
+    this.apiKey = options.apiKey ?? "";
     this.model = options.model;
     this.braveApiKey = options.braveApiKey;
     this.toolContext = options.toolContext;
