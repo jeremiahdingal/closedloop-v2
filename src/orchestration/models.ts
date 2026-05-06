@@ -55,12 +55,13 @@ const DEFAULT_TOP_P = 0.95;
 const DEFAULT_TOP_K = 64;
 
 function resolveOllamaContextWindow(model: string): number {
-  if (model.startsWith("glm-4.7-flash")) return 4096;
-  if (model.startsWith("qwen3.5:9b")) return 16384;
-  if (model.startsWith("qwen3.5:27b")) return 4096;
+  if (model.startsWith("glm-4.7-flash")) return 65536;
+  if (model.startsWith("qwen3.5:9b")) return 65536;
+  if (model.startsWith("qwen3.5:27b")) return 65536;
+  if (model.startsWith("qwen3.6:27b")) return 65536;
   if (model.startsWith("devstral-small-2:24b")) return 393216;
   if (model.startsWith("qwen2.5-coder:14b")) return 65536;
-  return 32768;
+  return 65536;
 }
 
 function promptExplicitlyRequestsDependencyInstall(prompt: string): boolean {
@@ -1010,7 +1011,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     await ensureModelLoaded(model);
     const result = await harness.run("explorer", input.prompt, {
-      maxIterations: 40,
+      maxIterations: 20,
       timeoutMs: 900_000,
       onEvent: (event) => {
         if (event.kind === "text" || event.kind === "thinking") {
@@ -1120,7 +1121,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     await ensureModelLoaded(model);
     const result = await harness.run("coder", input.prompt, {
-      maxIterations: input.skipExplorer ? 50 : 20,
+      maxIterations: 50,
       timeoutMs: 600_000,
       onEvent: (event) => {
         if (event.kind === "text" || event.kind === "thinking") {

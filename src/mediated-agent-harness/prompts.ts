@@ -85,15 +85,17 @@ YOUR JOB:
 4. Call: ${toolExample(toolMode, "finish")} with ticket list
 
 ## Ticket Quality Rules
-- Each ticket description MUST include:
-  - WHAT to do (specific files to create/modify)
-  - WHERE exactly (full file paths)
-  - HOW (key implementation details: which imports to add, which functions to call, which patterns to follow from existing code)
-  - WHY (how this ticket contributes to the epic goal)
-- Reference existing code patterns by file path: "Follow the pattern used in src/components/ExistingWidget.tsx"
-- Mention specific imports: "Import { X, Y } from 'package-name'"
-- If adding a dependency, state the exact npm package name and version context
-- If creating a new file, describe its expected exports/structure
+- Each ticket description MUST use this EXACT format (one-liner intro, then WHAT/WHERE/HOW/WHY sections):
+
+In path/to/file.tsx, replace the X with Y — matching the existing Z pattern.
+
+WHAT: Modify file.tsx only. WHERE: Replace the block (lines 32-63) that contains X elements. HOW:
+- Import NewComponent from @scope/package
+- Replace X elements with a map rendering NewComponent with props={...}
+- Follow the exact pattern from path/to/existing.tsx lines 100-120
+- Remove the now-unused OldComponent import if no other usage remains
+WHY: NewComponent provides a styled, consistent UI matching the rest of the app.
+
 - acceptanceCriteria must be specific and testable: NOT "UI looks good" but "Component renders a table with columns [A, B, C] populated from API response"
 - dependencies must list ticket IDs that MUST complete before this ticket starts
 - allowedPaths must be EXACT file/folder paths the ticket needs to touch — be precise
@@ -114,7 +116,7 @@ Call ${toolExample(toolMode, "finish")} with JSON:
     {
       "id": "T1",
       "title": "Short imperative description of the change",
-      "description": "Detailed multi-line description including: which file(s) to modify, what to add/change, which existing patterns to follow, specific imports needed, and how this relates to other tickets.",
+      "description": "In src/components/Table.tsx, add a Revenue column after Qty.\\n\\nWHAT: Modify Table.tsx only. WHERE: Add after the Qty column block (line 45). HOW: Import formatCurrency from utils. Add a new column with items.map calculating qty * price, using the same cell pattern as the Name column. WHY: Revenue visibility was requested in the epic.",
       "acceptanceCriteria": ["Specific, testable criterion 1", "Specific, testable criterion 2"],
       "dependencies": [],
       "allowedPaths": ["exact/path/to/file.tsx", "exact/path/to/folder"],
@@ -319,7 +321,7 @@ You have been given an edit packet below containing:
 5. After writing ALL changes, call: ${toolExample(toolMode, "finish")}
 
 ## Rules
-- MAX 12 tool calls total. Prefer batch writes via write_files or search_replace.
+- MAX 50 tool calls total. Prefer batch writes via write_files or search_replace.
 - You MUST read an existing file before overwriting it with write_file. The search_replace tool reads automatically.
 - For existing files with small changes, PREFER search_replace over write_file — it's safer and more precise.
 - Write ALL files before calling finish. Do not write one file per iteration.

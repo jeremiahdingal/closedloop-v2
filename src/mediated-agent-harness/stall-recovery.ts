@@ -7,7 +7,7 @@ export interface StallState {
   counts: Record<StallKind, number>;
   lastKind: StallKind | null;
   toolModeOverride: "native" | "xml" | null;
-  contextCompacted: boolean;
+  compaction: { passCount: number; totalRemovedTokens: number };
 }
 
 export interface RecoveryAction {
@@ -210,7 +210,7 @@ export function createStallState(): StallState {
     },
     lastKind: null,
     toolModeOverride: null,
-    contextCompacted: false,
+    compaction: { passCount: 0, totalRemovedTokens: 0 },
   };
 }
 

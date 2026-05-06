@@ -14,7 +14,7 @@ import { StagnationError, ModelConnectionError, LoopTimeoutError } from "./error
 import { StreamParser } from "./stream-parser.ts";
 import { WORKSPACE_TOOLS, BROWSER_TOOLS, executeToolCall, getAvailableToolsList, resetExploreModeFiles } from "./tools.ts";
 import { CallHistory, validateAndRepair } from "./validator.ts";
-import { computeBudget, shouldCompact, compactMessages, estimateMessagesTokens } from "./context-budget.ts";
+import { computeBudget, shouldCompact, summarizeMessages, estimateMessagesTokens } from "./context-budget.ts";
 import { classifyStall, computeStallLevel, getRecoveryAction, createStallState, recordStall, resetStallCounters, type StallState, type StallKind } from "./stall-recovery.ts";
 
 const KNOWN_TOOL_NAMES = new Set([
@@ -36,14 +36,15 @@ export interface LoopInput {
 }
 
 export function resolveModelContextWindow(model: string): number {
-  let result = 32768;
-  if (model.startsWith("glm-4.7-flash")) result = 16384;
-  else if (model.startsWith("qwen3.5:9b")) result = 16384;
-  else if (model.startsWith("qwen3.5:27b")) result = 16384;
-  else if (model.startsWith("qwen3:14b")) result = 16384;
+  let result = 65536;
+  if (model.startsWith("glm-4.7-flash")) result = 65536;
+  else if (model.startsWith("qwen3.5:9b")) result = 65536;
+  else if (model.startsWith("qwen3.5:27b")) result = 65536;
+  else if (model.startsWith("qwen3.6:27b")) result = 65536;
+  else if (model.startsWith("qwen3:14b")) result = 65536;
   else if (model.startsWith("devstral-small-2:24b")) result = 393216;
   else if (model.startsWith("qwen2.5-coder:14b")) result = 65536;
-  return Math.max(result, 16384);
+  return Math.max(result, 65536);
 }
 
 export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarnessResult> {
@@ -174,17 +175,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       emit({ kind: "text", text: `[convergence] Budget at 80%, forcing explorer to conclude...` });
     }
 
-    // Coder: early nudge at 40% — remind about outputting edit plan
-    if (config.role === "coder" && iteration >= Math.floor(maxIterations * 0.4)) {
-      const hasNudged = messages.some(m => typeof m.content === 'string' && m.content.includes('[SYSTEM REMINDER] coder 40%'));
-      if (!hasNudged) {
-        messages.push({
-          role: "user",
-          content: `[SYSTEM REMINDER] You are past 40% of your iteration budget (${iteration + 1}/${maxIterations}). You should have verified any stale file contents by now. Start formulating your edit operations. When you call finish, the "result" parameter MUST be a raw JSON string with this exact structure:\n\n{"operations":[{"kind":"search_replace","path":"relative/path","search":"exact content","replace":"replacement"}],"summary":"brief description"}\n\nNo markdown, no code fences, no commentary. Just the raw JSON object.`
-        });
-        emit({ kind: "text", text: "[nudge] 40% budget reached, reminding coder to output edit plan..." });
-      }
-    }
+
 
     // Coder: convergence at 60% — force to conclude
     if (config.role === "coder" && iteration >= Math.floor(maxIterations * 0.6)) {
@@ -197,7 +188,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
     // Context budget check — applies to ALL roles
     if (iteration > 3) {
-      const budget = computeBudget(messages, numCtx, stallState.contextCompacted);
+      const budget = computeBudget(messages, numCtx);
       const compactLevel = shouldCompact(budget);
 
       if (compactLevel === "force_finish") {
@@ -206,13 +197,22 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
           content: "[SYSTEM] Context window is nearly full (90%+). You MUST call the finish tool NOW. Pass your analysis as the result parameter (a JSON string). No more tool calls."
         });
         emit({ kind: "text", text: `[context] Budget at ${Math.round(budget.usedFraction * 100)}%, forcing finish...` });
-      } else if (compactLevel !== "none" && !stallState.contextCompacted) {
-        const result = compactMessages(messages, numCtx, compactLevel);
+      } else if (compactLevel !== "none") {
+        const passNum = stallState.compaction.passCount + 1;
+        emit({ kind: "text", text: `[context] Budget at ${Math.round(budget.usedFraction * 100)}%, summarizing history (pass ${passNum})...` });
+
+        const result = await summarizeMessages(messages, numCtx, config.model, baseURL, apiKey, stallState.compaction);
         if (result.removedTokens > 0) {
           messages.length = 0;
           messages.push(...result.messages);
-          stallState = { ...stallState, contextCompacted: true };
-          emit({ kind: "text", text: `[context] ${compactLevel} compaction: removed ${result.removedTokens} estimated tokens (now at ${Math.round(estimateMessagesTokens(messages) / numCtx * 100)}%)` });
+          stallState = {
+            ...stallState,
+            compaction: {
+              passCount: passNum,
+              totalRemovedTokens: stallState.compaction.totalRemovedTokens + result.removedTokens,
+            },
+          };
+          emit({ kind: "text", text: `[context] Summarization pass ${passNum} complete: removed ${result.removedTokens} tokens (now at ${Math.round(estimateMessagesTokens(messages) / numCtx * 100)}%)` });
         }
       }
     }

@@ -45,14 +45,16 @@ export function epicDecoderPrompt(epic: EpicRecord): string {
     "EXECUTOR CONSTRAINT: Every ticket will be executed by a 20-30B model with limited reasoning. Tickets MUST be trivially simple — one cohesive change, 1-3 files max, zero ambiguity. Prefer 8-12 small tickets over 3 large ones.",
     "",
     "TICKET QUALITY REQUIREMENTS:",
-    "Each ticket description MUST include:",
-    "- WHAT: specific files to create/modify, with full paths",
-    "- WHERE: exact file paths and locations within those files (e.g. 'Add the import at the top, after the existing react import')",
-    "- HOW: key implementation details — which imports, which functions, which existing patterns to follow",
-    "- WHY: how this ticket contributes to the epic goal",
-    "- Reference existing code: 'Follow the pattern in src/components/ExistingWidget.tsx'",
-    "- For dependencies: exact npm package name",
-    "- For new files: expected exports/structure",
+    "Each ticket description MUST use this EXACT format (one-liner intro, then WHAT/WHERE/HOW/WHY sections):",
+    "",
+    "In path/to/file.tsx, replace the X with Y — matching the existing Z pattern.",
+    "",
+    "WHAT: Modify file.tsx only. WHERE: Replace the block (lines 32-63) that contains X elements. HOW:",
+    "- Import NewComponent from @scope/package",
+    "- Replace X elements with a map rendering NewComponent with props={...}",
+    "- Follow the exact pattern from path/to/existing.tsx lines 100-120",
+    "- Remove the now-unused OldComponent import if no other usage remains",
+    "WHY: NewComponent provides a styled, consistent UI matching the rest of the app.",
     "",
     "acceptanceCriteria MUST be specific and testable:",
     "- BAD: 'UI looks good', 'Component works correctly'",
@@ -290,56 +292,41 @@ export function coderPrompt(
   skipContext?: { skipped: boolean; reason?: string }
 ): string {
   return [
-    "You are the Coder agent.",
-    "Your job is to write the actual code changes to satisfy the ticket based on the Explorer's analysis and the provided file contents.",
+    "You are the Coder agent. Write code changes to satisfy the ticket.",
     "",
-    "## PREFERRED: Write files directly using tools",
+    "## How to Edit",
     "Use search_replace for targeted edits to existing files (preferred for small changes).",
     "Use write_file for new files or when rewriting most of an existing file (you MUST read it first).",
     "Use write_files for writing multiple files at once.",
     "Write ALL files before calling finish.",
     "",
-    "## FALLBACK: JSON edit plan",
-    "If you cannot use write tools, output your edits as JSON operations in a FINAL_JSON block.",
-    "",
-    "CRITICAL: Work from the edit packet below. The file contents are already provided — do NOT request or expect to read more files. Produce your edits directly from this context.",
-    `Ticket: ${ticket.title}`,
-    `Goal: ${ticket.description}`,
-    `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`,
-    "## Acceptance Criteria Mapping",
-    "CRITICAL: Every change you produce MUST address at least one acceptance criterion. This prevents scope drift.",
+    ...(reviewerContext && (reviewerContext.blockers?.length || reviewerContext.suggestions?.length)
+      ? [
+        "## Previous Reviewer Feedback (MUST address)",
+        ...(reviewerContext.blockers?.length
+          ? ["Blockers (MUST resolve):", ...reviewerContext.blockers.map(b => "- " + b)]
+          : []),
+        ...(reviewerContext.suggestions?.length
+          ? ["Suggestions:", ...reviewerContext.suggestions.map(s => "- " + s)]
+          : []),
+      ]
+      : []),
     ...(skipContext?.skipped ? [
       "",
-      "## IMPORTANT: Explorer Was Skipped",
+      "## Explorer Was Skipped",
       skipContext.reason ?? "The explorer node was bypassed for this run.",
-      "You may have less file context than usual. Focus on the files listed in the edit packet and the ticket's allowedPaths.",
-      "If you are missing context, read the files you need rather than giving up."
+      "Focus on the files listed in the edit packet and the ticket's allowedPaths. If missing context, read the files you need."
     ] : []),
     "",
     "## Explorer Analysis",
     JSON.stringify(explorerOutput, null, 2),
-    "## Canonical Edit Packet (Current Source of Truth)",
-    JSON.stringify(editPacket, null, 2),
-    ...(reviewerContext && (reviewerContext.blockers?.length || reviewerContext.suggestions?.length)
-      ? [
-        "",
-        "## Previous Reviewer Feedback (address these issues)",
-        ...(reviewerContext.blockers?.length
-          ? ["Reviewer blockers (MUST resolve):", ...reviewerContext.blockers.map(b => "- " + b)]
-          : []),
-        ...(reviewerContext.suggestions?.length
-          ? ["Reviewer suggestions:", ...reviewerContext.suggestions.map(s => "- " + s)]
-          : []),
-        "Your changes MUST address every blocker listed above.",
-      ]
-      : []),
+    "",
     "## Rules",
-    "1. Use search_replace tool for existing files — provide the exact 'search' block and the 'replace' block.",
-    "2. Use write_file for new files. For existing files, you MUST read the file first.",
+    "1. Use read_file to get file contents you need. The explorer analysis lists the relevant files.",
+    "2. Every change MUST address at least one acceptance criterion. No scope drift.",
     "3. Do NOT delete or rename files unless explicitly permitted in destructivePermissions.",
-    "4. If the edit packet is missing content you need, read the file first. NEVER give up — always try to get the context and produce edits.",
-    "5. If reading the edit packet shows that the file content ALREADY matches what the acceptance criteria require, produce ZERO changes and explain in summary.",
-    "6. Do NOT produce identity transforms where search === replace.",
+    "4. If file content already matches what the acceptance criteria require, produce ZERO changes and explain in summary.",
+    "5. Do NOT produce identity transforms where search === replace.",
     "",
     "## Finish Output",
     "Call finish with JSON:",
@@ -348,18 +335,14 @@ export function coderPrompt(
       filesChanged: ["file1.ts", "file2.ts"]
     }, null, 2),
     "",
-    "## JSON Fallback (only if tools are unavailable)",
-    "Output a FINAL_JSON block with shape:",
-    JSON.stringify({
-      summary: "brief summary of what you implemented",
-      intendedFiles: ["string"],
-      unresolvedBlockers: ["string"],
-      operations: [
-        { kind: "search_replace", path: "string", expected_sha256: "string", search: "string", replace: "string", ac: "AC-1" },
-        { kind: "create_file", path: "string", content: "string", ac: "AC-2,AC-3" }
-      ]
-    }, null, 2),
-    "After you finish, output exactly one FINAL_JSON block and nothing after it."
+    "=".repeat(60),
+    "## TICKET (YOUR PRIMARY OBJECTIVE)",
+    `Title: ${ticket.title}`,
+    `Goal: ${ticket.description}`,
+    `Acceptance criteria:`,
+    ...ticket.acceptanceCriteria.map(c => `  - ${c}`),
+    `Allowed paths: ${ticket.allowedPaths.join(", ") || "(none)"}`,
+    "=".repeat(60),
   ].join("\n\n");
 }
 
@@ -477,22 +460,33 @@ export function doctorPrompt(input: {
   noDiff: boolean;
   infraFailure: boolean;
   currentNode?: string | null;
+  reviewApproved?: boolean;
 }): string {
   return [
-    "You are the Agent Doctor.",
+    "You are the Agent Doctor. Determine how to recover from a failed agent step.",
+    "",
     "Return JSON only with shape:",
     JSON.stringify({ decision: "retry_builder", reason: "string" }, null, 2),
-    "Decisions: retry_builder (start over), retry_same_node (retry current agent), escalate (give up), approve (code already satisfies criteria — accept as-is)",
+    "",
+    "Decisions: retry_builder (restart coder from scratch), retry_same_node (retry current agent), escalate (give up), approve (accept current state as done)",
+    "",
+    "CRITICAL RULES:",
+    "- NEVER choose 'approve' unless the reviewer has explicitly approved (reviewApproved=true).",
+    "- noDiff=true means the coder produced NOTHING — this is a failure, not success. Always retry_builder.",
+    "- Do NOT assume code from other tickets or previous runs satisfies this ticket's acceptance criteria.",
+    "- If the reviewer rejected with blockers, retry_builder to let the coder try again.",
+    "- Only choose 'escalate' if the same blocker or test failure has repeated multiple times.",
+    "- On stalls or infra failures, always retry_builder.",
+    "",
     `Ticket: ${input.ticket.title}`,
     `Current node: ${input.currentNode ?? "unknown"}`,
+    `Review approved: ${String(input.reviewApproved ?? false)}`,
     `Repeated blockers: ${String(input.repeatedBlockers)}`,
     `Repeated test failure: ${String(input.repeatedTestFailure)}`,
     `No diff: ${String(input.noDiff)}`,
     `Infrastructure failure: ${String(input.infraFailure)}`,
     `Latest review: ${JSON.stringify(input.reviewerVerdict)}`,
     `Latest test summary: ${input.testSummary ?? "(none)"}`,
-    "",
-    "Re-run Awareness: This ticket may have been run before. If noDiff is true and the coder/explorer reported that all acceptance criteria are already satisfied, you MUST choose 'approve'. Do NOT escalate tickets where the code is already correct."
   ].join("\n\n");
 }
 
@@ -528,14 +522,16 @@ export function epicDecoderToolingPrompt(
     [
       "TICKET QUALITY REQUIREMENTS — every ticket MUST have:",
       "",
-      "Description must include:",
-      "  - WHAT: specific files to create/modify, with full paths",
-      "  - WHERE: exact locations within files (e.g. 'Add import at top after existing react import')",
-      "  - HOW: key implementation details — which imports, which functions, which existing patterns to follow",
-      "  - WHY: how this ticket contributes to the epic goal",
-      "  - Reference existing code by file path: 'Follow the pattern used in src/components/ExistingWidget.tsx'",
-      "  - For npm dependencies: exact package name",
-      "  - For new files: expected exports/structure",
+      "Description MUST use this EXACT format (one-liner intro, then WHAT/WHERE/HOW/WHY sections):",
+      "",
+      "In path/to/file.tsx, replace the X with Y — matching the existing Z pattern.",
+      "",
+      "WHAT: Modify file.tsx only. WHERE: Replace the block (lines 32-63) that contains X elements. HOW:",
+      "  - Import NewComponent from @scope/package",
+      "  - Replace X elements with a map rendering NewComponent with props={...}",
+      "  - Follow the exact pattern from path/to/existing.tsx lines 100-120",
+      "  - Remove the now-unused OldComponent import if no other usage remains",
+      "WHY: NewComponent provides a styled, consistent UI matching the rest of the app.",
       "",
       "acceptanceCriteria must be specific and testable:",
       "  - BAD: 'UI looks good', 'Component works correctly'",
@@ -977,6 +973,16 @@ export function epicDecoderPlanModePrompt(
       "  • Small: the change should fit in a single model response",
       "When in doubt, split. 12 simple tickets are far better than 5 complex ones.",
       "Avoid vague titles like 'Update module X' — be precise: 'Add exportFoo() to src/foo.ts'.",
+      "",
+      "Description MUST use this EXACT format (one-liner intro, then WHAT/WHERE/HOW/WHY sections):",
+      "",
+      "In path/to/file.tsx, replace the X with Y — matching the existing Z pattern.",
+      "",
+      "WHAT: Modify file.tsx only. WHERE: Replace the block (lines 32-63) that contains X elements. HOW:",
+      "  - Import NewComponent from @scope/package",
+      "  - Replace X elements with a map rendering NewComponent with props={...}",
+      "  - Follow the exact pattern from path/to/existing.tsx lines 100-120",
+      "WHY: NewComponent provides a styled, consistent UI matching the rest of the app.",
     ].join("\n"),
     "## Required Output Format",
     [

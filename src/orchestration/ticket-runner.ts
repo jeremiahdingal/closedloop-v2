@@ -982,11 +982,11 @@ export class TicketRunner {
 
     const classifyNode = async (state: TicketGraphState) => {
       this.assertNotCancelled(ticket.id, ticket.epicId);
-      console.log(`[TICKET ${ticket.id}] Classify node: buildAttempts=${state.buildAttempts}/${state.maxBuildAttempts}, noDiff=${state.noDiff}, repeatedBlockers=${state.repeatedBlockers}`);
+      console.log(`[TICKET ${ticket.id}] Classify node: buildAttempts=${state.buildAttempts}/${state.maxBuildAttempts}, noDiff=${state.noDiff}, repeatedBlockers=${state.repeatedBlockers}, reviewApproved=${state.reviewApproved}`);
 
       // Hard guard: prevent infinite retry loops
       if (state.buildAttempts >= state.maxBuildAttempts) {
-        const reason = `Max build attempts (${state.maxBuildAttempts}) reached. ${state.noDiff ? "Code may already satisfy criteria — check manually." : "Repeated failures."}`;
+        const reason = `Max build attempts (${state.maxBuildAttempts}) reached. Repeated failures.`;
         console.log(`[TICKET ${ticket.id}] Classify: max attempts reached, escalating`);
         return {
           failureDecision: "escalate",
@@ -1016,40 +1016,24 @@ export class TicketRunner {
         repeatedTestFailure: state.repeatedTestFailure,
         noDiff: state.noDiff,
         infraFailure: false,
+        reviewApproved: state.reviewApproved,
       });
       console.log(`[TICKET ${ticket.id}] Doctor decision: ${failure.decision} - ${failure.reason}`);
 
-      // Override retry_builder when noDiff is true — code already satisfies criteria, approve instead
-      if (failure.decision === "retry_builder" && state.noDiff) {
-        const diffResult = await this.bridge.gitDiff(state.workspaceId);
-        if (!diffResult || !diffResult.trim()) {
-          const ws = this.bridge.requireWorkspace(state.workspaceId);
-          const diffBase = await getEffectiveDiffBase(ws.worktreePath, ws.baseCommit);
-          const baseDiff = await git(ws.worktreePath, ["diff", diffBase, "--", "."]);
-          if (baseDiff.stdout.trim()) {
-            console.log(`[TICKET ${ticket.id}] Doctor said retry_builder with noDiff, but found diff vs ${diffBase} — approving`);
-            return {
-              failureDecision: "approve",
-              failureReason: `Code already satisfies acceptance criteria (changes exist on branch). ${failure.reason}`,
-              lastMessage: failure.reason,
-              lastDiff: baseDiff.stdout.trim(),
-              status: "reviewing" as const,
-              reviewApproved: true,
-            } satisfies Partial<TicketGraphState>;
-          }
-        }
-        console.log(`[TICKET ${ticket.id}] Doctor said retry_builder with noDiff and no diff found — escalating`);
+      // Block auto-approve without reviewer approval
+      if (failure.decision === "approve" && !state.reviewApproved) {
+        console.log(`[TICKET ${ticket.id}] Doctor said approve but reviewer has not approved — retrying coder instead`);
         return {
-          failureDecision: "escalate",
-          failureReason: `Doctor recommended retry but noDiff=true and no changes detected. ${failure.reason}`,
+          failureDecision: "retry_builder",
+          failureReason: `Doctor approved but reviewer has not approved. ${failure.reason}`,
           lastMessage: failure.reason,
-          status: "escalated"
+          status: "building"
         } satisfies Partial<TicketGraphState>;
       }
 
       if (failure.decision === "approve") {
         const diffResult = await this.bridge.gitDiff(state.workspaceId);
-        console.log(`[TICKET ${ticket.id}] Doctor approved (code already satisfies criteria).`);
+        console.log(`[TICKET ${ticket.id}] Doctor approved (reviewer approved, code satisfies criteria).`);
         return {
           failureDecision: "approve",
           failureReason: failure.reason,
@@ -1221,8 +1205,8 @@ export class TicketRunner {
       .addConditionalEdges("reviewer", (state: TicketGraphState) => {
         if (state.reviewApproved) return "tester";
         if (state.buildAttempts >= state.maxBuildAttempts) return "classify";
-        return state.skipExplorer ? "build_packet" : "explorer";
-      }, ["tester", "classify", "explorer", "build_packet"])
+        return "coder";
+      }, ["tester", "classify", "coder"])
       .addConditionalEdges("tester", (state: TicketGraphState) => state.testPassed ? "finalize_success" : "classify", ["finalize_success", "classify"])
       .addConditionalEdges(
         "classify",
@@ -2346,6 +2330,7 @@ export class TicketRunner {
       repeatedTestFailure: boolean;
       noDiff: boolean;
       infraFailure: boolean;
+      reviewApproved?: boolean;
     }
   ): Promise<FailureDecision> {
     this.recordAgentStream({ agentRole: "doctor", source: "orchestrator", streamKind: "status", content: "Analyzing failure and determining recovery action...", runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 0, done: false });
@@ -2524,9 +2509,9 @@ export class TicketRunner {
   }
 
   private resolveMaxBuildAttempts(ticket: TicketRecord): number {
-    const configured = Number(ticket.metadata.maxBuildAttempts ?? 3);
-    if (!Number.isFinite(configured) || configured <= 0) return 3;
-    return Math.min(3, Math.floor(configured));
+    const configured = Number(ticket.metadata.maxBuildAttempts ?? 20);
+    if (!Number.isFinite(configured) || configured <= 0) return 20;
+    return Math.min(20, Math.floor(configured));
   }
 
   private reviewerVerdictFingerprint(verdict: ReviewerVerdict, diff: string): string {

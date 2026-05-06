@@ -6,15 +6,18 @@ export interface ContextBudget {
   windowTokens: number;
   usedTokens: number;
   usedFraction: number;
-  compacted: boolean;
 }
 
-export type CompactionLevel = "none" | "gentle" | "aggressive" | "force_finish";
+export type CompactionLevel = "none" | "summarize" | "force_finish";
+
+export interface CompactionState {
+  passCount: number;
+  totalRemovedTokens: number;
+}
 
 export interface CompactionResult {
   messages: ChatMessage[];
   removedTokens: number;
-  level: CompactionLevel;
 }
 
 // ─── Token estimation ────────────────────────────────────────────────────────
@@ -48,117 +51,69 @@ export function estimateMessagesTokens(messages: ChatMessage[]): number {
 export function computeBudget(
   messages: ChatMessage[],
   windowTokens: number,
-  alreadyCompacted: boolean
 ): ContextBudget {
   const usedTokens = estimateMessagesTokens(messages);
   return {
     windowTokens,
     usedTokens,
     usedFraction: usedTokens / windowTokens,
-    compacted: alreadyCompacted,
   };
 }
 
 export function shouldCompact(budget: ContextBudget): CompactionLevel {
-  if (budget.usedFraction >= 0.9) return "force_finish";
-  if (budget.usedFraction >= 0.8) return "aggressive";
-  if (budget.usedFraction >= 0.6) return "gentle";
+  if (budget.usedFraction >= 0.92) return "force_finish";
+  if (budget.usedFraction >= 0.75) return "summarize";
   return "none";
 }
 
-// ─── Compaction ──────────────────────────────────────────────────────────────
+// ─── LLM-based summarization ────────────────────────────────────────────────
 
-function truncateContent(content: string, head: number, tail: number): string {
-  if (content.length <= head + tail + 50) return content;
-  return content.slice(0, head) + `\n[...compacted from ${content.length} chars...]\n` + content.slice(-tail);
-}
+const SUMMARIZATION_SYSTEM_PROMPT = `You are a context compactor. Summarize the following conversation history into a concise summary that preserves:
+- Key findings and discoveries
+- File paths examined or modified
+- Code changes made (function names, variable names, logic changes)
+- Errors encountered and how they were resolved
+- Decisions taken and their rationale
+- Any important values, IDs, or configuration details
 
-/** Check if two messages form an assistant+tool_result pair */
-function isToolExchangeStart(messages: ChatMessage[], idx: number): boolean {
-  return (
-    messages[idx].role === "assistant" &&
-    idx + 1 < messages.length &&
-    messages[idx + 1].role === "tool"
-  );
-}
+Be specific — preserve file paths, variable names, function signatures, and important values exactly as they appeared.
+Omit exploratory dead-ends and redundant tool calls.
+Keep the summary under 2000 tokens.`;
 
-/**
- * Gentle compaction: truncate old tool result content to head+tail.
- * Operates on the older half of exchange pairs.
- */
-function compactGentle(messages: ChatMessage[]): ChatMessage[] {
-  if (messages.length <= 4) return messages;
-
-  const result = messages.map(m => ({ ...m }));
-
-  // Find tool exchanges
-  const exchangeStarts: number[] = [];
-  for (let i = 2; i < result.length; i++) {
-    if (isToolExchangeStart(result, i)) {
-      exchangeStarts.push(i);
+function formatMessagesForSummary(messages: ChatMessage[]): string {
+  const lines: string[] = [];
+  for (const msg of messages) {
+    if (msg.role === "system" && msg.content && typeof msg.content === "string" && msg.content.startsWith("[COMPACTED HISTORY")) {
+      lines.push(`[PRIOR SUMMARY]\n${msg.content}\n[/PRIOR SUMMARY]`);
+      continue;
     }
-  }
-
-  // Compact the older half
-  const cutoff = Math.ceil(exchangeStarts.length / 2);
-  for (let i = 0; i < cutoff && i < exchangeStarts.length; i++) {
-    const toolMsgIdx = exchangeStarts[i] + 1;
-    const toolContent = result[toolMsgIdx].content;
-    if (typeof toolContent === "string" && toolContent.length > 600) {
-      result[toolMsgIdx] = {
-        ...result[toolMsgIdx],
-        content: truncateContent(toolContent, 300, 200),
-      };
-    }
-  }
-
-  return result;
-}
-
-/**
- * Aggressive compaction: collapse old exchanges into single-line summaries.
- * Keep last 6 messages verbatim.
- */
-function compactAggressive(messages: ChatMessage[]): ChatMessage[] {
-  if (messages.length <= 8) return messages;
-
-  const keepTail = 6;
-  const head = messages.slice(0, 2); // system + user prompt
-  const tail = messages.slice(-keepTail);
-  const middle = messages.slice(2, -keepTail);
-
-  // Summarize middle into a single system message
-  const summaryLines: string[] = ["[PRIOR CONTEXT SUMMARY]"];
-  for (let i = 0; i < middle.length; i++) {
-    const msg = middle[i];
     if (msg.role === "assistant" && msg.tool_calls) {
       for (const tc of msg.tool_calls) {
-        const args = tc.function.arguments.slice(0, 80);
-        summaryLines.push(`Called ${tc.function.name}(${args}...)`);
+        const argsPreview = tc.function.arguments.length > 200
+          ? tc.function.arguments.slice(0, 200) + "..."
+          : tc.function.arguments;
+        lines.push(`Assistant called ${tc.function.name}(${argsPreview})`);
+      }
+      if (typeof msg.content === "string" && msg.content.trim()) {
+        lines.push(`Assistant said: ${msg.content.slice(0, 300)}`);
       }
     } else if (msg.role === "tool" && typeof msg.content === "string") {
-      const preview = msg.content.slice(0, 150).replace(/\n/g, " ");
-      summaryLines.push(`→ ${preview}...`);
+      const preview = msg.content.length > 500
+        ? msg.content.slice(0, 500) + `...[${msg.content.length} chars total]`
+        : msg.content;
+      lines.push(`Tool result: ${preview}`);
     } else if (msg.role === "assistant" && typeof msg.content === "string" && msg.content.trim()) {
-      const preview = msg.content.slice(0, 120).replace(/\n/g, " ");
-      summaryLines.push(`Assistant: ${preview}...`);
+      lines.push(`Assistant: ${msg.content.slice(0, 500)}`);
     } else if (msg.role === "user" && typeof msg.content === "string" && msg.content.trim()) {
-      const preview = msg.content.slice(0, 120).replace(/\n/g, " ");
-      summaryLines.push(`User: ${preview}...`);
+      lines.push(`User: ${msg.content.slice(0, 500)}`);
     }
   }
-
-  const summaryMsg: ChatMessage = {
-    role: "system",
-    content: summaryLines.join("\n"),
-  };
-
-  return [...head, summaryMsg, ...tail];
+  return lines.join("\n\n");
 }
 
 /**
  * Safety net: drop oldest exchange pairs until under target tokens.
- * Never splits assistant/tool_result pairs. Never drops messages[0] or messages[1].
+ * Never splits assistant/tool_result pairs. Never drops messages[0].
  */
 function enforceTokenBudget(messages: ChatMessage[], targetTokens: number): ChatMessage[] {
   let current = estimateMessagesTokens(messages);
@@ -166,9 +121,7 @@ function enforceTokenBudget(messages: ChatMessage[], targetTokens: number): Chat
 
   const result = [...messages];
 
-  // Drop from index 2 onward, in pairs (assistant + tool_result)
   while (current > targetTokens && result.length > 4) {
-    // Find the first droppable exchange pair starting from index 2
     let dropped = false;
     for (let i = 2; i < result.length - 2; i++) {
       if (result[i].role === "assistant" && result[i + 1]?.role === "tool") {
@@ -179,7 +132,6 @@ function enforceTokenBudget(messages: ChatMessage[], targetTokens: number): Chat
         break;
       }
     }
-    // If no pair found, drop single oldest non-essential message
     if (!dropped) {
       for (let i = 2; i < result.length - 2; i++) {
         const before = estimateMessagesTokens(result);
@@ -193,26 +145,74 @@ function enforceTokenBudget(messages: ChatMessage[], targetTokens: number): Chat
   return result;
 }
 
-export function compactMessages(
+export async function summarizeMessages(
   messages: ChatMessage[],
   windowTokens: number,
-  level: CompactionLevel
-): CompactionResult {
-  if (level === "none") {
-    return { messages, removedTokens: 0, level };
-  }
-
+  model: string,
+  baseURL: string,
+  apiKey: string,
+  state: CompactionState,
+): Promise<CompactionResult> {
   const before = estimateMessagesTokens(messages);
-  let result: ChatMessage[];
 
-  if (level === "gentle") {
-    result = compactGentle(messages);
-  } else if (level === "aggressive") {
-    result = compactAggressive(messages);
-  } else {
-    // force_finish — minimal compaction just to keep the model responding
-    result = compactAggressive(messages);
+  // Keep first message (system prompt) and last N messages verbatim
+  const minRecent = 6;
+  const recentCount = Math.max(minRecent, Math.ceil(messages.length * 0.2));
+  const headEnd = 1; // keep messages[0] (system prompt)
+  const tailStart = Math.max(headEnd + 1, messages.length - recentCount);
+
+  const head = messages.slice(0, headEnd);
+  const tail = messages.slice(tailStart);
+  const oldHistory = messages.slice(headEnd, tailStart);
+
+  if (oldHistory.length === 0) {
+    return { messages, removedTokens: 0 };
   }
+
+  // Build summarization prompt
+  const historyText = formatMessagesForSummary(oldHistory);
+
+  // Call the model to summarize
+  const summaryResponse = await fetch(`${baseURL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    signal: AbortSignal.timeout(120_000),
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: "system", content: SUMMARIZATION_SYSTEM_PROMPT },
+        { role: "user", content: historyText },
+      ],
+      stream: false,
+      temperature: 0.3,
+    }),
+  });
+
+  let summaryText: string;
+  if (summaryResponse.ok) {
+    const payload = await summaryResponse.json() as { choices?: { message?: { content?: string } }[] };
+    summaryText = payload.choices?.[0]?.message?.content?.trim() ?? "";
+  } else {
+    // If summarization fails, fall back to aggressive truncation of old history
+    const errorText = await summaryResponse.text().catch(() => "unknown error");
+    console.error(`[context] Summarization API call failed (${summaryResponse.status}): ${errorText}`);
+    summaryText = formatMessagesForSummary(oldHistory).slice(0, 4000);
+  }
+
+  if (!summaryText) {
+    summaryText = formatMessagesForSummary(oldHistory).slice(0, 4000);
+  }
+
+  const passNumber = state.passCount + 1;
+  const summaryMessage: ChatMessage = {
+    role: "system",
+    content: `[COMPACTED HISTORY — Pass ${passNumber}]\n${summaryText}`,
+  };
+
+  let result = [...head, summaryMessage, ...tail];
 
   // Safety net: ensure we're under 85% of window
   result = enforceTokenBudget(result, Math.floor(windowTokens * 0.85));
@@ -221,6 +221,5 @@ export function compactMessages(
   return {
     messages: result,
     removedTokens: before - after,
-    level,
   };
 }
