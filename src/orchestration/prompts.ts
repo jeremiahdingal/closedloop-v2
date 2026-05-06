@@ -14,6 +14,30 @@ import { type VerificationResult } from "./verifier.ts";
 import { getCompactToolContract, getAvailableToolsList } from "../mediated-agent-harness/tools.ts";
 import type { BuiltContext } from "../rag/context-builder.ts";
 
+// ─── Executor constraint by coder model size ──────────────────────────────────
+
+function executorConstraint(coderModel?: string): string {
+  const m = (coderModel ?? "").toLowerCase();
+  // Large cloud models — can handle more complex tickets
+  if (m.startsWith("zai:")) {
+    return [
+      "EXECUTOR CONSTRAINT: Tickets will be executed by a cloud-based model with strong reasoning.",
+      "Tickets should be well-scoped and clear, but can be moderately complex — up to 5 files per ticket is fine.",
+      "Still prefer splitting large features into smaller tickets for parallelism and easier review.",
+    ].join("\n");
+  }
+  // 30B+ models — moderate complexity
+  if (m.includes("30b") || m.includes("27b") || m.includes("24b") || m.includes("26b")) {
+    return [
+      "EXECUTOR CONSTRAINT: Every ticket will be executed by a 20-30B model with limited reasoning. Tickets MUST be trivially simple — one cohesive change, 1-3 files max, zero ambiguity. Prefer 8-12 small tickets over 3 large ones.",
+    ].join("\n");
+  }
+  // Small models (<14B) — strictest constraints
+  return [
+    "EXECUTOR CONSTRAINT: Every ticket will be executed by a small (<14B) model with very limited reasoning and a short context window. Tickets MUST be minimal — one change in 1-2 files max, zero ambiguity, no exploration needed. Prefer 12-16 tiny tickets over 4 larger ones. Each ticket description must be completely self-contained.",
+  ].join("\n");
+}
+
 type EpicReviewerTicketGitContext = {
   ticketId: string;
   baseRef: string | null;
@@ -38,11 +62,11 @@ function buildPromptPathArgs(paths: string[]): string {
 }
 
 
-export function epicDecoderPrompt(epic: EpicRecord): string {
+export function epicDecoderPrompt(epic: EpicRecord, coderModel?: string): string {
   return [
     "You are the Goal Decomposer. Break the epic into detailed, self-contained tickets.",
     "",
-    "EXECUTOR CONSTRAINT: Every ticket will be executed by a 20-30B model with limited reasoning. Tickets MUST be trivially simple — one cohesive change, 1-3 files max, zero ambiguity. Prefer 8-12 small tickets over 3 large ones.",
+    executorConstraint(coderModel),
     "",
     "TICKET QUALITY REQUIREMENTS:",
     "Each ticket description MUST use this EXACT format (one-liner intro, then WHAT/WHERE/HOW/WHY sections):",
@@ -493,7 +517,8 @@ export function doctorPrompt(input: {
 export function epicDecoderToolingPrompt(
   epic: EpicRecord,
   ragContext?: BuiltContext | null,
-  projectStructure?: string | null
+  projectStructure?: string | null,
+  coderModel?: string
 ): string {
   const role = "epic-decoder";
   const availableTools = getAvailableToolsList(role);
@@ -509,7 +534,7 @@ export function epicDecoderToolingPrompt(
     `Goal: ${epic.goalText}`,
     [
       "EXECUTOR CONSTRAINT — read this before writing a single ticket:",
-      "Each ticket you create will be executed by a 20-30B parameter model. That model has limited reasoning capacity and a short context window.",
+      executorConstraint(coderModel),
       "This means every ticket MUST be:",
       "  - Atomic — one coherent, self-contained change only",
       "  - Narrow — touches 1-3 files at most; never spans the whole codebase",
@@ -867,7 +892,8 @@ export function epicReviewerBuildFixPrompt(
 export function ticketRedecomposerPrompt(
   epic: EpicRecord,
   ticket: TicketRecord,
-  reviewerBlockers: string[]
+  reviewerBlockers: string[],
+  coderModel?: string
 ): string {
   const blockerBlock = reviewerBlockers.length
     ? reviewerBlockers.map((b, i) => `  Attempt ${i + 1}: ${b}`).join("\n")
@@ -900,7 +926,7 @@ export function ticketRedecomposerPrompt(
       "5. Every sub-ticket must be self-contained: its description alone must be enough to implement it with no additional discovery",
     ].join("\n"),
     [
-      "⚠️ EXECUTOR CONSTRAINT: Each sub-ticket will be run by a 20–30B model.",
+      `⚠️ EXECUTOR CONSTRAINT: Each sub-ticket will be run by the coder model. ${executorConstraint(coderModel)}`,
       "  • Atomic — one coherent change only",
       "  • Narrow — 1–2 files at most; tight allowedPaths",
       "  • Explicit — include the exact function/class name, file path, and expected signature in the description",
@@ -930,7 +956,8 @@ export function epicDecoderPlanModePrompt(
   epicDescription: string,
   userMessages: string[],
   projectStructure?: string | null,
-  ragContext?: { codeContext: string; docContext: string } | null
+  ragContext?: { codeContext: string; docContext: string } | null,
+  coderModel?: string
 ): string {
   const sections: string[] = [
     "You are the Epic Planner agent. Your job is to collaboratively explore the repository and produce a thorough, well-scoped implementation plan.",
@@ -964,8 +991,8 @@ export function epicDecoderPlanModePrompt(
     "Think carefully. Be specific about what each ticket changes and why.",
     [
       "⚠️ EXECUTOR CONSTRAINT — critical for ticket design:",
-      "Each ticket in the FINAL_JSON will be handed to an approximately 14B parameter model with limited reasoning and a short context window.",
-      "Design every ticket so that model can succeed without needing to explore the broader codebase.",
+      executorConstraint(coderModel),
+      "Design every ticket so the coder model can succeed without needing to explore the broader codebase.",
       "Rules for each ticket:",
       "  • Atomic: one coherent change only — no 'and also' tickets",
       "  • Narrow: 1–3 files touched at most; use tight allowedPaths",

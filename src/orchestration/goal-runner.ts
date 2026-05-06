@@ -609,17 +609,17 @@ export class GoalRunner {
       )
     ) {
       try {
-        const result = await this.gateway.runEpicDecoderInWorkspace({ cwd: epic.targetDir, prompt: epicDecoderToolingPrompt(epic, ragCtx, projectStructure), runId, epicId: epic.id, onStream: (e) => this.recordAgentStream(e) });
+        const result = await this.gateway.runEpicDecoderInWorkspace({ cwd: epic.targetDir, prompt: epicDecoderToolingPrompt(epic, ragCtx, projectStructure, this.gateway.models.coder), runId, epicId: epic.id, onStream: (e) => this.recordAgentStream(e) });
         return result;
       } catch (err) { console.warn(`Decoder failed: ${err}`); }
     }
     if (this.gateway.runEpicDecoderOpenCode && configuredModel.startsWith("opencode:")) {
       try {
-        const result = await this.gateway.runEpicDecoderOpenCode({ cwd: epic.targetDir, prompt: epicDecoderToolingPrompt(epic, ragCtx, projectStructure), runId, epicId: epic.id, onStream: (e) => this.recordAgentStream(e) });
+        const result = await this.gateway.runEpicDecoderOpenCode({ cwd: epic.targetDir, prompt: epicDecoderToolingPrompt(epic, ragCtx, projectStructure, this.gateway.models.coder), runId, epicId: epic.id, onStream: (e) => this.recordAgentStream(e) });
         return result;
       } catch (err) { console.warn(`OpenCode decoder failed: ${err}`); }
     }
-    return this.gateway.getGoalDecomposition(epicDecoderPrompt(epic));
+    return this.gateway.getGoalDecomposition(epicDecoderPrompt(epic, this.gateway.models.coder));
   }
 
   private async runEpicReview(epic: EpicRecord, tickets: TicketRecord[], runId: string): Promise<GoalReview> {

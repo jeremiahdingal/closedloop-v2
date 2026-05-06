@@ -76,7 +76,8 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
     input.epicDescription,
     input.userMessages,
     projectStructure,
-    ragCtx
+    ragCtx,
+    input.gateway.models.coder
   );
 
   const { gateway } = input;
