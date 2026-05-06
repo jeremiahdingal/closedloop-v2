@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 
 const OLLAMA_BASE = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
-const MODEL = process.argv[2] || "qwen3.6:27b";
+const MODEL = process.argv[2] || "vladimirgav/qwen3.6-27b-16gb-vram-uncensored";
 
 function color(code: number, value: string): string {
   return `\x1b[${code}m${value}\x1b[0m`;

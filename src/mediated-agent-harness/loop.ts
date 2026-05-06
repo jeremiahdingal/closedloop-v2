@@ -40,7 +40,7 @@ export function resolveModelContextWindow(model: string): number {
   if (model.startsWith("glm-4.7-flash")) result = 65536;
   else if (model.startsWith("qwen3.5:9b")) result = 65536;
   else if (model.startsWith("qwen3.5:27b")) result = 65536;
-  else if (model.startsWith("qwen3.6:27b")) result = 65536;
+  else if (model.startsWith("vladimirgav/qwen3.6-27b")) result = 65536;
   else if (model.startsWith("qwen3:14b")) result = 65536;
   else if (model.startsWith("devstral-small-2:24b")) result = 393216;
   else if (model.startsWith("qwen2.5-coder:14b")) result = 65536;
