@@ -87,9 +87,9 @@ export function validateAndRepair(
   const iterationCount = history.getRecentCalls(Infinity).length;
 
   // 1. Check stagnation
-  if (history.hasRepeatedCalls(3)) {
+  if (history.hasRepeatedCalls(10)) {
     return new StagnationError(
-      `Tool "${input.name}" called with identical arguments 3 times in a row`,
+      `Tool "${input.name}" called with identical arguments 10 times in a row`,
       iterationCount,
       "repeated_call"
     );

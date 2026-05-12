@@ -115,7 +115,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
     // Check stagnation — use progressive stall recovery
     if (iteration > 0) {
-      const repeatedCount = history.hasRepeatedCalls(3) ? 3 : 0;
+      const repeatedCount = history.hasRepeatedCalls(10) ? 10 : 0;
       const stallKind = classifyStall({
         hasEmptyResponse: false,
         hasNoToolCalls: false,
