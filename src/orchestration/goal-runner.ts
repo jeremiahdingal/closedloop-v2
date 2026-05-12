@@ -259,7 +259,7 @@ export class GoalRunner {
       status: "queued",
       diffFiles: [],
       prUrl: null,
-      metadata: { maxBuildAttempts: 3, sourceTicketId: String((ticket as GoalTicketPlan & { sourceTicketId?: string }).sourceTicketId || ticket.id) }
+      metadata: { maxBuildAttempts: 10, sourceTicketId: String((ticket as GoalTicketPlan & { sourceTicketId?: string }).sourceTicketId || ticket.id) }
     }));
 
     const allIds = Array.from(new Set(plans.map((plan) => planIdToTicketId.get(plan.id) || plan.id)));

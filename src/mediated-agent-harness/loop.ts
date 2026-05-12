@@ -94,20 +94,24 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
   const history = new CallHistory();
   const collectedToolCalls: ToolCall[] = [];
   const startTime = Date.now();
+  let lastActivityTime = startTime;
   let stallState = createStallState();
 
   emit({ kind: "text", text: `--- SYSTEM PROMPT ---\n${systemPrompt}\n\n--- USER PROMPT ---\n${userPrompt}\n-------------------` });
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
-    // Check timeout
-    const elapsed = Date.now() - startTime;
-    if (elapsed > timeoutMs) {
+    // Check timeout — only throw if idle (no recent activity) beyond the limit
+    const now = Date.now();
+    const totalElapsed = now - startTime;
+    const idleElapsed = now - lastActivityTime;
+    if (totalElapsed > timeoutMs && idleElapsed > 60_000) {
       throw new LoopTimeoutError(
-        `Loop timed out after ${elapsed}ms (limit: ${timeoutMs}ms)`,
-        elapsed,
+        `Loop timed out after ${totalElapsed}ms (limit: ${timeoutMs}ms, idle: ${idleElapsed}ms)`,
+        totalElapsed,
         timeoutMs
       );
     }
+    // No hard ceiling — rely on the idle-based timeout above
 
     // Check stagnation — use progressive stall recovery
     if (iteration > 0) {
@@ -400,6 +404,8 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     if (state.thinking) {
       emit({ kind: "thinking", text: state.thinking });
     }
+
+    lastActivityTime = Date.now();
 
     if (assistantText.trim()) {
       emit({ kind: "text", text: assistantText });
