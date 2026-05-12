@@ -164,11 +164,12 @@ export function validateAndRepair(
   const requiredParams = toolDef.function.parameters.required ?? [];
   for (const param of requiredParams) {
     if (args[param] === undefined || args[param] === null) {
+      const example = buildExampleCall(name, toolDef);
       return new ToolValidationError(
-        `Missing required parameter: ${param}`,
+        `Missing required parameter: ${param} for ${name}`,
         name,
         input.arguments,
-        `Required parameters: ${requiredParams.join(", ")}`
+        `Call ${name} with: ${example}`
       );
     }
   }
@@ -434,4 +435,27 @@ function stableStringify(obj: Record<string, unknown>): string {
     return acc;
   }, {});
   return JSON.stringify(sorted);
+}
+
+function buildExampleCall(toolName: string, toolDef: ToolDef): string {
+  const props = toolDef.function.parameters.properties;
+  const example: Record<string, string> = {};
+  for (const [key, schema] of Object.entries(props)) {
+    const desc = ((schema as any).description ?? "").toLowerCase();
+    if ((schema as any).type === "string") {
+      if (desc.includes("glob") || key === "pattern") example[key] = "src/**/*.ts";
+      else if (desc.includes("path")) example[key] = "src/main.ts";
+      else if (desc.includes("search") || desc.includes("query")) example[key] = "search term";
+      else if (desc.includes("content") || desc.includes("text") || desc.includes("code")) example[key] = "your content here";
+      else if (desc.includes("command")) example[key] = "npm test";
+      else if (desc.includes("summary")) example[key] = "brief summary";
+      else if (desc.includes("result")) example[key] = "result data";
+      else if (desc.includes("url")) example[key] = "https://example.com";
+      else if (desc.includes("message") || desc.includes("reason")) example[key] = "explanation";
+      else example[key] = "value";
+    } else {
+      example[key] = "value";
+    }
+  }
+  return JSON.stringify(example);
 }
