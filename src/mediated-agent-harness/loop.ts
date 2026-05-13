@@ -1,4 +1,4 @@
-﻿import type {
+import type {
   ChatMessage,
   CompleteToolCall,
   MediatedHarnessConfig,
@@ -42,6 +42,7 @@ export function resolveModelContextWindow(model: string): number {
   else if (model.startsWith("qwen3.5:27b")) result = 65536;
   else if (model.startsWith("vladimirgav/qwen3.6-27b")) result = 65536;
   else if (model.startsWith("batiai/qwen3.6-27b")) result = 16384;
+  else if (model.startsWith("ibm/granite4.1:30b-q3")) result = 8192;
   else if (model.startsWith("ibm/granite4.1")) result = 32768;
   else if (model.startsWith("qwen3:14b")) result = 65536;
   else if (model.startsWith("devstral-small-2:24b")) result = 393216;
