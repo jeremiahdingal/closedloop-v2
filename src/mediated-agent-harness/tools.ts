@@ -1490,6 +1490,16 @@ async function execSearchReplace(
     return { callId, name: "search_replace", output: "Error: path and search are required", isError: true };
   }
 
+  // Read-before-replace guard: model must read the file first to have exact content
+  if (!hasFileBeenRead(ctx.cwd, filePath)) {
+    return {
+      callId,
+      name: "search_replace",
+      output: `Error: You must read_file("${filePath}") before using search_replace on it. Read the file first, then use the exact content from the read result as your search block.`,
+      isError: true
+    };
+  }
+
   const normalized = filePath.replace(/\\/g, "/");
   if (normalized.startsWith(".git/") || normalized.includes("/.git/") ||
       normalized.startsWith("node_modules/") || normalized.includes("/node_modules/")) {
@@ -1926,6 +1936,9 @@ export function getAvailableToolsList(role: string, options?: { availableCommand
   }
   if (role === "epic-reviewer" || role === "epicReviewer") {
     return ["read_file", "list_dir", "write_file", "write_files", "remove_file", "run_command", "git_diff", "git_diff_staged", "git_status", "list_changed_files", "finish"];
+  }
+  if (role === "tester") {
+    return [...common, "run_command", "git_diff", "git_status"];
   }
   return common;
 }

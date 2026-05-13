@@ -13,7 +13,15 @@ import { WorkspaceBridge } from "../bridge/workspace-bridge.ts";
 import { deterministicDoctor } from "../bridge/doctor.ts";
 import { loadConfig } from "../config.ts";
 import { randomId, nowIso, sleep } from "../utils.ts";
-import { builderPrompt, builderToolingPrompt, doctorPrompt, reviewerPrompt, reviewerToolingPrompt } from "./prompts.ts";
+import { StagnationError, LoopTimeoutError } from "../mediated-agent-harness/errors.ts";
+import { 
+  builderPrompt, 
+  builderToolingPrompt, 
+  doctorPrompt, 
+  reviewerPrompt, 
+  reviewerToolingPrompt,
+  buildCoderResumePrompt 
+} from "./prompts.ts";
 import type { ModelGateway } from "./models.ts";
 import { loadLangGraphRuntime, type LangGraphRuntime } from "./langgraph-loader.ts";
 import { OpenCodeLaunchError, formatOpenCodeFailure } from "./opencode.ts";
@@ -46,6 +54,9 @@ type TicketGraphState = {
   workspaceId: string;
   buildAttempts: number;
   maxBuildAttempts: number;
+  coderAttempts: number;
+  hotResets: number;
+  rescueMode: boolean;
   intendedFiles: string[];
   blockHistory: string[];
   testHistory: string[];
@@ -67,6 +78,7 @@ type TicketGraphState = {
   verificationResult: any;
   repeatedBlockers: boolean;
   repeatedTestFailure: boolean;
+  recovery: boolean;
   status: "pending" | "building" | "reviewing" | "testing" | "approved" | "escalated" | "failed";
 };
 
@@ -182,6 +194,13 @@ export class TicketRunner {
         && (job.payload as any)?.skipExplorer === true
     );
 
+    // Read recovery flag — if true, skip prepare_context and go to classify (doctor)
+    const recovery = this.db.listJobRecords().some(
+      (job: any) => job.kind === "run_ticket"
+        && (job.payload as any)?.runId === runId
+        && (job.payload as any)?.recovery === true
+    );
+
     this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting LangGraph ticket: ${ticket.title}`, runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 0 });
 
     const { StateGraph, StateSchema, START, END, MemorySaver, z } = runtime;
@@ -192,6 +211,9 @@ export class TicketRunner {
       workspaceId: z.string().default(""),
       buildAttempts: z.number().default(0),
       maxBuildAttempts: z.number().default(this.resolveMaxBuildAttempts(ticket)),
+      coderAttempts: z.number().default(0),
+      hotResets: z.number().default(0),
+      rescueMode: z.boolean().default(false),
       intendedFiles: z.array(z.string()).default([]),
       blockHistory: z.array(z.string()).default([]),
       testHistory: z.array(z.string()).default([]),
@@ -202,7 +224,7 @@ export class TicketRunner {
       testSummary: z.string().default(""),
       lastDiff: z.string().default(""),
       lastMessage: z.string().default(""),
-      failureDecision: z.enum(["retry_same_node", "retry_builder", "blocked", "todo", "escalate", "approve"]).default("escalate"),
+      failureDecision: z.enum(["retry_same_node", "retry_builder", "blocked", "todo", "escalate", "approve", "review_existing"]).default("escalate"),
       failureReason: z.string().default(""),
       noDiff: z.boolean().default(false),
       skipExplorer: z.boolean().default(false),
@@ -213,8 +235,35 @@ export class TicketRunner {
       verificationResult: z.any().default(null),
       repeatedBlockers: z.boolean().default(false),
       repeatedTestFailure: z.boolean().default(false),
+      recovery: z.boolean().default(false),
       status: z.enum(["pending", "building", "reviewing", "testing", "approved", "escalated", "failed"]).default("pending")
     });
+
+    const recoveryInit = async (_state: TicketGraphState) => {
+      this.assertNotCancelled(ticket.id, ticket.epicId);
+      this.db.updateRun({ runId, status: "running", currentNode: "recovery_init", heartbeatAt: nowIso(), lastMessage: "Recovery: loading existing workspace..." });
+      this.heartbeat(runId, ticket.id, "recovery_init", "Recovery: loading existing workspace...");
+
+      const workspace = this.db.findWorkspaceByRun(runId);
+      if (!workspace) throw new Error(`No workspace found for run ${runId} — cannot recover`);
+      await this.bridge.acquireWorkspaceLease(workspace.id, runId);
+
+      const diff = await this.bridge.gitDiff(workspace.id);
+      const noDiff = !diff || diff.trim().length === 0;
+
+      this.heartbeat(runId, ticket.id, "recovery_init", `Recovery: workspace loaded (${noDiff ? "no changes" : "has changes"}). Running doctor...`);
+      return {
+        workspaceId: workspace.id,
+        buildAttempts: 0,
+        maxBuildAttempts: this.resolveMaxBuildAttempts(ticket),
+        coderAttempts: 0,
+        rescueMode: false,
+        noDiff,
+        skipExplorer: true,
+        lastMessage: "Recovery: workspace loaded, running doctor.",
+        status: "building" as const
+      } satisfies Partial<TicketGraphState>;
+    };
 
     const prepareContext = async (_state: TicketGraphState) => {
       this.assertNotCancelled(ticket.id, ticket.epicId);
@@ -247,6 +296,8 @@ export class TicketRunner {
         workspaceId: workspace.id,
         buildAttempts: 0,
         maxBuildAttempts: this.resolveMaxBuildAttempts(ticket),
+        coderAttempts: 0,
+        rescueMode: false,
         lastMessage: "Workspace prepared.",
         status: "building"
       } satisfies Partial<TicketGraphState>;
@@ -427,20 +478,84 @@ export class TicketRunner {
         return { status: "building" as const, noDiff: true, lastMessage: "Coder skipped." } satisfies Partial<TicketGraphState>;
       }
       const workspace = this.bridge.requireWorkspace(state.workspaceId);
-      this.db.updateRun({ runId, status: "running", currentNode: "coder", heartbeatAt: nowIso(), lastMessage: "Coder generating edits..." });
-      this.heartbeat(runId, ticket.id, "coder", "Coder generating edits...");
+      const coderAttempts = (state.coderAttempts ?? 0) + 1;
+      const isRescue = state.rescueMode || coderAttempts >= 3;
 
-      const coderResult = await this.gateway.runCoderInWorkspace!({
-        cwd: workspace.worktreePath,
-        prompt: coderPrompt(ticket, state.explorerOutput, state.canonicalEditPacket, { blockers: state.reviewBlockers ?? [], suggestions: state.reviewSuggestions ?? [] }, { skipped: state.skipExplorer, reason: "Explorer was skipped by user request." }),
-        runId, ticketId: ticket.id, epicId: ticket.epicId, skipExplorer: state.skipExplorer,
-        onStream: (evt: any) => {
-          evt.runId = runId;
-          evt.ticketId = ticket.id;
-          evt.epicId = ticket.epicId;
-          this.recordAgentStream(evt);
+      if (isRescue && !state.rescueMode) {
+        this.heartbeat(runId, ticket.id, "coder", `3 coder failures reached. Switching to rescue model (attempt ${coderAttempts})...`);
+      } else if (isRescue) {
+        this.heartbeat(runId, ticket.id, "coder", `Rescue coder attempt ${coderAttempts}...`);
+      } else {
+        this.heartbeat(runId, ticket.id, "coder", `Coder generating edits (attempt ${coderAttempts})...`);
+      }
+      this.db.updateRun({ runId, status: "running", currentNode: "coder", heartbeatAt: nowIso(), lastMessage: isRescue ? "Rescue coder running..." : "Coder generating edits..." });
+
+      // When in rescue mode, override coder to use ZAI Anthropic endpoint
+      let activeGateway = this.gateway;
+      if (isRescue) {
+        const { createAnthropicHarnessGateway } = await import("./models.ts");
+        activeGateway = createAnthropicHarnessGateway();
+      }
+
+      const maxHotResets = 3;
+      let hotResets = 0;
+
+      // Unify Force In-Place and Hot-Reset: if workspace has existing changes, use resume prompt
+      const initialDiff = await this.bridge.gitDiff(workspace.id);
+      let currentCoderPrompt: string;
+
+      if (initialDiff && initialDiff.trim().length > 0) {
+        this.heartbeat(runId, ticket.id, "coder", "Existing workspace changes detected. Resuming via Hot-Reset prompt.");
+        currentCoderPrompt = buildCoderResumePrompt(ticket, initialDiff, state.reviewBlockers ?? [], state.explorerOutput);
+      } else {
+        currentCoderPrompt = coderPrompt(ticket, state.explorerOutput, state.canonicalEditPacket, { blockers: state.reviewBlockers ?? [], suggestions: state.reviewSuggestions ?? [] }, { skipped: state.skipExplorer, reason: "Explorer was skipped by user request." });
+      }
+
+      let coderResult;
+      while (true) {
+        try {
+          coderResult = await activeGateway.runCoderInWorkspace!({
+            cwd: workspace.worktreePath,
+            prompt: currentCoderPrompt,
+            runId, ticketId: ticket.id, epicId: ticket.epicId, skipExplorer: state.skipExplorer,
+            onStream: (evt: any) => {
+              evt.runId = runId;
+              evt.ticketId = ticket.id;
+              evt.epicId = ticket.epicId;
+              this.recordAgentStream(evt);
+            }
+          });
+          break; // Success
+        } catch (err) {
+          const isStall = err instanceof StagnationError || err instanceof LoopTimeoutError;
+          if (!isStall || hotResets >= maxHotResets) {
+            throw err;
+          }
+
+          hotResets++;
+          console.log(`[TICKET ${ticket.id}] Coder stalled, hot-reset #${hotResets}`);
+
+          // Stage any partial changes so they show up in git diff
+          await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] partial changes before hot-reset #${hotResets}` }).catch(() => {});
+
+          // Build condensed resume prompt
+          const currentDiff = await this.bridge.gitDiff(workspace.id);
+          currentCoderPrompt = buildCoderResumePrompt(ticket, currentDiff, state.reviewBlockers ?? [], state.explorerOutput);
+
+          this.recordAgentStream({
+            agentRole: "coder",
+            source: "orchestrator",
+            streamKind: "status",
+            content: `Coder stalled. Hot-reset #${hotResets} — restarting with condensed context (${currentDiff.length} chars of diff)...`,
+            runId,
+            ticketId: ticket.id,
+            epicId: ticket.epicId
+          });
+
+          // Re-invoke with fresh harness (condensed prompt)
+          continue;
         }
-      });
+      }
 
       // Detect direct writes from tool call history
       const writeToolNames = new Set(["write_file", "write_files", "search_replace"]);
@@ -495,6 +610,9 @@ export class TicketRunner {
             noDiff: false,
             lastMessage: "Coder wrote files directly via tool calls.",
             status: "reviewing" as const,
+            coderAttempts,
+            hotResets,
+            rescueMode: isRescue,
           } satisfies Partial<TicketGraphState>;
         }
 
@@ -506,6 +624,9 @@ export class TicketRunner {
           noDiff: false,
           lastMessage: "Coder wrote files via tool calls (diff not captured).",
           status: "reviewing" as const,
+          coderAttempts,
+          hotResets,
+          rescueMode: isRescue,
         } satisfies Partial<TicketGraphState>;
       }
 
@@ -529,15 +650,28 @@ export class TicketRunner {
             noDiff: false,
             lastMessage: "Coder output was not valid JSON but workspace contains changes.",
             status: "reviewing" as const,
+            coderAttempts,
+            hotResets,
+            rescueMode: isRescue,
           } satisfies Partial<TicketGraphState>;
         }
         this.heartbeat(runId, ticket.id, "system", `Coder output was not valid JSON. Escalating. Raw output: ${coderResult.text.slice(0, 200)}`);
-        return { status: "building" as const, buildAttempts: state.buildAttempts + 1, lastMessage: `Coder output invalid: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}` };
+        return {
+          status: "building" as const,
+          buildAttempts: state.buildAttempts + 1,
+          lastMessage: `Coder output invalid: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
+          coderAttempts,
+          hotResets,
+          rescueMode: isRescue
+        };
       }
 
       return {
         coderOutput,
         lastMessage: "Coder complete. Verifying...",
+        coderAttempts,
+        hotResets,
+        rescueMode: isRescue,
       } satisfies Partial<TicketGraphState>;
     };
 
@@ -602,46 +736,30 @@ export class TicketRunner {
             status: "reviewing" as const,
           } satisfies Partial<TicketGraphState>;
         }
-        // Applied ops but no diff (e.g. replace with identical content) — treat as noDiff
+        // Applied ops but no diff (e.g. replace with identical content) — fall through to existing-diff check
         console.warn(`[VERIFY] ${ticket.id} applied ${verificationResult.appliedOperations.length} ops but no diff produced`);
       }
 
-      // Coder produced 0 ops ("already satisfied") — check if workspace already has a diff from a previous run
-      if (verificationResult.outcome === "empty_failure" || verificationResult.outcome === "escalate") {
-        let existingDiff = await this.bridge.gitDiff(workspace.id);
-        if (!existingDiff || !existingDiff.trim()) {
-          const diffBase = await getEffectiveDiffBase(workspace.worktreePath, workspace.baseCommit);
-          const baseDiff = await git(workspace.worktreePath, ["diff", diffBase, "--", "."]);
-          existingDiff = baseDiff.stdout.trim() || existingDiff;
-        }
-        if (existingDiff && existingDiff.trim()) {
-          console.log(`[VERIFY] ${ticket.id} coder produced 0 ops but workspace has existing diff — treating as already-complete`);
-          this.heartbeat(runId, ticket.id, "coder", "No new operations needed — workspace already contains changes. Proceeding to review.");
-          return {
-            verificationResult,
-            lastDiff: existingDiff,
-            noDiff: false,
-            lastMessage: "Coder determined no changes needed; workspace already contains prior changes matching ticket criteria.",
-            status: "reviewing" as const,
-          } satisfies Partial<TicketGraphState>;
-        }
-      }
-
-      // Complete failure, escalate, or empty — check workspace one last time before giving up
-      let lastChanceDiff = await this.bridge.gitDiff(workspace.id);
-      if (!lastChanceDiff || !lastChanceDiff.trim()) {
+      // Helper: get diff including committed changes against base
+      const getWorkspaceDiff = async (): Promise<string> => {
+        let diff = await this.bridge.gitDiff(workspace.id);
+        if (diff && diff.trim()) return diff;
         const diffBase = await getEffectiveDiffBase(workspace.worktreePath, workspace.baseCommit);
         const baseDiff = await git(workspace.worktreePath, ["diff", diffBase, "--", "."]);
-        lastChanceDiff = baseDiff.stdout.trim() || lastChanceDiff;
-      }
-      if (lastChanceDiff && lastChanceDiff.trim()) {
-        console.log(`[VERIFY] ${ticket.id} verification ${verificationResult.outcome} but workspace has diff — committing and proceeding`);
-        await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] ${ticket.title} (partial coder)` });
+        diff = baseDiff.stdout.trim();
+        return diff && diff.trim() ? diff : "";
+      };
+
+      // Coder produced 0 ops or applied ops produced no diff — check if workspace already has changes
+      const existingDiff = await getWorkspaceDiff();
+      if (existingDiff) {
+        console.log(`[VERIFY] ${ticket.id} coder produced no new ops but workspace has existing diff — proceeding to review`);
+        this.heartbeat(runId, ticket.id, "coder", "No new operations needed — workspace already contains changes. Proceeding to review.");
         return {
           verificationResult,
-          lastDiff: lastChanceDiff,
+          lastDiff: existingDiff,
           noDiff: false,
-          lastMessage: `Verification ${verificationResult.outcome} but workspace contains changes. ${verificationResult.summary}`,
+          lastMessage: "Workspace already contains changes matching ticket criteria.",
           status: "reviewing" as const,
         } satisfies Partial<TicketGraphState>;
       }
@@ -858,6 +976,7 @@ export class TicketRunner {
 
         const changedFilesDesc = state.intendedFiles.join("\n");
         const buildDiffDesc = state.lastDiff?.slice(0, 2000) || "No diff available";
+        const ticketGoalDesc = ticket.description || ticket.title || "No ticket description";
 
         // HARD TIMEOUT: 5 minutes max for tester
         let timeoutHandle: NodeJS.Timeout | null = null;
@@ -880,7 +999,7 @@ export class TicketRunner {
           this.withHeartbeat(runId, ticket.id, "tester", "Running tests.", () =>
             this.gateway.runTesterInWorkspace!({
               cwd: workspace.worktreePath,
-              prompt: `Test the following changes:\n\nChanged files:\n${changedFilesDesc}\n\nBuild diff:\n${buildDiffDesc}`,
+              prompt: `Test ONLY the features related to this ticket:\n\nTicket: ${ticketGoalDesc}\n\nChanged files:\n${changedFilesDesc}\n\nBuild diff:\n${buildDiffDesc}`,
               runId,
               ticketId: ticket.id,
               epicId: ticket.epicId,
@@ -982,7 +1101,53 @@ export class TicketRunner {
 
     const classifyNode = async (state: TicketGraphState) => {
       this.assertNotCancelled(ticket.id, ticket.epicId);
-      console.log(`[TICKET ${ticket.id}] Classify node: buildAttempts=${state.buildAttempts}/${state.maxBuildAttempts}, noDiff=${state.noDiff}, repeatedBlockers=${state.repeatedBlockers}, reviewApproved=${state.reviewApproved}`);
+      console.log(`[TICKET ${ticket.id}] Classify node: buildAttempts=${state.buildAttempts}/${state.maxBuildAttempts}, coderAttempts=${state.coderAttempts}, rescueMode=${state.rescueMode}, noDiff=${state.noDiff}, repeatedBlockers=${state.repeatedBlockers}, reviewApproved=${state.reviewApproved}`);
+
+      // Hard guard: if coder has failed 5+ times total (including rescue), stop retrying
+      if ((state.coderAttempts ?? 0) >= 5) {
+        const reason = `Coder failed ${state.coderAttempts} times. Escalating to prevent recursion limit.`;
+        console.log(`[TICKET ${ticket.id}] Classify: coder exhausted (${state.coderAttempts} attempts), escalating`);
+        return {
+          failureDecision: "escalate",
+          failureReason: reason,
+          lastMessage: reason,
+          status: "escalated"
+        } satisfies Partial<TicketGraphState>;
+      }
+
+      // If noDiff and workspace already has committed changes, send to reviewer to check
+      if (state.noDiff && state.workspaceId) {
+        try {
+          const workspace = this.bridge.requireWorkspace(state.workspaceId);
+          const diffBase = await getEffectiveDiffBase(workspace.worktreePath, workspace.baseCommit);
+          const baseDiff = await git(workspace.worktreePath, ["diff", diffBase, "--", "."]);
+          if (baseDiff.stdout.trim()) {
+            console.log(`[TICKET ${ticket.id}] Classify: noDiff but workspace has existing changes — sending to reviewer`);
+            return {
+              failureDecision: "review_existing",
+              lastDiff: baseDiff.stdout.trim(),
+              noDiff: false,
+              lastMessage: "Coder produced no new changes but workspace has existing diff — reviewer will verify.",
+              status: "reviewing" as const,
+            } satisfies Partial<TicketGraphState>;
+          }
+        } catch (err) {
+          console.warn(`[TICKET ${ticket.id}] Classify: failed to check workspace diff: ${err}`);
+        }
+      }
+
+      // Rescue mode activation: after 3 coder failures, switch to rescue before escalating
+      if ((state.coderAttempts ?? 0) >= 3 && !state.rescueMode) {
+        const reason = `3 coder failures reached. Activating rescue mode with heavier model.`;
+        console.log(`[TICKET ${ticket.id}] Classify: activating rescue mode`);
+        return {
+          failureDecision: "retry_builder",
+          failureReason: reason,
+          lastMessage: reason,
+          rescueMode: true,
+          status: "building"
+        } satisfies Partial<TicketGraphState>;
+      }
 
       // Hard guard: prevent infinite retry loops
       if (state.buildAttempts >= state.maxBuildAttempts) {
@@ -1179,6 +1344,7 @@ export class TicketRunner {
     };
 
     const graphBuilder = new StateGraph(TicketState)
+      .addNode("recovery_init", recoveryInit)
       .addNode("prepare_context", prepareContext)
       .addNode("explorer", explorerNode)
       .addNode("build_packet", buildPacketNode)
@@ -1190,13 +1356,17 @@ export class TicketRunner {
       .addNode("finalize_success", finalizeSuccess)
       .addNode("finalize_escalated", finalizeEscalated)
       .addNode("finalize_failed", finalizeFailed)
-      .addEdge(START, "prepare_context")
+      .addConditionalEdges(START,
+        (state: TicketGraphState) => state.recovery ? "recovery_init" : "prepare_context",
+        ["recovery_init", "prepare_context"]
+      )
       .addConditionalEdges("prepare_context",
         (state: TicketGraphState) => state.skipExplorer ? "build_packet" : "explorer",
         ["explorer", "build_packet"]
       )
       .addEdge("explorer", "build_packet")
       .addEdge("build_packet", "coder")
+      .addEdge("recovery_init", "classify")
       .addEdge("coder", "verify")
       .addConditionalEdges("verify",
         (state: TicketGraphState) => state.noDiff ? "classify" : "reviewer",
@@ -1212,11 +1382,12 @@ export class TicketRunner {
         "classify",
         (state: TicketGraphState) => {
           if (state.failureDecision === "approve") return "finalize_success";
+          if (state.failureDecision === "review_existing") return "reviewer";
           if (["escalate", "blocked", "todo"].includes(state.failureDecision)) return "finalize_escalated";
-          if (state.failureDecision === "retry_same_node" || state.failureDecision === "retry_builder") return "build_packet";
+          if (state.failureDecision === "retry_same_node" || state.failureDecision === "retry_builder") return "coder";
           return "finalize_failed";
         },
-        ["finalize_success", "finalize_escalated", "finalize_failed", "build_packet"]
+        ["finalize_success", "finalize_escalated", "finalize_failed", "coder", "reviewer"]
       )
       .addEdge("finalize_success", END)
       .addEdge("finalize_escalated", END)
@@ -1225,13 +1396,52 @@ export class TicketRunner {
     const graph = graphBuilder.compile(MemorySaver ? { checkpointer: new MemorySaver() } : undefined);
 
     try {
-      const result = await graph.invoke({ runId, epicId: ticket.epicId, ticketId: ticket.id, skipExplorer }, {
-        configurable: { thread_id: runId }
+      const result = await graph.invoke({ runId, epicId: ticket.epicId, ticketId: ticket.id, skipExplorer, recovery }, {
+        configurable: { thread_id: runId },
+        recursionLimit: 50,
       }) as TicketGraphState;
+
+      // Auto-retry from scratch on escalation or failure
+      const finalStatus = result.status === "approved" ? "approved" : result.status === "escalated" ? "escalated" : "failed";
+      if (finalStatus !== "approved") {
+        console.log(`[TICKET ${ticket.id}] ${finalStatus} — auto-retrying from scratch`);
+        this.db.recordEvent({
+          aggregateType: "ticket",
+          aggregateId: ticket.id,
+          runId,
+          ticketId: ticket.id,
+          kind: "ticket_auto_retry",
+          message: `Ticket ${finalStatus}, auto-retrying from scratch.`,
+        });
+        // Create a fresh run so the worker picks it up
+        const retryRunId = randomId("run");
+        this.db.createRun({
+          id: retryRunId,
+          kind: "ticket",
+          epicId: ticket.epicId,
+          ticketId: ticket.id,
+          status: "queued",
+          currentNode: "queued",
+          attempt: 0,
+          heartbeatAt: null,
+          lastMessage: `Auto-retry after ${finalStatus}.`,
+          errorText: null
+        });
+        this.db.updateTicketRunState({
+          ticketId: ticket.id,
+          status: "queued",
+          currentRunId: retryRunId,
+          currentNode: "queued",
+          lastHeartbeatAt: nowIso(),
+          lastMessage: `Auto-retry after ${finalStatus}.`
+        });
+        this.db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: retryRunId });
+      }
+
       return {
         runId,
         workspaceId: result.workspaceId,
-        status: result.status === "approved" ? "approved" : result.status === "escalated" ? "escalated" : "failed",
+        status: finalStatus,
         lastDiff: result.lastDiff,
         reviewVerdict: result.reviewApproved ? {
           approved: true,
@@ -1258,6 +1468,32 @@ export class TicketRunner {
       }
       this.db.updateRun({ runId, status: "failed", currentNode: "error", heartbeatAt: nowIso(), lastMessage: "Ticket crashed.", errorText: (error as Error).message });
       this.db.updateTicketRunState({ ticketId: ticket.id, status: "failed", currentNode: "error", lastHeartbeatAt: nowIso(), lastMessage: (error as Error).message });
+
+      // Auto-retry from scratch on crash
+      console.log(`[TICKET ${ticket.id}] crashed — auto-retrying from scratch`);
+      const crashRunId = randomId("run");
+      this.db.createRun({
+        id: crashRunId,
+        kind: "ticket",
+        epicId: ticket.epicId,
+        ticketId: ticket.id,
+        status: "queued",
+        currentNode: "queued",
+        attempt: 0,
+        heartbeatAt: null,
+        lastMessage: "Auto-retry after crash.",
+        errorText: null
+      });
+      this.db.updateTicketRunState({
+        ticketId: ticket.id,
+        status: "queued",
+        currentRunId: crashRunId,
+        currentNode: "queued",
+        lastHeartbeatAt: nowIso(),
+        lastMessage: "Auto-retry after crash."
+      });
+      this.db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: crashRunId });
+
       throw error;
     } finally {
       const workspace = this.db.findWorkspaceByRun(runId);
@@ -1460,11 +1696,12 @@ export class TicketRunner {
         if (this.gateway.runTesterInWorkspace && this.gateway.models.tester.startsWith("mediated:")) {
           const changedFilesDesc = builderResult.intendedFiles.join("\n");
           const buildDiffDesc = lastDiff.slice(0, 2000) || "No diff available";
-          
+          const ticketGoalDesc = ticket.description || ticket.title || "No ticket description";
+
           const testerResult = await this.withHeartbeat(runId, ticket.id, "tester", "Running tests.", () =>
             this.gateway.runTesterInWorkspace!({
               cwd: workspace.worktreePath,
-              prompt: `Test the following changes:\n\nChanged files:\n${changedFilesDesc}\n\nBuild diff:\n${buildDiffDesc}\n\nScore test necessity and write/run tests if needed.`,
+              prompt: `Test ONLY the features related to this ticket:\n\nTicket: ${ticketGoalDesc}\n\nChanged files:\n${changedFilesDesc}\n\nBuild diff:\n${buildDiffDesc}`,
               runId,
               ticketId: ticket.id,
               epicId: ticket.epicId,
@@ -2496,6 +2733,35 @@ export class TicketRunner {
       content: JSON.stringify({ reason, runId, ticketId }, null, 2)
     });
     await this.bridge.archiveWorkspace(workspaceId);
+
+    // Auto-retry from scratch
+    const ticket = this.db.getTicket(ticketId);
+    if (ticket) {
+      console.log(`[TICKET ${ticketId}] escalated — auto-retrying from scratch`);
+      const retryRunId = randomId("run");
+      this.db.createRun({
+        id: retryRunId,
+        kind: "ticket",
+        epicId: ticket.epicId,
+        ticketId,
+        status: "queued",
+        currentNode: "queued",
+        attempt: 0,
+        heartbeatAt: null,
+        lastMessage: "Auto-retry after escalation.",
+        errorText: null
+      });
+      this.db.updateTicketRunState({
+        ticketId,
+        status: "queued",
+        currentRunId: retryRunId,
+        currentNode: "queued",
+        lastHeartbeatAt: nowIso(),
+        lastMessage: "Auto-retry after escalation."
+      });
+      this.db.enqueueJob("run_ticket", { ticketId, epicId: ticket.epicId, runId: retryRunId });
+    }
+
     return { runId, workspaceId, status: "escalated", lastDiff: "", reviewVerdict: null, testSummary: reason };
   }
 

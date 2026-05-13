@@ -41,10 +41,12 @@ export function resolveModelContextWindow(model: string): number {
   else if (model.startsWith("qwen3.5:9b")) result = 65536;
   else if (model.startsWith("qwen3.5:27b")) result = 65536;
   else if (model.startsWith("vladimirgav/qwen3.6-27b")) result = 65536;
+  else if (model.startsWith("batiai/qwen3.6-27b")) result = 16384;
+  else if (model.startsWith("ibm/granite4.1")) result = 32768;
   else if (model.startsWith("qwen3:14b")) result = 65536;
   else if (model.startsWith("devstral-small-2:24b")) result = 393216;
   else if (model.startsWith("qwen2.5-coder:14b")) result = 65536;
-  return Math.max(result, 65536);
+  return result;
 }
 
 export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarnessResult> {
@@ -57,6 +59,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
   } = input;
 
   const baseURL = config.baseURL ?? "http://localhost:11434";
+  const apiBackend = config.apiBackend ?? "ollama";
   const toolMode = config.toolMode ?? "native";
   const maxIterations = config.maxIterations ?? 80;
   const timeoutMs = config.timeoutMs ?? 900_000;
@@ -223,37 +226,14 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
     const effectiveToolMode = stallState.toolModeOverride ?? toolMode;
 
-    // Make streaming request to Ollama native /api/chat
+    // Make streaming request to model backend
     let response: Response;
     try {
-      response = await fetch(`${baseURL}/api/chat`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        signal: AbortSignal.timeout(900_000),
-        body: JSON.stringify({
-          model: config.model,
-          messages: messages.map(convertToOllamaMessage),
-          ...(effectiveToolMode === "native" ? {
-            tools: tools.map(t => ({
-              type: t.type,
-              function: {
-                name: t.function.name,
-                description: t.function.description,
-                parameters: t.function.parameters,
-              },
-            })),
-          } : {}),
-          stream: true,
-          options: {
-            temperature,
-            top_p: topP,
-            top_k: topK,
-            num_ctx: numCtx,
-          },
-        }),
-      });
+      if (apiBackend === "anthropic") {
+        response = await fetchAnthropic(baseURL, config.apiKey ?? "", config.model, messages, tools, effectiveToolMode, systemPrompt, numCtx);
+      } else {
+        response = await fetchOllama(baseURL, config.model, messages, tools, effectiveToolMode, temperature, topP, topK, numCtx, config.noThink);
+      }
     } catch (err) {
       throw new ModelConnectionError(
         `Failed to connect to model server: ${err instanceof Error ? err.message : String(err)}`,
@@ -271,7 +251,9 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     }
 
     // Parse streaming response
-    const parser = new StreamParser();
+    const parser = new StreamParser((text: string, isThinking: boolean) => {
+      emit({ kind: isThinking ? "streaming_thinking" : "streaming_text", text });
+    });
     const reader = response.body?.getReader();
     if (!reader) {
       throw new ModelConnectionError("No response body from model server", baseURL);
@@ -279,6 +261,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
     const decoder = new TextDecoder();
     let buffer = "";
+    const anthropicToolNames = new Map<number, string>();
 
     try {
       while (true) {
@@ -286,20 +269,62 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
 
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed) {
-            parser.feed(trimmed);
+        if (apiBackend === "anthropic") {
+          // Anthropic SSE: event:\ndata:{json}\n\n
+          const events = buffer.split("\n\n");
+          buffer = events.pop() ?? "";
+          for (const event of events) {
+            const dataLine = event.split("\n").find(l => l.startsWith("data:"));
+            if (!dataLine) continue;
+            const jsonStr = dataLine.slice(5).trim();
+            if (!jsonStr) continue;
+            try {
+              const evt = JSON.parse(jsonStr);
+              if (evt.type === "content_block_delta" && evt.delta?.type === "text_delta") {
+                parser.feed(JSON.stringify({ message: { content: evt.delta.text } }));
+              } else if (evt.type === "content_block_delta" && evt.delta?.type === "thinking_delta") {
+                parser.feed(JSON.stringify({ message: { content: "" }, thinking: evt.delta.thinking }));
+              } else if (evt.type === "content_block_start" && evt.content_block?.type === "tool_use") {
+                anthropicToolNames.set(evt.index, evt.content_block.name);
+              } else if (evt.type === "content_block_delta" && evt.delta?.type === "input_json_delta") {
+                const idx = evt.index ?? 0;
+                const name = anthropicToolNames.get(idx) ?? "";
+                parser.feed(JSON.stringify({ message: { tool_calls: [{ function: { name, arguments: evt.delta.partial_json } }] } }));
+              } else if (evt.type === "message_stop") {
+                parser.feed(JSON.stringify({ done: true }));
+              }
+            } catch { /* skip malformed */ }
+          }
+        } else {
+          // Ollama NDJSON: one JSON object per line
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed) {
+              parser.feed(trimmed);
+            }
           }
         }
       }
 
       // Process remaining buffer
       if (buffer.trim()) {
-        parser.feed(buffer.trim());
+        if (apiBackend === "anthropic") {
+          // Process any remaining SSE event
+          const dataLine = buffer.split("\n").find(l => l.startsWith("data:"));
+          if (dataLine) {
+            try {
+              const evt = JSON.parse(dataLine.slice(5).trim());
+              if (evt.type === "content_block_delta" && evt.delta?.type === "text_delta") {
+                parser.feed(JSON.stringify({ message: { content: evt.delta.text } }));
+              }
+            } catch { /* skip */ }
+          }
+        } else {
+          parser.feed(buffer.trim());
+        }
       }
     } finally {
       reader.releaseLock();
@@ -307,6 +332,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
     const state = parser.drain();
     let assistantText = state.content;
+    lastActivityTime = Date.now();
 
     // If no API tool calls, check for XML-style tool calls or termination
     if (state.toolCalls.length === 0) {
@@ -435,11 +461,16 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       }
 
       // Validate and repair
+      const inferCtx = {
+        recentPaths: history.getRecentPaths(),
+        lastReadPath: history.getLastReadPath(),
+      };
       const validated = validateAndRepair(
         { name: completeCall.name, arguments: completeCall.arguments },
         toolSchemaMap,
         history,
-        config.allowedPaths ?? ["*"]
+        config.allowedPaths ?? ["*"],
+        inferCtx
       );
 
       if ("kind" in validated) {
@@ -568,6 +599,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     for (const tr of toolResults) {
       messages.push(tr);
     }
+    lastActivityTime = Date.now();
   }
 
   // Max iterations reached
@@ -947,4 +979,87 @@ function parseArgsToObject(argsStr: string): Record<string, unknown> {
     }
   } catch {}
   return {};
+}
+
+// ─── Backend fetch helpers ────────────────────────────────────────────────────
+
+function convertToAnthropicMessages(messages: ChatMessage[]): { role: string; content: string }[] {
+  return messages.map(m => {
+    if (m.role === "tool") {
+      return { role: "user", content: `Tool result: ${m.content ?? ""}` };
+    }
+    return { role: m.role === "assistant" ? "assistant" : "user", content: m.content ?? "" };
+  }).filter(m => m.role === "user" || m.role === "assistant");
+}
+
+async function fetchOllama(
+  baseURL: string,
+  model: string,
+  messages: ChatMessage[],
+  tools: any[],
+  toolMode: string,
+  temperature: number,
+  topP: number,
+  topK: number,
+  numCtx: number,
+  noThink?: boolean,
+): Promise<Response> {
+  return fetch(`${baseURL}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(900_000),
+    body: JSON.stringify({
+      model,
+      messages: messages.map(convertToOllamaMessage),
+      ...(toolMode === "native" ? {
+        tools: tools.map(t => ({
+          type: t.type,
+          function: {
+            name: t.function.name,
+            description: t.function.description,
+            parameters: t.function.parameters,
+          },
+        })),
+      } : {}),
+      stream: true,
+      think: noThink ? false : undefined,
+      options: { temperature, top_p: topP, top_k: topK, num_ctx: numCtx },
+    }),
+  });
+}
+
+async function fetchAnthropic(
+  baseURL: string,
+  apiKey: string,
+  model: string,
+  messages: ChatMessage[],
+  tools: any[],
+  toolMode: string,
+  systemPrompt: string,
+  _numCtx: number,
+): Promise<Response> {
+  const anthropicMessages = convertToAnthropicMessages(messages);
+  const anthropicTools = toolMode === "native" ? tools.map(t => ({
+    name: t.function.name,
+    description: t.function.description,
+    input_schema: t.function.parameters,
+  })) : undefined;
+
+  return fetch(`${baseURL}/v1/messages`, {
+    method: "POST",
+    headers: {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    signal: AbortSignal.timeout(900_000),
+    body: JSON.stringify({
+      model,
+      max_tokens: 16384,
+      stream: true,
+      system: systemPrompt,
+      messages: anthropicMessages,
+      ...(anthropicTools?.length ? { tools: anthropicTools } : {}),
+    }),
+  });
 }

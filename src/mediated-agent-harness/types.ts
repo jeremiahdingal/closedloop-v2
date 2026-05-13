@@ -69,12 +69,15 @@ export interface StreamState {
 
 export interface MediatedHarnessConfig {
   baseURL?: string;
-  /** @deprecated Not needed for Ollama native API */
+  /** API key for Anthropic-compatible backends */
   apiKey?: string;
+  /** "ollama" (default) or "anthropic" for Anthropic-compatible endpoints */
+  apiBackend?: "ollama" | "anthropic";
   model: string;
   cwd: string;
   role?: string;
   toolMode?: "native" | "xml";
+  noThink?: boolean;
   allowedPaths?: string[];
   maxIterations?: number;
   timeoutMs?: number;
@@ -111,6 +114,8 @@ export interface ToolExecutionContext {
 export type MediatedHarnessEvent =
   | { kind: "thinking"; text: string }
   | { kind: "text"; text: string }
+  | { kind: "streaming_text"; text: string }
+  | { kind: "streaming_thinking"; text: string }
   | { kind: "tool_call"; call: ToolCall }
   | { kind: "tool_result"; result: ToolResult }
   | { kind: "tool_error"; call: ToolCall; error: string }

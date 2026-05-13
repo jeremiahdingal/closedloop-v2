@@ -125,7 +125,8 @@ export type GoalDecomposition = {
     description: string;
     acceptanceCriteria: string[];
     dependencies: string[];
-    allowedPaths: string[];
+    allowedPaths?: string[];
     priority: string;
+    testSpecs?: string[];
   }>;
 };

@@ -481,6 +481,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:ibm/granite4.1:30b-q3_K_M", label: "Mediated (Granite 4.1 30B)", description: "Local tool execution via Ollama + harness" },
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" },
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
     { id: "ollama", label: "Ollama (Fallback)", description: "Pure LLM via local Ollama, no workspace tools" },
@@ -495,6 +496,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:ibm/granite4.1:30b-q3_K_M", label: "Mediated (Granite 4.1 30B)", description: "Local tool execution via Ollama + harness" },
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" },
     { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
@@ -505,6 +507,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "mediated:gemma4:e4b", label: "Mediated (gemma4:e4b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:ibm/granite4.1:30b-q3_K_M", label: "Mediated (Granite 4.1 30B)", description: "Local tool execution via Ollama + harness" },
     { id: "qwen3:14b", label: "Ollama (qwen3:14b)", description: "Pure LLM via local Ollama, no workspace tools" },
     { id: "qwen3.5:9b", label: "Ollama (qwen3.5:9b)", description: "Pure LLM via local Ollama, no workspace tools" },
     { id: "glm-4.7-flash:q4_K_M", label: "Ollama (glm-4.7-flash)", description: "Pure LLM via local Ollama, no workspace tools" },
@@ -514,9 +517,11 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
   tester: [
     { id: "skip", label: "Skip Tester", description: "Bypass tester step and mark tests as skipped" },
     { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
+    { id: "mediated:qwen3.5:9b", label: "Mediated (qwen3.5:9b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:e4b", label: "Mediated (gemma4:e4b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
-    { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" }
+    { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:ibm/granite4.1:30b-q3_K_M", label: "Mediated (Granite 4.1 30B)", description: "Local tool execution via Ollama + harness" }
   ],
   builder: [
     { id: "gemini-cli", label: "Gemini CLI", description: "Workspace-aware local Gemini CLI execution" },
@@ -532,7 +537,8 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:devstral-small-2:24b", label: "Mediated (devstral-small-2:24b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
-    { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" }
+    { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:ibm/granite4.1:30b-q3_K_M", label: "Mediated (Granite 4.1 30B)", description: "Local tool execution via Ollama + harness" }
   ],
   coder: [
     { id: "gemini-cli", label: "Gemini CLI", description: "Workspace-aware local Gemini CLI execution" },
@@ -543,6 +549,8 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:vladimirgav/qwen3.6-27b-16gb-vram-uncensored", label: "Mediated (Qwen3.6-27B Uncensored)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:batiai/qwen3.6-27b:iq3", label: "Mediated (BatiAI Qwen3.6-27B iq3)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:ibm/granite4.1:30b-q3_K_M", label: "Mediated (Granite 4.1 30B)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
@@ -1000,7 +1008,7 @@ async function main() {
           lastHeartbeatAt: timestamp,
           lastMessage: reason
         });
-        db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id });
+        db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id, recovery: true });
         db.recordEvent({
           aggregateType: "ticket",
           aggregateId: ticket.id,
@@ -1038,10 +1046,10 @@ async function main() {
         }
 
         const node = String(run.currentNode ?? "").toLowerCase();
-        if (requireReviewerNode && !node.includes("review")) {
+        if (requireReviewerNode && !node.includes("review") && node !== "error") {
           return json(res, 409, {
             error: "run_not_in_reviewer",
-            message: "Force rescue is only allowed when current node is reviewer.",
+            message: "Force rescue is only allowed when current node is reviewer or error.",
             currentNode: run.currentNode
           });
         }
@@ -1086,7 +1094,7 @@ async function main() {
           lastHeartbeatAt: timestamp,
           lastMessage: reason
         });
-        db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id });
+        db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id, recovery: true });
         db.recordEvent({
           aggregateType: "ticket",
           aggregateId: ticket.id,
@@ -1151,6 +1159,53 @@ async function main() {
       if (deleteTicketMatch && req.method === "DELETE") {
         const summary = await lifecycle.deleteTicket(decodeURIComponent(deleteTicketMatch[1]));
         return json(res, 200, { ok: true, ...summary });
+      }
+      // Kick off one queued ticket that has satisfied deps
+      if (url.pathname === "/api/kick" && req.method === "POST") {
+        const tickets = db.listTickets();
+        const started: string[] = [];
+        for (const ticket of tickets) {
+          if (ticket.status !== "queued" || !ticket.epicId) continue;
+          const epic = db.getEpic(ticket.epicId);
+          if (!epic || epic.status === "cancelled") continue;
+          const supersededIds = new Set(
+            db.listTickets(ticket.epicId)
+              .map((t: any) => (t.metadata as Record<string, unknown>)?.originalTicketId as string | undefined)
+              .filter((id): id is string => Boolean(id))
+          );
+          const depsReady = ticket.dependencies.every((depId: string) => {
+            const dep = db.getTicket(depId);
+            return dep?.status === "approved" || supersededIds.has(depId);
+          });
+          if (!depsReady) continue;
+
+          // Check no active run/job already
+          const runs = db.listRunsForTicket(ticket.id);
+          const activeRun = runs.find((r: any) =>
+            r.status === "queued" || r.status === "running" || r.status === "waiting"
+          );
+          if (activeRun) {
+            // Ensure there's a job
+            const hasJob = db.listJobRecords().some((j: any) =>
+              j.kind === "run_ticket" && (j.status === "queued" || j.status === "running") &&
+              String((j.payload ?? {} as any).runId ?? "") === activeRun.id
+            );
+            if (hasJob) continue; // already has a job, worker will pick up
+          }
+
+          const runId = await ticketRunner.start(ticket.id, ticket.epicId);
+          db.updateTicketRunState({
+            ticketId: ticket.id,
+            status: "queued",
+            currentRunId: runId,
+            currentNode: "queued",
+            lastHeartbeatAt: new Date().toISOString(),
+            lastMessage: "API kick started ticket."
+          });
+          started.push(ticket.id);
+          if (started.length >= config.workerConcurrency) break;
+        }
+        return json(res, 200, { ok: true, started, count: started.length });
       }
       if (url.pathname === "/api/config" && req.method === "GET") {
         const configPath = path.join(process.cwd(), "config", "workspace.json");

@@ -25,6 +25,7 @@ const SOURCE_SHORT: Record<string, string> = {
 const KIND_LABEL: Record<string, string> = {
   tool_call: "tool",
   tool_result: "result",
+  tool_error: "err",
   assistant: "text",
   thinking: "think",
   status: "status",
@@ -45,7 +46,9 @@ function ToolResultContent({ content, isError }: { content: string; isError?: bo
   const [expanded, setExpanded] = React.useState(false);
   const isLong = content.length > 600;
   const displayContent = expanded ? content : content.slice(0, 600);
-  const hasMd = hasCodeBlocks(content) || content.includes("**") || content.includes("##") || content.includes("- [");
+  // Never render errors through ReactMarkdown — paths like __tests__ get
+  // interpreted as GFM bold and the underscores vanish.
+  const hasMd = !isError && (hasCodeBlocks(content) || content.includes("**") || content.includes("##") || content.includes("- ["));
 
   if (hasMd) {
     return (
@@ -197,7 +200,8 @@ export function AgentEventCard({ event }: { event: AgentEvent }) {
   const toolName = p.metadata?.toolName as string | undefined;
   const isToolCall = kind === "tool_call";
   const isToolResult = kind === "tool_result";
-  const isError = kind === "stderr" || (p.metadata?.isError as boolean);
+  const isToolError = kind === "tool_error";
+  const isError = kind === "stderr" || kind === "tool_error" || (p.metadata?.isError as boolean);
   const isThinking = kind === "thinking";
   const isSystem = kind === "system";
   const isText = kind === "assistant" || kind === "raw" || kind === "system";
@@ -292,7 +296,7 @@ export function AgentEventCard({ event }: { event: AgentEvent }) {
     const raw = p.content;
     const parenIdx = raw.indexOf("(");
     let argsStr = parenIdx >= 0 ? raw.slice(parenIdx + 1, -1) : "";
-    
+
     try {
       if (argsStr.trim().startsWith("{") || argsStr.trim().startsWith("[")) {
         const parsed = JSON.parse(argsStr);
@@ -306,6 +310,13 @@ export function AgentEventCard({ event }: { event: AgentEvent }) {
       <div className="tev-tool-body">
         <span className="tev-tool-name">🔧 {toolName}</span>
         {argsStr && <pre className="tev-tool-args">{argsStr}</pre>}
+      </div>
+    );
+  } else if (isToolError) {
+    mainContent = (
+      <div className="tev-tool-body">
+        <span className="tev-tool-name" style={{ color: "#b00" }}>⚠ {toolName || "error"}</span>
+        <pre className="tev-tool-args" style={{ color: "#b00", background: "#fff5f5" }}>{p.content || "Unknown error"}</pre>
       </div>
     );
   } else if (isText) {

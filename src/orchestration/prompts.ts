@@ -84,9 +84,12 @@ export function epicDecoderPrompt(epic: EpicRecord, coderModel?: string): string
     "- BAD: 'UI looks good', 'Component works correctly'",
     "- GOOD: 'Component renders a <table> with columns [Name, Qty, Revenue]', 'Clicking the Revenue toggle sorts rows descending by qty * price'",
     "",
-    "dependencies: list ticket IDs that MUST complete before this one starts. Use this to enforce build order (e.g. install deps before using them, create types before importing them).",
+    "TDD REQUIREMENT: Every ticket MUST include at least one test-related acceptance criterion specifying:",
+    "- The test file path (e.g., 'tests/unit/foo.test.ts' or '__tests__/foo.test.ts')",
+    "- The expected behavior to assert (e.g., 'foo() returns 42 when input is 7')",
+    "- Example: 'Test file tests/math.test.ts passes: expect(add(2,3)).toBe(5)'",
     "",
-    "allowedPaths: EXACT file/folder paths the ticket needs — NOT ticket IDs, NOT URLs. Example: ['src/components/TopItemsTable.tsx', 'src/hooks/']",
+    "dependencies: list ticket IDs that MUST complete before this one starts. Use this to enforce build order (e.g. install deps before using them, create types before importing them).",
     "",
     "Return JSON only with shape:",
     JSON.stringify({
@@ -98,8 +101,8 @@ export function epicDecoderPrompt(epic: EpicRecord, coderModel?: string): string
           description: "string — multi-line with files, patterns, imports, and implementation details",
           acceptanceCriteria: ["string — specific, testable criteria"],
           dependencies: ["string — ticket IDs"],
-          allowedPaths: ["string — exact file/folder paths"],
-          priority: "high|medium|low"
+          priority: "high|medium|low",
+          testSpecs: ["string — test assertions, e.g. 'expect(add(2,3)).toBe(5)'"]
         }
       ]
     }, null, 2),
@@ -316,13 +319,20 @@ export function coderPrompt(
   skipContext?: { skipped: boolean; reason?: string }
 ): string {
   return [
-    "You are the Coder agent. Write code changes to satisfy the ticket.",
+    "You are the Coder agent. Write code changes AND tests to satisfy the ticket.",
     "",
     "## How to Edit",
     "Use search_replace for targeted edits to existing files (preferred for small changes).",
     "Use write_file for new files or when rewriting most of an existing file (you MUST read it first).",
     "Use write_files for writing multiple files at once.",
-    "Write ALL files before calling finish.",
+    "Write ALL files (implementation + tests) before calling finish.",
+    "",
+    "## Writing Tests",
+    "You MUST write test files alongside implementation files.",
+    "BEFORE writing any test, read an existing test file in the project to discover the test framework (vitest, jest, mocha, etc.), import style, and assertion patterns. Do NOT assume Jest — many projects use vitest with describe/it/expect but import from 'vitest'.",
+    "Follow the exact import and assertion patterns you find in existing tests.",
+    "Each test file should import and test the functions/components you create.",
+    "Use the acceptance criteria as test assertions — every criterion should have a corresponding test.",
     "",
     ...(reviewerContext && (reviewerContext.blockers?.length || reviewerContext.suggestions?.length)
       ? [
@@ -345,6 +355,9 @@ export function coderPrompt(
     "## Explorer Analysis",
     JSON.stringify(explorerOutput, null, 2),
     "",
+    "## Edit Packet",
+    JSON.stringify(editPacket, null, 2),
+    "",
     "## Rules",
     "1. READ files listed in the explorer analysis FIRST — do NOT glob, list_dir, or browse directories. The explorer already found the relevant files.",
     "2. Only use glob/grep/list_dir if the explorer analysis is missing a file you critically need. This should be rare.",
@@ -352,12 +365,14 @@ export function coderPrompt(
     "4. Do NOT delete or rename files unless explicitly permitted in destructivePermissions.",
     "5. If file content already matches what the acceptance criteria require, produce ZERO changes and explain in summary.",
     "6. Do NOT produce identity transforms where search === replace.",
+    "7. You MUST write both implementation code AND test files. Every ticket should have at least one test file.",
     "",
     "## Finish Output",
     "Call finish with JSON:",
     JSON.stringify({
       summary: "brief summary of what you implemented",
-      filesChanged: ["file1.ts", "file2.ts"]
+      filesChanged: ["file1.ts", "file2.ts"],
+      testFiles: ["tests/file1.test.ts"]
     }, null, 2),
     "",
     "=".repeat(60),
@@ -564,11 +579,13 @@ export function epicDecoderToolingPrompt(
       "  - GOOD: 'Component renders a <table> with columns [Name, Qty, Revenue]'",
       "  - GOOD: 'Clicking the Revenue toggle sorts rows descending by qty * price without any API call'",
       "",
+      "TDD REQUIREMENT: Every ticket MUST include at least one test-related acceptance criterion specifying:",
+      "  - The test file path (e.g., 'tests/unit/foo.test.ts' or '__tests__/foo.test.ts')",
+      "  - The expected behavior to assert (e.g., 'foo() returns 42 when input is 7')",
+      "  - Example: 'Test file tests/math.test.ts passes: expect(add(2,3)).toBe(5)'",
+      "",
       "dependencies: list ticket IDs that MUST complete before this one starts.",
       "  - Use to enforce build order: install deps before using them, create types before importing them, build foundation components before pages that use them.",
-      "",
-      "allowedPaths: EXACT file/folder paths — NOT ticket IDs, NOT URLs.",
-      "  - Example: ['src/components/TopItemsTable.tsx', 'src/hooks/useTopItems.ts']",
     ].join("\n"),
   ];
 
@@ -596,8 +613,8 @@ export function epicDecoderToolingPrompt(
         description: "string",
         acceptanceCriteria: ["string"],
         dependencies: ["string"],
-        allowedPaths: ["string"],
-        priority: "high|medium|low"
+        priority: "high|medium|low",
+        testSpecs: ["string — test assertions, e.g. 'expect(add(2,3)).toBe(5)'"]
       }]
     })}</FINAL_JSON>`
   );
@@ -1011,6 +1028,11 @@ export function epicDecoderPlanModePrompt(
       "  - Replace X elements with a map rendering NewComponent with props={...}",
       "  - Follow the exact pattern from path/to/existing.tsx lines 100-120",
       "WHY: NewComponent provides a styled, consistent UI matching the rest of the app.",
+      "",
+      "TDD REQUIREMENT: Every ticket MUST include at least one test-related acceptance criterion specifying:",
+      "  - The test file path (e.g., 'tests/unit/foo.test.ts' or '__tests__/foo.test.ts')",
+      "  - The expected behavior to assert (e.g., 'foo() returns 42 when input is 7')",
+      "  - Example: 'Test file tests/math.test.ts passes: expect(add(2,3)).toBe(5)'",
     ].join("\n"),
     "## Required Output Format",
     [
@@ -1041,8 +1063,8 @@ export function epicDecoderPlanModePrompt(
         description: "string",
         acceptanceCriteria: ["string"],
         dependencies: ["string"],
-        allowedPaths: ["string"],
-        priority: "high|medium|low"
+        priority: "high|medium|low",
+        testSpecs: ["string — test assertions, e.g. 'expect(add(2,3)).toBe(5)'"]
       }]
     })}</FINAL_JSON>`,
     `Clarification example:\n<FINAL_JSON>${JSON.stringify({
@@ -1190,23 +1212,23 @@ export function playTesterPrompt(
     "",
     "For each test file:",
     "  1. Read the test file content using your read_file tool.",
-    "  2. Identify each `test(...)` block and what it does.",
+    "  2. Identify each \`test(...)\` block and what it does.",
     "  3. For each test:",
-    "     a. Use `browser_navigate` to go to the page under test.",
-    "     b. Use `browser_click`, `browser_type`, `browser_snapshot` etc. to perform the test steps.",
-    "     c. Use `browser_snapshot` to capture the page state for assertions.",
+    "     a. Use \`browser_navigate\` to go to the page under test.",
+    "     b. Use \`browser_click\`, \`browser_type\`, \`browser_snapshot\` etc. to perform the test steps.",
+    "     c. Use \`browser_snapshot\` to capture the page state for assertions.",
     "     d. Compare the actual UI state to what the test expects.",
     "     e. Mark the test as PASSED if everything matches expectations.",
     "     f. Mark the test as FAILED if any step fails, with the exact error.",
     "",
     "## Critical Rules",
-    "  - Do NOT run `npx playwright test` or any shell command to run tests.",
-    "  - Do NOT use the `run_command` tool to execute tests.",
-    "  - Use ONLY Playwright MCP browser tools: `browser_navigate`, `browser_click`,",
-    "    `browser_type`, `browser_fill`, `browser_snapshot`, `browser_evaluate`,",
-    "    `browser_get_text`, `browser_wait_for`.",
+    "  - Do NOT run \`npx playwright test\` or any shell command to run tests.",
+    "  - Do NOT use the \`run_command\` tool to execute tests.",
+    "  - Use ONLY Playwright MCP browser tools: \`browser_navigate\`, \`browser_click\`,",
+    "    \`browser_type\`, \`browser_fill\`, \`browser_snapshot\`, \`browser_evaluate\`,",
+    "    \`browser_get_text\`, \`browser_wait_for\`.",
     "  - Run every test file listed above. Do not skip any.",
-    "  - If a test file has multiple `test(...)` blocks, run ALL of them.",
+    "  - If a test file has multiple \`test(...)\` blocks, run ALL of them.",
     "  - Do not suggest fixes. Do not edit any files. Only report results.",
     "",
     "## Required Output Format",
@@ -1215,31 +1237,72 @@ export function playTesterPrompt(
     "Include every test you ran, whether it passed or failed.",
     "",
     "Format:",
-    `<FINAL_JSON>{
-  "status": "passed",
-  "summary": { "total": 4, "passed": 4, "failed": 0 },
-  "results": [
-    {
-      "testFile": "tests/epic-theming.spec.ts",
-      "testName": "dashboard has correct gradient background",
-      "status": "passed",
-      "steps": 5,
-      "error": null
-    },
-    {
-      "testFile": "tests/epic-theming.spec.ts",
-      "testName": "cashier splash shows correct theme",
-      "status": "failed",
-      "steps": 3,
-      "error": "Expected element .cashier-splash to have background #FF5500 but got transparent"
-    }
-  ]
-}</FINAL_JSON>`,
+    "<FINAL_JSON>{",
+    "  \"status\": \"passed\",",
+    "  \"summary\": { \"total\": 4, \"passed\": 4, \"failed\": 0 },",
+    "  \"results\": [",
+    "    {",
+    "      \"testFile\": \"tests/epic-theming.spec.ts\",",
+    "      \"testName\": \"dashboard has correct gradient background\",",
+    "      \"status\": \"passed\",",
+    "      \"steps\": 5,",
+    "      \"error\": null",
+    "    },",
+    "    {",
+    "      \"testFile\": \"tests/epic-theming.spec.ts\",",
+    "      \"testName\": \"cashier splash shows correct theme\",",
+    "      \"status\": \"failed\",",
+    "      \"steps\": 3,",
+    "      \"error\": \"Expected element .cashier-splash to have background #FF5500 but got transparent\"",
+    "    }",
+    "  ]",
+    "}</FINAL_JSON>",
     "",
     "Rules for FINAL_JSON:",
     "  - `status` at the top level is `passed` only if ALL tests passed, otherwise `failed`.",
     "  - `error` is null for passing tests.",
     "  - `error` must be the exact failure message for failing tests — be specific.",
     "  - Include every test. Do not omit passing tests from the results array.",
+  ].join("\n");
+}
+
+export function buildCoderResumePrompt(
+  ticket: TicketRecord,
+  currentDiff: string,
+  reviewerBlockers: string[],
+  explorerOutput?: ExplorerOutput | null,
+): string {
+  const explorerSection = explorerOutput ? [
+    "## Explorer Analysis (Prior)",
+    JSON.stringify(explorerOutput, null, 2),
+    ""
+  ] : [];
+
+  return [
+    "## Resume Context",
+    "You are continuing work on a ticket that was interrupted. File changes are already on disk.",
+    "",
+    ...explorerSection,
+    "## Ticket",
+    `Title: ${ticket.title}`,
+    `Goal: ${ticket.description}`,
+    `Acceptance Criteria: ${(ticket.acceptanceCriteria ?? []).join("\n")}`,
+    "",
+    "## Current Progress (git diff)",
+    "```diff",
+    currentDiff.slice(0, 15000),
+    "```",
+    currentDiff.length > 15000 ? `\n(Diff truncated — ${currentDiff.length} chars total)` : "",
+    "",
+    "## Reviewer Feedback (if any)",
+    reviewerBlockers.length ? reviewerBlockers.map((b, i) => `${i + 1}. ${b}`).join("\n") : "No reviewer feedback yet.",
+    "",
+    "## Instructions",
+    "- The diff above shows changes already made. Do NOT redo work that's already done.",
+    "- Continue from where you left off. Focus on completing any remaining acceptance criteria.",
+    "- If the diff shows completed work matching all criteria, call finish immediately.",
+    "- Write tests for any new code that doesn't have tests yet.",
+    "- After you finish, output exactly one FINAL_JSON block and nothing after it.",
+    '<FINAL_JSON>{"summary":"brief summary of remaining changes implemented"}</FINAL_JSON>'
   ].join("\n");
 }

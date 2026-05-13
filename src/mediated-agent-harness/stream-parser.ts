@@ -18,6 +18,11 @@ export class StreamParser {
   private thinking = "";
   private inThinking = false;
   private buffer = "";
+  private onStreamingContent?: (text: string, isThinking: boolean) => void;
+
+  constructor(onStreamingContent?: (text: string, isThinking: boolean) => void) {
+    this.onStreamingContent = onStreamingContent;
+  }
 
   feed(rawLine: string): void {
     const line = rawLine.trim();
@@ -66,6 +71,7 @@ export class StreamParser {
     // Accumulate native thinking field
     if (message.thinking) {
       this.thinking += message.thinking;
+      this.onStreamingContent?.(message.thinking, true);
     }
 
     // Accumulate tool calls (Ollama sends complete tool calls per line)
@@ -100,24 +106,30 @@ export class StreamParser {
       this.inThinking = true;
       const afterThink = text.split("<think").pop() ?? "";
       this.thinking += afterThink;
+      this.onStreamingContent?.(afterThink, true);
       return;
     }
     if (text.includes("</think")) {
       this.inThinking = false;
       const beforeClose = text.split("</think")[0] ?? "";
       this.thinking += beforeClose;
+      this.onStreamingContent?.(beforeClose, true);
       // Content after </think is regular content
       const parts = text.split("</think");
       if (parts.length > 1) {
-        this.content += parts.slice(1).join("</think");
+        const afterClose = parts.slice(1).join("</think");
+        this.content += afterClose;
+        this.onStreamingContent?.(afterClose, false);
       }
       return;
     }
 
     if (this.inThinking) {
       this.thinking += text;
+      this.onStreamingContent?.(text, true);
     } else {
       this.content += text;
+      this.onStreamingContent?.(text, false);
     }
   }
 

@@ -5,6 +5,7 @@ import { AgentEvent, Run, Ticket, TicketDiffResponse } from "../types.ts";
 import {
   diffLineClass,
   fetchJson,
+  mergeStreamingEvents,
   normalizeCompareUrl,
   normalizeDisplayedTicketId,
   parseUnifiedDiff,
@@ -30,11 +31,12 @@ export function TicketModal(props: {
   const ticketRun =
     props.runs.find((run) => run.id === props.ticket.currentRunId) ?? null;
   const hasCurrentRunId = Boolean(props.ticket.currentRunId);
-  const ticketEvents = props.events.filter(
+  const rawTicketEvents = props.events.filter(
     (e) =>
       e.ticket_id === props.ticket.id ||
       (hasCurrentRunId && e.run_id === props.ticket.currentRunId)
   );
+  const ticketEvents = useMemo(() => mergeStreamingEvents(rawTicketEvents), [rawTicketEvents]);
   const feedEndRef = useRef<HTMLDivElement>(null);
   const [ticketDiff, setTicketDiff] = useState<TicketDiffResponse | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);

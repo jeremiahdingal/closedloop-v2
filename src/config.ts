@@ -87,7 +87,7 @@ export function loadConfig(): AppConfig {
     useExplorerCoderPipeline: true,
     commandCatalog: {
       status: process.env.STATUS_COMMAND || "git status --short",
-      test: process.env.TEST_COMMAND || "npm test -- --runInBand",
+      test: process.env.TEST_COMMAND || "npm test",
       lint: process.env.LINT_COMMAND || "npm run lint",
       typecheck: process.env.TYPECHECK_COMMAND || "npm run typecheck",
       build: process.env.BUILD_COMMAND || "npm run build"
@@ -102,7 +102,7 @@ export function loadConfig(): AppConfig {
       ? process.env.REVIEWER_MODE
       : "direct-fast",
     reviewGuardEnabled: process.env.REVIEW_GUARD_ENABLED !== "0",
-    reviewFastTimeoutMs: Number(process.env.REVIEW_FAST_TIMEOUT_MS || process.env.REVIEWER_TIMEOUT_MS || 180_000),
+    reviewFastTimeoutMs: Number(process.env.REVIEW_FAST_TIMEOUT_MS || process.env.REVIEWER_TIMEOUT_MS || 300_000),
     reviewDeepTimeoutMs: Number(process.env.REVIEW_DEEP_TIMEOUT_MS || process.env.REVIEWER_TIMEOUT_MS || 420_000),
     reviewContractPath: process.env.REVIEW_CONTRACT_PATH || ".closedloop/PROJECT_STRUCTURE.md",
     toolRagEnabled: process.env.TOOL_RAG_ENABLED !== "0",

@@ -39,8 +39,8 @@ type EpicReviewerTicketGitContext = {
   hasWorkspaceChanges: boolean;
 };
 
-function sanitizeAllowedPaths(paths: string[]): string[] {
-  if (!paths.length) return ["*"];
+function sanitizeAllowedPaths(paths: string[] | undefined): string[] {
+  if (!paths || !paths.length) return ["*"];
   const normalized = paths
     .map((pathValue) => String(pathValue || "").trim())
     .filter(Boolean)
@@ -254,7 +254,7 @@ export class GoalRunner {
       description: ticket.description,
       acceptanceCriteria: ticket.acceptanceCriteria,
       dependencies: ticket.dependencies.map((dependencyId) => planIdToTicketId.get(dependencyId) || dependencyId),
-      allowedPaths: ticket.allowedPaths,
+      allowedPaths: ticket.allowedPaths ?? ["*"],
       priority: ticket.priority,
       status: "queued",
       diffFiles: [],
@@ -641,7 +641,7 @@ export class GoalRunner {
         ticketId: ticket.id,
         baseRef: fallbackWorkspace?.baseCommit ?? null,
         headRef: changedWorkspace?.headCommit ?? null,
-        allowedPaths: ticket.allowedPaths,
+        allowedPaths: ticket.allowedPaths ?? ["*"],
         branchName: fallbackWorkspace?.branchName ?? null,
         hasWorkspaceChanges: Boolean(activeWorkspace)
       });
@@ -735,7 +735,7 @@ export class GoalRunner {
               description: ft.description,
               acceptanceCriteria: ft.acceptanceCriteria,
               dependencies: ft.dependencies ?? [],
-              allowedPaths: ft.allowedPaths ?? [],
+              allowedPaths: ft.allowedPaths ?? ["*"],
               status: "queued",
               priority: ft.priority ?? "medium",
               metadata: {},

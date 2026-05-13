@@ -191,7 +191,7 @@ export function App() {
         if (!matchesTicket && !matchesRun) return current;
         const next = [...current, row];
         const deduped = Array.from(new Map(next.map((item) => [item.id, item])).values());
-        return deduped.slice(-200);
+        return deduped.slice(-3000);
       });
       const role = normalizeAgentRole(row.payload?.agentRole);
       setLastEventTime((prev) => new Map(prev).set(role, Date.now()));
@@ -206,7 +206,7 @@ export function App() {
     }
 
     let cancelled = false;
-    const params = new URLSearchParams({ ticketId: selectedTicket.id, limit: "200" });
+    const params = new URLSearchParams({ ticketId: selectedTicket.id, limit: "3000" });
     if (selectedTicket.currentRunId) params.set("runId", selectedTicket.currentRunId);
 
     void fetchJson<AgentEvent[]>(`/api/agent-events?${params.toString()}`)
@@ -288,7 +288,10 @@ export function App() {
     return status;
   }, [agentRoles, eventsByRole, data.runs, nowTick]);
 
-  const activeItems = openRole ? [...(eventsByRole.get(openRole) ?? [])].reverse() : [];
+  const activeItems = useMemo(() =>
+    openRole ? [...(eventsByRole.get(openRole) ?? [])].reverse() : [],
+    [openRole, eventsByRole]
+  );
 
   const dedupedTickets = useMemo(() => {
     const grouped = new Map<string, Ticket[]>();

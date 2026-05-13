@@ -11,9 +11,16 @@ interface CallRecord {
   timestamp: number;
 }
 
+const PATH_TOOLS = new Set([
+  "read_file", "read_files", "write_file", "write_files",
+  "search_replace", "list_dir", "glob_files", "grep_files",
+]);
+
 export class CallHistory {
   private records: CallRecord[] = [];
   private consecutiveErrors = 0;
+  private recentPaths: string[] = [];
+  private readPaths: string[] = [];
 
   record(name: string, args: Record<string, unknown>, isError: boolean): void {
     const argsHash = stableStringify(args);
@@ -23,6 +30,21 @@ export class CallHistory {
       this.consecutiveErrors++;
     } else {
       this.consecutiveErrors = 0;
+    }
+
+    if (!isError && PATH_TOOLS.has(name)) {
+      const p = extractPathFromArgs(name, args);
+      if (p) {
+        this.recentPaths.push(p);
+        if (this.recentPaths.length > 10) this.recentPaths.shift();
+      }
+      if (name === "read_file" || name === "read_files") {
+        const p = extractPathFromArgs(name, args);
+        if (p) {
+          this.readPaths.push(p);
+          if (this.readPaths.length > 10) this.readPaths.shift();
+        }
+      }
     }
   }
 
@@ -50,10 +72,127 @@ export class CallHistory {
     return this.records.slice(-count);
   }
 
+  getRecentPaths(): string[] {
+    return [...this.recentPaths];
+  }
+
+  getLastReadPath(): string | null {
+    return this.readPaths.length > 0 ? this.readPaths[this.readPaths.length - 1] : null;
+  }
+
   reset(): void {
     this.records = [];
     this.consecutiveErrors = 0;
+    this.recentPaths = [];
+    this.readPaths = [];
   }
+}
+
+// ─── Path extraction helper ─────────────────────────────────────────────────
+
+function extractPathFromArgs(name: string, args: Record<string, unknown>): string | null {
+  if (name === "read_files") {
+    const paths = args.paths;
+    if (Array.isArray(paths) && paths.length > 0) return String(paths[0]);
+  }
+  if (name === "write_files") {
+    const files = args.files;
+    if (Array.isArray(files) && files[0]?.path) return String(files[0].path);
+  }
+  if (args.path && typeof args.path === "string") return args.path;
+  if (args.pattern && typeof args.pattern === "string") return args.pattern;
+  return null;
+}
+
+// ─── Path inference ──────────────────────────────────────────────────────────
+
+export interface PathInferenceContext {
+  recentPaths: string[];
+  lastReadPath: string | null;
+}
+
+function looksLikeFilePath(value: string): boolean {
+  if (!value) return false;
+  return /[./\\]/.test(value) && !value.includes("*") && !value.includes("|");
+}
+
+function tryInferPath(
+  toolName: string,
+  args: Record<string, unknown>,
+  missingParam: string,
+  ctx: PathInferenceContext,
+): Record<string, unknown> | null {
+  const { recentPaths, lastReadPath } = ctx;
+  const lastPath = recentPaths.length > 0 ? recentPaths[recentPaths.length - 1] : null;
+
+  switch (toolName) {
+    case "read_file": {
+      if (missingParam === "path") {
+        // Model confused params: passed pattern instead of path
+        if (args.pattern && typeof args.pattern === "string" && looksLikeFilePath(args.pattern)) {
+          return { ...args, path: args.pattern };
+        }
+        // Use most recent path
+        if (lastPath && looksLikeFilePath(lastPath)) {
+          return { ...args, path: lastPath };
+        }
+      }
+      break;
+    }
+
+    case "write_file": {
+      if (missingParam === "path") {
+        // Only infer if content is present (model knows what to write, just forgot where)
+        if (args.content && lastPath && looksLikeFilePath(lastPath)) {
+          return { ...args, path: lastPath };
+        }
+      }
+      break;
+    }
+
+    case "search_replace": {
+      if (missingParam === "path") {
+        // search/replace needs the file that was last read
+        if ((args.search || args.replace) && lastReadPath && looksLikeFilePath(lastReadPath)) {
+          return { ...args, path: lastReadPath };
+        }
+        if ((args.search || args.replace) && lastPath && looksLikeFilePath(lastPath)) {
+          return { ...args, path: lastPath };
+        }
+      }
+      break;
+    }
+
+    case "glob_files": {
+      if (missingParam === "pattern") {
+        // Model swapped: passed path instead of pattern
+        if (args.path && typeof args.path === "string") {
+          return { ...args, pattern: args.path };
+        }
+      }
+      break;
+    }
+
+    case "grep_files": {
+      if (missingParam === "pattern") {
+        // Model passed regex in scope instead of pattern
+        if (args.scope && typeof args.scope === "string" && /[|*(+]/.test(args.scope)) {
+          return { ...args, pattern: args.scope };
+        }
+      }
+      break;
+    }
+
+    case "list_dir": {
+      if (missingParam === "path") {
+        // list_dir path is optional, default to "."
+        return { ...args, path: "." };
+      }
+      break;
+    }
+  }
+
+  return null;
 }
 
 // ─── Validation ─────────────────────────────────────────────────────────────
@@ -82,7 +221,8 @@ export function validateAndRepair(
   input: ValidationInput,
   knownTools: Map<string, ToolDef>,
   history: CallHistory,
-  allowedPaths: string[]
+  allowedPaths: string[],
+  inferCtx?: PathInferenceContext
 ): ValidatedCall | ToolValidationError | StagnationError {
   const iterationCount = history.getRecentCalls(Infinity).length;
 
@@ -159,14 +299,25 @@ export function validateAndRepair(
     }
   }
 
-  // 5. Validate required parameters
+  // 5. Validate required parameters — with path inference repair
   const toolDef = knownTools.get(name)!;
   const requiredParams = toolDef.function.parameters.required ?? [];
   for (const param of requiredParams) {
     if (args[param] === undefined || args[param] === null) {
+      // Try to infer the missing parameter before rejecting
+      if (inferCtx) {
+        const repaired = tryInferPath(name, args, param, inferCtx);
+        if (repaired) {
+          console.log(`[PATH-REPAIR] ${name}: inferred missing "${param}" → "${repaired[param]}"`);
+          args = repaired;
+          continue;
+        }
+      }
+
       const example = buildExampleCall(name, toolDef);
+      const paramDesc = (toolDef.function.parameters.properties[param] as any)?.description ?? "";
       return new ToolValidationError(
-        `Missing required parameter: ${param} for ${name}`,
+        `Missing required parameter: ${param} for ${name}. Parameter "${param}": ${paramDesc || `(${typeof args[param]})`}. Example: Call ${name} with: ${example}`,
         name,
         input.arguments,
         `Call ${name} with: ${example}`
@@ -439,10 +590,16 @@ function stableStringify(obj: Record<string, unknown>): string {
 
 function buildExampleCall(toolName: string, toolDef: ToolDef): string {
   const props = toolDef.function.parameters.properties;
-  const example: Record<string, string> = {};
+  const example: Record<string, unknown> = {};
   for (const [key, schema] of Object.entries(props)) {
     const desc = ((schema as any).description ?? "").toLowerCase();
-    if ((schema as any).type === "string") {
+    const type = (schema as any).type;
+    if (type === "array") {
+      const itemDesc = ((schema as any).items?.description ?? "").toLowerCase();
+      if (itemDesc.includes("path") || key === "paths") (example as any)[key] = ["file1.ts", "file2.ts"];
+      else if (itemDesc.includes("glob") || key === "patterns") (example as any)[key] = ["src/**/*.ts"];
+      else (example as any)[key] = ["value"];
+    } else if (type === "string") {
       if (desc.includes("glob") || key === "pattern") example[key] = "src/**/*.ts";
       else if (desc.includes("path")) example[key] = "src/main.ts";
       else if (desc.includes("search") || desc.includes("query")) example[key] = "search term";
@@ -453,6 +610,10 @@ function buildExampleCall(toolName: string, toolDef: ToolDef): string {
       else if (desc.includes("url")) example[key] = "https://example.com";
       else if (desc.includes("message") || desc.includes("reason")) example[key] = "explanation";
       else example[key] = "value";
+    } else if (type === "boolean") {
+      (example as any)[key] = true;
+    } else if (type === "number") {
+      (example as any)[key] = 1;
     } else {
       example[key] = "value";
     }

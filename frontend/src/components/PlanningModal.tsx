@@ -124,7 +124,29 @@ export function PlanningModal(props: {
         hasAutoFocusedPlanRef.current = false;
         return;
       }
-      setStreamItems((prev) => [...prev, data]);
+      setStreamItems((prev) => {
+        const isStreaming = data.streamKind === "streaming_text" || data.streamKind === "streaming_thinking";
+        if (isStreaming && prev.length > 0) {
+          const last = prev[prev.length - 1];
+          const targetKind = data.streamKind === "streaming_thinking" ? "thinking" : "assistant";
+          if (last.streamKind === targetKind && last.agentRole === data.agentRole) {
+            // Append to existing card — in-place update
+            const updated = [...prev];
+            updated[updated.length - 1] = { ...last, content: last.content + (data.content ?? ""), id: data.id };
+            return updated;
+          }
+        }
+        // Replace final streaming card with non-streaming event of same kind
+        if ((data.streamKind === "assistant" || data.streamKind === "thinking") && prev.length > 0) {
+          const last = prev[prev.length - 1];
+          if (last.streamKind === data.streamKind && last.agentRole === data.agentRole) {
+            const updated = [...prev];
+            updated[updated.length - 1] = { ...data };
+            return updated;
+          }
+        }
+        return [...prev, data];
+      });
     });
     es.addEventListener("session_status", (e) => {
       const data = JSON.parse(e.data);
@@ -347,7 +369,7 @@ export function PlanningModal(props: {
                                 "**Acceptance Criteria**",
                                 ...ticket.acceptanceCriteria.map((criterion) => `- ${criterion}`),
                                 "",
-                                `**Allowed Paths:** ${ticket.allowedPaths.join(", ") || "(none)"}`,
+                                ...(ticket.testSpecs?.length ? ["**Test Specs**", ...ticket.testSpecs.map((s) => `- ${s}`), ""] : []),
                                 `**Dependencies:** ${ticket.dependencies.join(", ") || "(none)"}`
                               ].join("\n")}
                             </ReactMarkdown>

@@ -1,6 +1,6 @@
 import React from "react";
 import { AgentEvent, AgentModelInfo, AgentStreamStatus } from "../types.ts";
-import { formatTime } from "../utils.ts";
+import { formatTime, mergeStreamingEvents } from "../utils.ts";
 
 export function AgentModal(props: {
   role: string;
@@ -13,6 +13,7 @@ export function AgentModal(props: {
 }) {
   if (!props.open) return null;
   const info = props.modelInfo;
+  const mergedItems = mergeStreamingEvents(props.items);
   const safeAdapters = info?.adapters ?? [];
   const hasMultipleAdapters = safeAdapters.length > 1;
   const currentDesc =
@@ -68,8 +69,8 @@ export function AgentModal(props: {
           </div>
         )}
         <div className="modal-stream-list">
-          {props.items.length ? (
-            props.items.map((item) => (
+          {mergedItems.length ? (
+            mergedItems.map((item) => (
               <div className="modal-stream-item" key={item.id}>
                 <div className="modal-stream-meta">
                   <span className={`pill pill-${item.payload?.streamKind || "raw"}`}>

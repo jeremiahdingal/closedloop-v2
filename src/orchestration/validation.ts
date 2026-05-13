@@ -77,7 +77,7 @@ function isGoalTicketPlan(value: unknown): value is GoalTicketPlan {
     typeof ticket.description === "string" &&
     isStringArray(ticket.acceptanceCriteria) &&
     isStringArray(ticket.dependencies) &&
-    isStringArray(ticket.allowedPaths) &&
+    (ticket.allowedPaths === undefined || isStringArray(ticket.allowedPaths)) &&
     (ticket.priority === "high" || ticket.priority === "medium" || ticket.priority === "low")
   );
 }

@@ -9,7 +9,7 @@ import type { AgentStreamPayload } from "../types.ts";
 export class RecoveryService {
   readonly config = loadConfig();
   private readonly db: AppDatabase;
-  private readonly ticketRunner: TicketRunner;
+  readonly ticketRunner: TicketRunner;
   private readonly goalRunner: GoalRunner;
 
   constructor(db: AppDatabase, ticketRunner: TicketRunner, goalRunner: GoalRunner) {
@@ -333,7 +333,7 @@ export class RecoveryService {
               lastMessage: requeueMessage
             });
           }
-          this.db.enqueueJob("run_ticket", { ticketId: run.ticketId, epicId: run.epicId, runId: run.id });
+          this.db.enqueueJob("run_ticket", { ticketId: run.ticketId, epicId: run.epicId, runId: run.id, recovery: true });
         } else if (run.epicId) {
           this.db.enqueueJob("run_epic", { epicId: run.epicId, runId: run.id });
         }

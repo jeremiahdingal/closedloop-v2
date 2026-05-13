@@ -59,6 +59,7 @@ function resolveOllamaContextWindow(model: string): number {
   if (model.startsWith("qwen3.5:9b")) return 65536;
   if (model.startsWith("qwen3.5:27b")) return 65536;
   if (model.startsWith("vladimirgav/qwen3.6-27b")) return 65536;
+  if (model.startsWith("ibm/granite4.1")) return 32768;
   if (model.startsWith("devstral-small-2:24b")) return 393216;
   if (model.startsWith("qwen2.5-coder:14b")) return 65536;
   return 65536;
@@ -75,8 +76,9 @@ function buildZodSchemas(z: any) {
     description: z.string(),
     acceptanceCriteria: z.array(z.string()),
     dependencies: z.array(z.string()),
-    allowedPaths: z.array(z.string()),
-    priority: z.enum(["high", "medium", "low"])
+    allowedPaths: z.array(z.string()).optional(),
+    priority: z.enum(["high", "medium", "low"]),
+    testSpecs: z.array(z.string()).optional(),
   });
 
   return {
@@ -610,8 +612,9 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
   private readonly zai: ZaiRunner;
   private readonly ollamaBaseURL: string;
   private readonly braveApiKey: string | undefined;
+  private readonly anthropicOverride?: { baseURL: string; apiKey: string; apiBackend: "anthropic"; model: string };
 
-  constructor(ollamaBaseURL?: string, models?: Record<AgentRole, string>) {
+  constructor(ollamaBaseURL?: string, models?: Record<AgentRole, string>, anthropicOverride?: { baseURL: string; apiKey: string; apiBackend: "anthropic"; model: string }) {
     this._models = models;
     this.ollamaBaseURL = ollamaBaseURL || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
     this.ollama = new OllamaGateway(this.ollamaBaseURL);
@@ -621,6 +624,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     this.gemini = new GeminiRunner();
     this.zai = new ZaiRunner();
     this.braveApiKey = process.env.BRAVE_API_KEY;
+    this.anthropicOverride = anthropicOverride;
   }
 
   rawPrompt(role: AgentRole, prompt: string): Promise<string> {
@@ -676,74 +680,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const result = await harness.run("reviewer", input.prompt, {
       maxIterations: 80,
       timeoutMs: 300_000,
-      onEvent: (event) => {
-        if (event.kind === "text" || event.kind === "thinking") {
-          input.onStream?.({
-            agentRole: "reviewer",
-            source: "mediated-harness",
-            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
-            content: event.text,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "tool_call") {
-          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
-          input.onStream?.({
-            agentRole: "reviewer",
-            source: "mediated-harness",
-            streamKind: "tool_call",
-            content: `${event.call.name}(${argsPreview})`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
-          });
-        }
-        if (event.kind === "tool_result") {
-          input.onStream?.({
-            agentRole: "reviewer",
-            source: "mediated-harness",
-            streamKind: "tool_result",
-            content: event.result.output,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.result.name, toolResult: event.result.output, isError: Boolean(event.result.isError) },
-          });
-        }
-        if (event.kind === "tool_error") {
-          input.onStream?.({
-            agentRole: "reviewer",
-            source: "mediated-harness",
-            streamKind: "stderr",
-            content: `Tool error: ${event.error}`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "complete") {
-          input.onStream?.({
-            agentRole: "reviewer",
-            source: "mediated-harness",
-            streamKind: "status",
-            content: `Completed in ${event.iterations} iterations`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-      },
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("reviewer", model, input),
     });
     markModelLoaded(model);
 
@@ -811,45 +749,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const result = await harness.run("epicDecoder", input.prompt, {
       maxIterations: 80,
       timeoutMs: 900_000,
-      onEvent: (event) => {
-        if (event.kind === "text" || event.kind === "thinking") {
-          input.onStream?.({
-            agentRole: "epicDecoder",
-            source: "mediated-harness",
-            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
-            content: event.text,
-            runId: input.runId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "tool_call") {
-          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
-          input.onStream?.({
-            agentRole: "epicDecoder",
-            source: "mediated-harness",
-            streamKind: "tool_call",
-            content: `${event.call.name}(${argsPreview})`,
-            runId: input.runId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
-          });
-        }
-        if (event.kind === "complete") {
-          input.onStream?.({
-            agentRole: "epicDecoder",
-            source: "mediated-harness",
-            streamKind: "status",
-            content: `Completed in ${event.iterations} iterations`,
-            runId: input.runId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-      },
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("epicDecoder", model, input),
     });
     markModelLoaded(model);
 
@@ -907,45 +808,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const result = await harness.run("epicReviewer", input.prompt, {
       maxIterations: 80,
       timeoutMs: 900_000,
-      onEvent: (event) => {
-        if (event.kind === "text" || event.kind === "thinking") {
-          input.onStream?.({
-            agentRole: "epicReviewer",
-            source: "mediated-harness",
-            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
-            content: event.text,
-            runId: input.runId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "tool_call") {
-          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
-          input.onStream?.({
-            agentRole: "epicReviewer",
-            source: "mediated-harness",
-            streamKind: "tool_call",
-            content: `${event.call.name}(${argsPreview})`,
-            runId: input.runId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
-          });
-        }
-        if (event.kind === "complete") {
-          input.onStream?.({
-            agentRole: "epicReviewer",
-            source: "mediated-harness",
-            streamKind: "status",
-            content: `Completed in ${event.iterations} iterations`,
-            runId: input.runId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-      },
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("epicReviewer", model, input),
     });
     markModelLoaded(model);
 
@@ -1013,74 +877,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const result = await harness.run("explorer", input.prompt, {
       maxIterations: 20,
       timeoutMs: 900_000,
-      onEvent: (event) => {
-        if (event.kind === "text" || event.kind === "thinking") {
-          input.onStream?.({
-            agentRole: "explorer",
-            source: "mediated-harness",
-            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
-            content: event.text,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "tool_call") {
-          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
-          input.onStream?.({
-            agentRole: "explorer",
-            source: "mediated-harness",
-            streamKind: "tool_call",
-            content: `${event.call.name}(${argsPreview})`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
-          });
-        }
-        if (event.kind === "tool_result") {
-          input.onStream?.({
-            agentRole: "explorer",
-            source: "mediated-harness",
-            streamKind: "tool_result",
-            content: event.result.output,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.result.name, toolResult: event.result.output, isError: Boolean(event.result.isError) },
-          });
-        }
-        if (event.kind === "tool_error") {
-          input.onStream?.({
-            agentRole: "explorer",
-            source: "mediated-harness",
-            streamKind: "error",
-            content: `Tool error: ${event.error}`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, error: event.error },
-          });
-        }
-        if (event.kind === "complete") {
-          input.onStream?.({
-            agentRole: "explorer",
-            source: "mediated-harness",
-            streamKind: "status",
-            content: `Completed in ${event.iterations} iterations`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-      },
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("explorer", model, input),
     });
     markModelLoaded(model);
 
@@ -1111,88 +909,19 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     });
 
     const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : []);
-    const harness = new MediatedAgentHarness({
-      baseURL: this.ollamaBaseURL,
-      apiKey: "",
-      model,
-      braveApiKey: this.braveApiKey,
-      toolContext,
-    });
+    const harnessConfig: any = this.anthropicOverride
+      ? { ...this.anthropicOverride, braveApiKey: this.braveApiKey, toolContext }
+      : { baseURL: this.ollamaBaseURL, apiKey: "", model, braveApiKey: this.braveApiKey, toolContext, noThink: true };
+    const harness = new MediatedAgentHarness(harnessConfig);
 
-    await ensureModelLoaded(model);
+    if (!this.anthropicOverride) await ensureModelLoaded(model);
     const result = await harness.run("coder", input.prompt, {
       maxIterations: 50,
       timeoutMs: 600_000,
-      onEvent: (event) => {
-        if (event.kind === "text" || event.kind === "thinking") {
-          input.onStream?.({
-            agentRole: "coder",
-            source: "mediated-harness",
-            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
-            content: event.text,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "tool_call") {
-          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
-          input.onStream?.({
-            agentRole: "coder",
-            source: "mediated-harness",
-            streamKind: "tool_call",
-            content: `${event.call.name}(${argsPreview})`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
-          });
-        }
-        if (event.kind === "tool_result") {
-          input.onStream?.({
-            agentRole: "coder",
-            source: "mediated-harness",
-            streamKind: "tool_result",
-            content: event.result.output,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.result.name, toolResult: event.result.output, isError: Boolean(event.result.isError) },
-          });
-        }
-        if (event.kind === "tool_error") {
-          input.onStream?.({
-            agentRole: "coder",
-            source: "mediated-harness",
-            streamKind: "error",
-            content: `Tool error: ${event.error}`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, error: event.error },
-          });
-        }
-        if (event.kind === "complete") {
-          input.onStream?.({
-            agentRole: "coder",
-            source: "mediated-harness",
-            streamKind: "status",
-            content: `Completed in ${event.iterations} iterations`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-      },
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("coder", model, input),
     });
-    markModelLoaded(model);
+    if (!this.anthropicOverride) markModelLoaded(model);
 
     return {
       text: result.text,
@@ -1268,6 +997,10 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
+    const builderToolMode = this.resolveToolMode(model);
+    if (builderToolMode === "xml") {
+      return await this.runBuilderAttempt(input, model, "xml");
+    }
     try {
       return await this.runBuilderAttempt(input, model, "native");
     } catch (nativeError) {
@@ -1321,48 +1054,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const result = await harness.run("tester", input.prompt, {
       maxIterations: 80,
       timeoutMs: 300_000, // 5 minutes
-      onEvent: (event) => {
-        if (event.kind === "text" || event.kind === "thinking") {
-          input.onStream?.({
-            agentRole: "tester",
-            source: "mediated-harness",
-            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
-            content: event.text,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "tool_call") {
-          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
-          input.onStream?.({
-            agentRole: "tester",
-            source: "mediated-harness",
-            streamKind: "tool_call",
-            content: `${event.call.name}(${argsPreview})`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
-          });
-        }
-        if (event.kind === "complete") {
-          input.onStream?.({
-            agentRole: "tester",
-            source: "mediated-harness",
-            streamKind: "status",
-            content: `Completed in ${event.iterations} iterations`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-      },
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("tester", model, input),
     });
     markModelLoaded(model);
 
@@ -1375,6 +1068,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       testResults: parsed.testResults ?? "SKIPPED",
       testOutput: parsed.testOutput ?? "",
       testsRun: parsed.testsRun ?? 0,
+      failedTests: parsed.failedTests ?? [],
     };
   }
 
@@ -1382,7 +1076,101 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const raw = this.models[role];
     if (!raw) return process.env.OLLAMA_FALLBACK_MODEL || "qwen3:8b";
     if (raw.startsWith("mediated:")) return raw.slice("mediated:".length);
+    if (raw.startsWith("zai:")) return raw.slice("zai:".length);
     return raw;
+  }
+
+  private resolveToolMode(_model: string): "native" | "xml" {
+    return "native";
+  }
+
+  private buildHarnessEventHandler(
+    role: string,
+    model: string,
+    input: { runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook },
+  ): (event: import("../mediated-agent-harness/types.ts").MediatedHarnessEvent) => void {
+    return (event) => {
+      if (event.kind === "streaming_text" || event.kind === "streaming_thinking") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: event.kind === "streaming_thinking" ? "streaming_thinking" : "streaming_text",
+          content: event.text,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model },
+        });
+        return;
+      }
+      if (event.kind === "text" || event.kind === "thinking") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: event.kind === "thinking" ? "thinking" : "assistant",
+          content: event.text,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model },
+        });
+      }
+      if (event.kind === "tool_call") {
+        const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: "tool_call",
+          content: `${event.call.name}(${argsPreview})`,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
+        });
+      }
+      if (event.kind === "tool_result") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: "tool_result",
+          content: event.result.output,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model, toolName: event.result.name, toolResult: event.result.output, isError: Boolean(event.result.isError) },
+        });
+      }
+      if (event.kind === "tool_error") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: "tool_error",
+          content: event.error,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model, toolName: event.call.name },
+        });
+      }
+      if (event.kind === "complete") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: "status",
+          content: `Completed in ${event.iterations} iterations`,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model },
+        });
+      }
+    };
   }
 
   protected buildBuilderXmlPrompt(prompt: string): string {
@@ -1435,74 +1223,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       maxIterations: 100,
       timeoutMs: 1_800_000,
       toolMode,
-      onEvent: (event) => {
-        if (event.kind === "text" || event.kind === "thinking") {
-          input.onStream?.({
-            agentRole: "builder",
-            source: "mediated-harness",
-            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
-            content: event.text,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "tool_call") {
-          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
-          input.onStream?.({
-            agentRole: "builder",
-            source: "mediated-harness",
-            streamKind: "tool_call",
-            content: `${event.call.name}(${argsPreview})`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
-          });
-        }
-        if (event.kind === "tool_result") {
-          input.onStream?.({
-            agentRole: "builder",
-            source: "mediated-harness",
-            streamKind: "tool_result",
-            content: event.result.output,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.result.name, toolResult: event.result.output, isError: Boolean(event.result.isError) },
-          });
-        }
-        if (event.kind === "tool_error") {
-          input.onStream?.({
-            agentRole: "builder",
-            source: "mediated-harness",
-            streamKind: "stderr",
-            content: `Tool error: ${event.error}`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "complete") {
-          input.onStream?.({
-            agentRole: "builder",
-            source: "mediated-harness",
-            streamKind: "status",
-            content: `Completed in ${event.iterations} iterations`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-      },
+      onEvent: this.buildHarnessEventHandler("builder", model, input),
     });
     markModelLoaded(model);
 
@@ -1606,4 +1327,17 @@ export function createGateway(modelsOverride?: Record<AgentRole, string>): Model
     return new MediatedAgentHarnessGateway(undefined, modelsOverride);
   }
   return new OpenCodeHybridGateway(modelsOverride);
+}
+
+export function createAnthropicHarnessGateway(): MediatedAgentHarnessGateway {
+  const config = loadConfig();
+  const zaiBaseURL = process.env.ZAI_BASE_URL || process.env.ANTHROPIC_BASE_URL || "https://api.z.ai/api/anthropic";
+  const zaiApiKey = process.env.ZAI_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || "";
+  const zaiModel = process.env.ZAI_MODEL || "glm-5.1";
+  return new MediatedAgentHarnessGateway(undefined, undefined, {
+    baseURL: zaiBaseURL,
+    apiKey: zaiApiKey,
+    apiBackend: "anthropic" as const,
+    model: zaiModel,
+  });
 }

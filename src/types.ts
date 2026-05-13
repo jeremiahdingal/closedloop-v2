@@ -129,8 +129,9 @@ export type GoalTicketPlan = {
   description: string;
   acceptanceCriteria: string[];
   dependencies: string[];
-  allowedPaths: string[];
+  allowedPaths?: string[];
   priority: "high" | "medium" | "low";
+  testSpecs?: string[];
 };
 
 export type GoalDecomposition = {
@@ -146,7 +147,7 @@ export type GoalReview = {
 };
 
 export type FailureDecision = {
-  decision: "retry_same_node" | "retry_builder" | "blocked" | "todo" | "escalate" | "approve";
+  decision: "retry_same_node" | "retry_builder" | "blocked" | "todo" | "escalate" | "approve" | "review_existing";
   reason: string;
 };
 
@@ -211,7 +212,7 @@ export type WriteFileInput = {
 export type AgentStreamPayload = {
   agentRole: AgentRole;
   source: "opencode" | "orchestrator" | "mediated-harness" | "zai";
-  streamKind: "stdout" | "stderr" | "thinking" | "assistant" | "system" | "status" | "raw" | "tool_call" | "tool_result" | "error" | "plan_cleared";
+  streamKind: "stdout" | "stderr" | "thinking" | "assistant" | "system" | "status" | "raw" | "tool_call" | "tool_result" | "tool_error" | "error" | "plan_cleared" | "streaming_text" | "streaming_thinking";
   content: string;
   runId?: string | null;
   ticketId?: string | null;
@@ -246,6 +247,7 @@ export type TesterResult = {
   testResults: "PASS" | "FAIL" | "SKIPPED";
   testOutput: string;
   testsRun: number;
+  failedTests?: Array<{ name: string; error: string }>;
 };
 
 export type EpicReviewDisposition =

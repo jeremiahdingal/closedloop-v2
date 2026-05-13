@@ -171,34 +171,46 @@ export async function summarizeMessages(
   // Build summarization prompt
   const historyText = formatMessagesForSummary(oldHistory);
 
-  // Call the model to summarize via Ollama native /api/chat
-  const summaryResponse = await fetch(`${baseURL}/api/chat`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    signal: AbortSignal.timeout(120_000),
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: SUMMARIZATION_SYSTEM_PROMPT },
-        { role: "user", content: historyText },
-      ],
-      stream: false,
-      options: {
-        temperature: 0.3,
-      },
-    }),
-  });
+  // Use a small fast model for compaction — the main agent model is too slow for summarization
+  const compactionModel = process.env.COMPACTION_MODEL || "qwen3.5:2b";
+
+  // Call the model to summarize via Ollama native /api/chat, with retry
+  let summaryResponse: Response | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      summaryResponse = await fetch(`${baseURL}/api/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        signal: AbortSignal.timeout(60_000),
+        body: JSON.stringify({
+          model: compactionModel,
+          messages: [
+            { role: "system", content: SUMMARIZATION_SYSTEM_PROMPT },
+            { role: "user", content: historyText },
+          ],
+          stream: false,
+          options: {
+            temperature: 0.3,
+          },
+        }),
+      });
+      if (summaryResponse.ok || summaryResponse.status !== 404) break;
+    } catch (err) {
+      console.warn(`[context] Summarization attempt ${attempt + 1} failed: ${err instanceof Error ? err.message : String(err)}`);
+      if (attempt === 0) continue;
+    }
+  }
 
   let summaryText: string;
-  if (summaryResponse.ok) {
+  if (summaryResponse?.ok) {
     const payload = await summaryResponse.json() as { message?: { content?: string } };
     summaryText = payload.message?.content?.trim() ?? "";
   } else {
     // If summarization fails, fall back to aggressive truncation of old history
-    const errorText = await summaryResponse.text().catch(() => "unknown error");
-    console.error(`[context] Summarization API call failed (${summaryResponse.status}): ${errorText}`);
+    const errorText = summaryResponse ? await summaryResponse.text().catch(() => "unknown error") : "no response";
+    console.error(`[context] Summarization API call failed (${summaryResponse?.status ?? "timeout"}): ${errorText}`);
     summaryText = formatMessagesForSummary(oldHistory).slice(0, 4000);
   }
 

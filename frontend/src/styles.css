@@ -1435,6 +1435,8 @@ body::after {
 .tev-kind-pill-thinking   { background: #ede8ff; color: #5020a0; border: 1px solid #b09de0; }
 .tev-kind-pill-status     { background: #e8e8e8; color: #444;    border: 1px solid #bbb; }
 .tev-kind-pill-stderr     { background: #ffe0e0; color: #800;    border: 1px solid #e09090; }
+.tev-kind-pill-tool_error { background: #ffe0e0; color: #800;    border: 1px solid #e09090; }
+.tev-kind-tool_error      { background: #fff8f8; }
 .tev-kind-pill-stdout     { background: #e0f0e0; color: #244;    border: 1px solid #90c090; }
 .tev-kind-pill-raw        { background: #f0f0f0; color: #555;    border: 1px solid #ccc; }
 .tev-kind-pill-sys        { background: #f0f0f0; color: #555;    border: 1px solid #ccc; }
@@ -1501,6 +1503,8 @@ body::after {
   overflow-x: hidden;
   overflow-wrap: anywhere;
   word-break: break-word;
+  white-space: pre-wrap;
+  max-width: 100%;
 }
 
 .tev-text-content.markdown-body h1,
@@ -1557,6 +1561,55 @@ body::after {
   max-width: 100%;
   word-break: break-all;
   white-space: pre-wrap;
+}
+
+/* Tool result body */
+.tev-tool-result-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+.tev-tool-result-name {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #1a6b3d;
+  font-family: 'Fira Code', monospace;
+}
+.tev-tool-result {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.tev-tool-result-pre {
+  font-size: 0.72rem;
+  font-family: 'Fira Code', monospace;
+  background: #f4faf6;
+  border: 1px solid #b0d8c0;
+  padding: 0.25rem 0.4rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  color: #1a3d2a;
+  max-height: 300px;
+  overflow-y: auto;
+  border-radius: 1px;
+}
+.tev-tool-result-error .tev-tool-result-pre {
+  background: #fff0f0;
+  border-color: #e0a0a0;
+  color: #6b1a1a;
+}
+.tev-tool-result-toggle {
+  font-size: 0.7rem;
+  color: var(--win-blue);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0.1rem 0;
+}
+.tev-tool-result-toggle:hover {
+  text-decoration: underline;
 }
 
 /* Colour tint entire card per kind */
@@ -1688,12 +1741,14 @@ body::after {
 
 .modal-stream-list {
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 1rem;
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
   background: #fff;
   flex: 1;
+  min-width: 0;
   margin: 4px;
   border: 2px solid;
   border-color: var(--win-gray-dark) var(--win-gray-light) var(--win-gray-light) var(--win-gray-darker);
@@ -1702,6 +1757,8 @@ body::after {
 .modal-stream-item {
   padding: 0.75rem;
   border-bottom: 1px dashed var(--win-gray-dark);
+  min-width: 0;
+  overflow: hidden;
 }
 
 .modal-stream-item:last-child { border-bottom: none; }
@@ -1723,8 +1780,11 @@ body::after {
   font-size: 0.8rem;
   white-space: pre-wrap;
   word-break: break-word;
+  overflow-wrap: anywhere;
   line-height: 1.4;
   color: var(--win-gray-darker);
+  margin: 0;
+  max-width: 100%;
 }
 
 .modal-empty { 
