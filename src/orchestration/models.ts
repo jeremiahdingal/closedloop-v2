@@ -59,6 +59,7 @@ function resolveOllamaContextWindow(model: string): number {
   if (model.startsWith("qwen3.5:9b")) return 65536;
   if (model.startsWith("qwen3.5:27b")) return 65536;
   if (model.startsWith("vladimirgav/qwen3.6-27b")) return 65536;
+  if (model.startsWith("ibm/granite4.1:30b-q3")) return 8192;
   if (model.startsWith("ibm/granite4.1")) return 32768;
   if (model.startsWith("devstral-small-2:24b")) return 393216;
   if (model.startsWith("qwen2.5-coder:14b")) return 65536;
