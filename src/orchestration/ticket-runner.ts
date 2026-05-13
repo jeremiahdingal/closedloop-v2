@@ -1401,41 +1401,18 @@ export class TicketRunner {
         recursionLimit: 50,
       }) as TicketGraphState;
 
-      // Auto-retry from scratch on escalation or failure
       const finalStatus = result.status === "approved" ? "approved" : result.status === "escalated" ? "escalated" : "failed";
-      if (finalStatus !== "approved") {
-        console.log(`[TICKET ${ticket.id}] ${finalStatus} — auto-retrying from scratch`);
-        this.db.recordEvent({
-          aggregateType: "ticket",
-          aggregateId: ticket.id,
-          runId,
-          ticketId: ticket.id,
-          kind: "ticket_auto_retry",
-          message: `Ticket ${finalStatus}, auto-retrying from scratch.`,
-        });
-        // Create a fresh run so the worker picks it up
-        const retryRunId = randomId("run");
-        this.db.createRun({
-          id: retryRunId,
-          kind: "ticket",
-          epicId: ticket.epicId,
-          ticketId: ticket.id,
-          status: "queued",
-          currentNode: "queued",
-          attempt: 0,
-          heartbeatAt: null,
-          lastMessage: `Auto-retry after ${finalStatus}.`,
-          errorText: null
-        });
+      if (finalStatus === "failed") {
+        console.log(`[TICKET ${ticket.id}] ${finalStatus} — auto-retrying (keeping building state)`);
         this.db.updateTicketRunState({
           ticketId: ticket.id,
-          status: "queued",
-          currentRunId: retryRunId,
-          currentNode: "queued",
+          status: "building",
+          currentNode: "retry",
           lastHeartbeatAt: nowIso(),
-          lastMessage: `Auto-retry after ${finalStatus}.`
+          lastMessage: `Auto-retry after ${finalStatus}, starting fresh.`
         });
-        this.db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: retryRunId });
+        this.db.updateRun({ runId, status: "running", currentNode: "retry", heartbeatAt: nowIso(), lastMessage: `Auto-retry after ${finalStatus}.` });
+        return await this.runTicketAsNewAttempt(ticket.id, ticket.epicId);
       }
 
       return {
@@ -1469,32 +1446,15 @@ export class TicketRunner {
       this.db.updateRun({ runId, status: "failed", currentNode: "error", heartbeatAt: nowIso(), lastMessage: "Ticket crashed.", errorText: (error as Error).message });
       this.db.updateTicketRunState({ ticketId: ticket.id, status: "failed", currentNode: "error", lastHeartbeatAt: nowIso(), lastMessage: (error as Error).message });
 
-      // Auto-retry from scratch on crash
-      console.log(`[TICKET ${ticket.id}] crashed — auto-retrying from scratch`);
-      const crashRunId = randomId("run");
-      this.db.createRun({
-        id: crashRunId,
-        kind: "ticket",
-        epicId: ticket.epicId,
-        ticketId: ticket.id,
-        status: "queued",
-        currentNode: "queued",
-        attempt: 0,
-        heartbeatAt: null,
-        lastMessage: "Auto-retry after crash.",
-        errorText: null
-      });
+      console.log(`[TICKET ${ticket.id}] crashed — auto-retrying (keeping building state)`);
       this.db.updateTicketRunState({
         ticketId: ticket.id,
-        status: "queued",
-        currentRunId: crashRunId,
-        currentNode: "queued",
+        status: "building",
+        currentNode: "retry",
         lastHeartbeatAt: nowIso(),
         lastMessage: "Auto-retry after crash."
       });
-      this.db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: crashRunId });
-
-      throw error;
+      return await this.runTicketAsNewAttempt(ticket.id, ticket.epicId);
     } finally {
       const workspace = this.db.findWorkspaceByRun(runId);
       if (workspace) this.bridge.releaseLease("workspace", workspace.id);
@@ -2734,35 +2694,38 @@ export class TicketRunner {
     });
     await this.bridge.archiveWorkspace(workspaceId);
 
-    // Auto-retry from scratch
+    return { runId, workspaceId, status: "escalated", lastDiff: "", reviewVerdict: null, testSummary: reason };
+  }
+
+  private async runTicketAsNewAttempt(ticketId: string, epicId: string | null): Promise<TicketLoopResult> {
     const ticket = this.db.getTicket(ticketId);
-    if (ticket) {
-      console.log(`[TICKET ${ticketId}] escalated — auto-retrying from scratch`);
-      const retryRunId = randomId("run");
-      this.db.createRun({
-        id: retryRunId,
-        kind: "ticket",
-        epicId: ticket.epicId,
-        ticketId,
-        status: "queued",
-        currentNode: "queued",
-        attempt: 0,
-        heartbeatAt: null,
-        lastMessage: "Auto-retry after escalation.",
-        errorText: null
-      });
-      this.db.updateTicketRunState({
-        ticketId,
-        status: "queued",
-        currentRunId: retryRunId,
-        currentNode: "queued",
-        lastHeartbeatAt: nowIso(),
-        lastMessage: "Auto-retry after escalation."
-      });
-      this.db.enqueueJob("run_ticket", { ticketId, epicId: ticket.epicId, runId: retryRunId });
+    if (!ticket) {
+      throw new Error(`Ticket ${ticketId} not found for retry`);
     }
 
-    return { runId, workspaceId, status: "escalated", lastDiff: "", reviewVerdict: null, testSummary: reason };
+    const newRunId = randomId("run");
+    this.db.createRun({
+      id: newRunId,
+      kind: "ticket",
+      epicId,
+      ticketId,
+      status: "running",
+      currentNode: "preparing",
+      attempt: 0,
+      heartbeatAt: nowIso(),
+      lastMessage: "Auto-retry from fresh.",
+      errorText: null
+    });
+    this.db.updateTicketRunState({
+      ticketId,
+      status: "building",
+      currentRunId: newRunId,
+      currentNode: "preparing",
+      lastHeartbeatAt: nowIso(),
+      lastMessage: "Auto-retry starting fresh."
+    });
+
+    return await this.runTicket(newRunId, ticket, epicId, { skipExplorer: false });
   }
 
   private assertNotCancelled(ticketId: string, epicId: string | null): void {
