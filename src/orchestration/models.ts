@@ -100,7 +100,7 @@ function buildZodSchemas(z: any) {
       approved: z.boolean(),
       blockers: z.array(z.string()),
       suggestions: z.array(z.string()),
-      riskLevel: z.enum(["low", "medium", "high"])
+riskLevel: z.enum(["low", "medium", "high"])
     }),
     goalReview: z.object({
       verdict: z.enum(["approved", "needs_followups", "failed"]),
@@ -108,8 +108,13 @@ function buildZodSchemas(z: any) {
       followupTickets: z.array(GoalTicketPlanSchema)
     }),
     failureDecision: z.object({
-      decision: z.enum(["retry_same_node", "retry_builder", "blocked", "todo", "escalate"]),
+      decision: z.enum(["retry_same_node", "retry_builder", "blocked", "todo", "escalate", "review_existing"]),
       reason: z.string()
+    }),
+    ticketResult: z.object({
+      summary: z.string(),
+      filesChanged: z.array(z.string()),
+      testFiles: z.array(z.string()).optional()
     })
   };
 }

@@ -1,6 +1,5 @@
 import type {
   CoderOutput,
-  CanonicalEditPacket,
   EditOperation,
   EpicRecord,
   ExplorerOutput,
@@ -314,7 +313,7 @@ export function explorerPrompt(ticket: TicketRecord, packet: TicketContextPacket
 export function coderPrompt(
   ticket: TicketRecord,
   explorerOutput: ExplorerOutput | null,
-  editPacket: CanonicalEditPacket,
+  allowedPaths: string[],
   reviewerContext?: { blockers: string[]; suggestions: string[] },
   skipContext?: { skipped: boolean; reason?: string }
 ): string {
@@ -325,6 +324,7 @@ export function coderPrompt(
     "Use search_replace for targeted edits to existing files (preferred for small changes).",
     "Use write_file for new files or when rewriting most of an existing file (you MUST read it first).",
     "Use write_files for writing multiple files at once.",
+    "If you need to read file contents, use read_file — do not guess or assume file contents.",
     "Write ALL files (implementation + tests) before calling finish.",
     "",
     "## Writing Tests",
@@ -349,20 +349,21 @@ export function coderPrompt(
       "",
       "## Explorer Was Skipped",
       skipContext.reason ?? "The explorer node was bypassed for this run.",
-      "Focus on the files listed in the edit packet and the ticket's allowedPaths. If missing context, read the files you need."
+      "Focus on the files listed in allowedPaths. If missing context, read the files you need."
     ] : []),
     "",
     "## Explorer Analysis",
     JSON.stringify(explorerOutput, null, 2),
     "",
-    "## Edit Packet",
-    JSON.stringify(editPacket, null, 2),
+    "## Allowed Paths",
+    "You may only edit/create files within these paths:",
+    ...allowedPaths.map(p => `- ${p}`),
     "",
     "## Rules",
-    "1. READ files listed in the explorer analysis FIRST — do NOT glob, list_dir, or browse directories. The explorer already found the relevant files.",
+    "1. READ files listed in the explorer analysis FIRST — use read_file to read them. Do NOT guess or assume file contents.",
     "2. Only use glob/grep/list_dir if the explorer analysis is missing a file you critically need. This should be rare.",
     "3. Every change MUST address at least one acceptance criterion. No scope drift.",
-    "4. Do NOT delete or rename files unless explicitly permitted in destructivePermissions.",
+    "4. Do NOT delete or rename files unless explicitly permitted.",
     "5. If file content already matches what the acceptance criteria require, produce ZERO changes and explain in summary.",
     "6. Do NOT produce identity transforms where search === replace.",
     "7. You MUST write both implementation code AND test files. Every ticket should have at least one test file.",
@@ -381,7 +382,6 @@ export function coderPrompt(
     `Goal: ${ticket.description}`,
     `Acceptance criteria:`,
     ...ticket.acceptanceCriteria.map(c => `  - ${c}`),
-    `Allowed paths: ${ticket.allowedPaths.join(", ") || "(none)"}`,
     "=".repeat(60),
   ].join("\n\n");
 }

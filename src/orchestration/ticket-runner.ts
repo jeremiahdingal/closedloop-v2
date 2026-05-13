@@ -508,7 +508,7 @@ export class TicketRunner {
         this.heartbeat(runId, ticket.id, "coder", "Existing workspace changes detected. Resuming via Hot-Reset prompt.");
         currentCoderPrompt = buildCoderResumePrompt(ticket, initialDiff, state.reviewBlockers ?? [], state.explorerOutput);
       } else {
-        currentCoderPrompt = coderPrompt(ticket, state.explorerOutput, state.canonicalEditPacket, { blockers: state.reviewBlockers ?? [], suggestions: state.reviewSuggestions ?? [] }, { skipped: state.skipExplorer, reason: "Explorer was skipped by user request." });
+        currentCoderPrompt = coderPrompt(ticket, state.explorerOutput, state.canonicalEditPacket.allowedPaths, { blockers: state.reviewBlockers ?? [], suggestions: state.reviewSuggestions ?? [] }, { skipped: state.skipExplorer, reason: "Explorer was skipped by user request." });
       }
 
       let coderResult;
