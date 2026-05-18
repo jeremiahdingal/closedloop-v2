@@ -571,7 +571,7 @@ export class WorkspaceBridge {
       .filter((row) => row.path.length > 0);
   }
 
-  private async stageTicketChanges(worktreePath: string): Promise<void> {
+  async stageTicketChanges(worktreePath: string): Promise<void> {
     // Exclude orchestrator bookkeeping from ticket diffs/commits.
     await git(worktreePath, ["add", "-A", "--", ".", ":(exclude).orchestrator/context.json"]);
   }

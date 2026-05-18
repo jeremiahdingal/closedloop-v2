@@ -1163,6 +1163,19 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
           metadata: { model, toolName: event.call.name },
         });
       }
+      if (event.kind === "duplicate_recovery") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: "duplicate_recovery",
+          content: `Duplicate tool call detected: ${event.bannedCall}. Recovery restart #${event.recoveryCount}.`,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model, recoveryCount: event.recoveryCount },
+        });
+      }
       if (event.kind === "complete") {
         input.onStream?.({
           agentRole: role as any,
@@ -1284,8 +1297,10 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
         const { promisify } = await import("node:util");
         const execFileAsync = promisify(execFile);
         try {
-          const { stdout } = await execFileAsync("git", ["diff"], { cwd, timeout: 10000 });
-          return stdout;
+          const { stdout } = await execFileAsync("git", ["diff", "--staged"], { cwd, timeout: 10000 });
+          if (stdout.trim()) return stdout;
+          const { stdout: unstaged } = await execFileAsync("git", ["diff"], { cwd, timeout: 10000 });
+          return unstaged;
         } catch { return ""; }
       },
       gitStatus: async () => {

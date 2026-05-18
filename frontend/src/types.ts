@@ -5,6 +5,8 @@ export type Epic = {
   targetDir: string;
   targetBranch: string | null;
   status: string;
+  scheduledDate: string | null;
+  assetPaths: string[];
   createdAt: string;
   updatedAt: string;
 };

@@ -4,7 +4,7 @@ import { TOOL_ALIASES } from "./tools.ts";
 
 // ─── Call history for stagnation detection ──────────────────────────────────
 
-interface CallRecord {
+export interface CallRecord {
   name: string;
   argsHash: string;
   isError: boolean;
@@ -21,13 +21,17 @@ export class CallHistory {
   private consecutiveErrors = 0;
   private recentPaths: string[] = [];
   private readPaths: string[] = [];
+  private errorMessages: Map<string, string> = new Map();
 
-  record(name: string, args: Record<string, unknown>, isError: boolean): void {
+  record(name: string, args: Record<string, unknown>, isError: boolean, errorMsg?: string): void {
     const argsHash = stableStringify(args);
     this.records.push({ name, argsHash, isError, timestamp: Date.now() });
 
     if (isError) {
       this.consecutiveErrors++;
+      if (errorMsg) {
+        this.errorMessages.set(`${name}:${argsHash}`, errorMsg);
+      }
     } else {
       this.consecutiveErrors = 0;
     }
@@ -78,6 +82,14 @@ export class CallHistory {
 
   getLastReadPath(): string | null {
     return this.readPaths.length > 0 ? this.readPaths[this.readPaths.length - 1] : null;
+  }
+
+  getErrorMessage(name: string, argsHash: string): string | undefined {
+    return this.errorMessages.get(`${name}:${argsHash}`);
+  }
+
+  getErrorMessages(): Map<string, string> {
+    return this.errorMessages;
   }
 
   reset(): void {
@@ -575,7 +587,7 @@ function validateArgTypes(
 
 // ─── Deterministic JSON stringify for hashing ───────────────────────────────
 
-function stableStringify(obj: Record<string, unknown>): string {
+export function stableStringify(obj: Record<string, unknown>): string {
   const sorted = Object.keys(obj).sort().reduce<Record<string, unknown>>((acc, key) => {
     const val = obj[key];
     if (typeof val === "object" && val !== null && !Array.isArray(val)) {

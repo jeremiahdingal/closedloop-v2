@@ -62,13 +62,13 @@ export function computeBudget(
 
 export function shouldCompact(budget: ContextBudget): CompactionLevel {
   if (budget.usedFraction >= 0.92) return "force_finish";
-  if (budget.usedFraction >= 0.75) return "summarize";
+  if (budget.usedFraction >= 0.85) return "summarize";
   return "none";
 }
 
 // ─── LLM-based summarization ────────────────────────────────────────────────
 
-const SUMMARIZATION_SYSTEM_PROMPT = `You are a context compactor. Summarize the following conversation history into a concise summary that preserves:
+export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context compactor. Summarize the following conversation history into a concise summary that preserves:
 - Key findings and discoveries
 - File paths examined or modified
 - Code changes made (function names, variable names, logic changes)
@@ -80,7 +80,7 @@ Be specific — preserve file paths, variable names, function signatures, and im
 Omit exploratory dead-ends and redundant tool calls.
 Keep the summary under 2000 tokens.`;
 
-function formatMessagesForSummary(messages: ChatMessage[]): string {
+export function formatMessagesForSummary(messages: ChatMessage[]): string {
   const lines: string[] = [];
   for (const msg of messages) {
     if (msg.role === "system" && msg.content && typeof msg.content === "string" && msg.content.startsWith("[COMPACTED HISTORY")) {
@@ -145,6 +145,8 @@ function enforceTokenBudget(messages: ChatMessage[], targetTokens: number): Chat
   return result;
 }
 
+export const COMPACTION_MODEL = process.env.COMPACTION_MODEL || "qwen3.5:2b";
+
 export async function summarizeMessages(
   messages: ChatMessage[],
   windowTokens: number,
@@ -172,7 +174,7 @@ export async function summarizeMessages(
   const historyText = formatMessagesForSummary(oldHistory);
 
   // Use a small fast model for compaction — the main agent model is too slow for summarization
-  const compactionModel = process.env.COMPACTION_MODEL || "qwen3.5:2b";
+  const compactionModel = COMPACTION_MODEL;
 
   // Call the model to summarize via Ollama native /api/chat, with retry
   let summaryResponse: Response | null = null;

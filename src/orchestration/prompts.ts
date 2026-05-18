@@ -1,4 +1,5 @@
 import type {
+  CanonicalEditPacket,
   CoderOutput,
   EditOperation,
   EpicRecord,
@@ -250,11 +251,23 @@ export function reviewerPrompt(
   ].join("\n\n");
 }
 
-export function reviewerToolingPrompt(ticket: TicketRecord): string {
+export function reviewerToolingPrompt(ticket: TicketRecord, diff?: string): string {
+  const diffSection = diff && diff.trim()
+    ? [
+        "## Diff to Review",
+        "```diff",
+        diff.slice(0, 40000),
+        "```",
+      ]
+    : [
+        "## Diff to Review",
+        "Use the git_diff tool to inspect the current workspace changes. If git_diff returns empty, check git_diff_staged as well.",
+      ];
+
   return [
     "You are the Local Reviewer.",
     "Structural rules have already been checked by a deterministic guard.",
-    "Review the current workspace diff using the available review tools.",
+    "Review the diff below and decide whether to approve or reject.",
     "Use `.closedloop/PROJECT_STRUCTURE.md` as the source of truth for styling, UI elements, and compatibility constraints when present.",
     "Reject diffs that introduce raw HTML tags into Tamagui / React Native / mobile-facing code unless the file is clearly web-only.",
     "Do not ask for clarification. Inspect the diff, decide, and finish.",
@@ -265,6 +278,7 @@ export function reviewerToolingPrompt(ticket: TicketRecord): string {
       suggestions: ["string"],
       riskLevel: "low"
     }, null, 2),
+    ...diffSection,
     `Ticket: ${ticket.title}`,
     `Description: ${ticket.description}`,
     `Acceptance criteria: ${ticket.acceptanceCriteria.join("; ")}`
@@ -315,8 +329,16 @@ export function coderPrompt(
   explorerOutput: ExplorerOutput | null,
   allowedPaths: string[],
   reviewerContext?: { blockers: string[]; suggestions: string[] },
-  skipContext?: { skipped: boolean; reason?: string }
+  skipContext?: { skipped: boolean; reason?: string },
+  editPacket?: CanonicalEditPacket | null
 ): string {
+  const fileSnippets = editPacket?.files
+    ?.filter(f => f.exists && (f.content || f.excerpts?.length))
+    .map(f => {
+      const body = f.content ?? f.excerpts!.map(e => e.content).join("\n");
+      return `### ${f.path} (sha256: ${f.sha256?.slice(0, 12)}…)\n\`\`\`\n${body}\n\`\`\``;
+    }) ?? [];
+
   return [
     "You are the Coder agent. Write code changes AND tests to satisfy the ticket.",
     "",
@@ -354,6 +376,9 @@ export function coderPrompt(
     "",
     "## Explorer Analysis",
     JSON.stringify(explorerOutput, null, 2),
+    ...(fileSnippets.length > 0
+      ? ["", "## File Contents (from edit packet)", ...fileSnippets]
+      : []),
     "",
     "## Allowed Paths",
     "You may only edit/create files within these paths:",
@@ -474,6 +499,10 @@ export function epicReviewerToolingPrompt(
     "If you find destructive changes or integration issues, FIX THEM DIRECTLY.",
     "Do NOT ask for followups - apply the fixes yourself.",
     "Prefer the smallest safe patch that resolves conflicts between tickets.",
+    "",
+    "NOTE: Ticket code changes are STAGED but NOT COMMITTED in the workspace.",
+    "Use `git diff --staged` (not `git diff`) to see the ticket changes.",
+    "Use `git status --short` to see all modified/new files.",
     "",
     "Use the OpenCode tools that are available in-session: read, glob, grep, edit, write, task, todowrite, and skill.",
     "Do not call shell-style tools like bash, ls, find, or run unless they are explicitly available.",
@@ -622,6 +651,45 @@ export function epicDecoderToolingPrompt(
   return sections.join("\n\n");
 }
 
+export function epicDecoderCompactPrompt(
+  epic: EpicRecord,
+  coderModel?: string
+): string {
+  return [
+    "You are the Epic Decoder agent. This is a COMPACTED retry after a previous stall.",
+    "Explore the repo QUICKLY — you already know the structure from the previous attempt.",
+    "Do NOT re-read files you already understand. Focus on decomposing into tickets NOW.",
+    "Do not try to call bash, ls, find, run, or any other unavailable shell tool.",
+    `Epic: ${epic.title}`,
+    `Goal: ${epic.goalText}`,
+    "",
+    "EXECUTOR CONSTRAINT — read this before writing a single ticket:",
+    executorConstraint(coderModel),
+    "Every ticket MUST be: atomic, narrow (1-3 files), explicit, and small enough for one LLM response.",
+    "",
+    "TICKET QUALITY REQUIREMENTS — every ticket MUST have:",
+    "Description using WHAT/WHERE/HOW/WHY format. Specific acceptance criteria. At least one test-related criterion.",
+    "",
+    "Steps:",
+    "1. Quick glob/grep to confirm layout (2-3 calls max)",
+    "2. Decompose into atomic, file-scoped tickets immediately",
+    "3. Output FINAL_JSON",
+    "",
+    `<FINAL_JSON>${JSON.stringify({
+      summary: "string",
+      tickets: [{
+        id: "string",
+        title: "string",
+        description: "string",
+        acceptanceCriteria: ["string"],
+        dependencies: ["string"],
+        priority: "high|medium|low",
+        testSpecs: ["string — test assertions"]
+      }]
+    })}</FINAL_JSON>`
+  ].join("\n\n");
+}
+
 export function epicReviewerCodexPrompt(
   epic: EpicRecord,
   tickets: TicketRecord[],
@@ -761,7 +829,7 @@ export function epicReviewerDirectCliPrompt(input: {
       lines.push(`- Ticket branch/worktree hint: ${gitContext.branchName}`);
     }
     if (gitContext?.hasWorkspaceChanges && !gitContext.headRef) {
-      lines.push("- This ticket may include uncommitted workspace changes. Inspect `git status --short` and `git diff` in addition to commit-based review.");
+      lines.push("- This ticket has staged but uncommitted changes. Use `git diff --staged` to see the changes, or `git status --short` to see modified files.");
     }
 
     // Include reviewer verdict for failing/problematic tickets
@@ -798,16 +866,18 @@ export function epicReviewerDirectCliPrompt(input: {
     "You are the Epic Reviewer agent. You have access to the full workspace with all ticket changes already merged in.",
     "",
     "IMPORTANT: All ticket code changes are already present in your working directory.",
+    "Changes are STAGED but NOT COMMITTED. Use `git diff --staged` to see them, or `git diff` if unstaged changes exist.",
     "Do NOT rely on embedded/truncated diffs in the prompt. Pull the git history and diffs yourself.",
     "Use git in two passes: first holistically for the whole epic, then ticket-by-ticket using the command hints below.",
     "",
     "Recommended whole-epic commands:",
     "1. Run: git status --short",
-    `2. Run: git diff --stat ${holisticRange}`,
-    `3. Run: git diff ${holisticRange}`,
-    `4. Run: git diff --name-only ${holisticRange}`,
-    "5. If the holistic diff is large, switch to ticket-specific diff commands from the ticket metadata below.",
-    "6. Read source files directly after locating suspicious hunks.",
+    "2. Run: git diff --staged --stat",
+    "3. Run: git diff --staged",
+    "4. Run: git diff --staged --name-only",
+    `5. If committed changes exist: git diff ${holisticRange}`,
+    "6. If the diff is large, switch to ticket-specific commands from the ticket metadata below.",
+    "7. Read source files directly after locating suspicious hunks.",
     "",
     "Your job is to:",
     "1. Review ALL ticket changes against the epic goal and acceptance criteria",
@@ -859,8 +929,9 @@ export function epicReviewerDirectCliPrompt(input: {
   sections.push(ticketSections);
   sections.push("");
   sections.push("## Instructions");
-  sections.push(`1. Start with the whole-epic diff: \`git diff ${holisticRange}\``);
-  sections.push("2. For each ticket, run the ticket-specific `git diff` command listed in that ticket section to inspect only its scoped paths");
+  sections.push("1. Start with `git diff --staged` to see all staged (uncommitted) changes");
+  sections.push(`2. If there are also committed changes, check: \`git diff ${holisticRange}\``);
+  sections.push("3. For each ticket, run the ticket-specific `git diff` command listed in that ticket section to inspect only its scoped paths");
   sections.push("3. Cross-reference each ticket's changes against its acceptance criteria above");
   sections.push("4. Check for cross-ticket integration issues (conflicting changes, missing imports, broken shared types, etc.)");
   sections.push("5. If you find issues, FIX THEM DIRECTLY by editing the files");
@@ -1178,29 +1249,29 @@ export function playWriterPrompt(
 export function playTesterPrompt(
   epic: EpicRecord,
   testFiles: string[],
-  devServerUrl: string,
-  devServerCommand: string,
+  _devServerUrl: string,
+  _devServerCommand: string,
   loopAttempt: number,
   previousFailures?: string | null
 ): string {
-  const testFilesList = testFiles.map(f => `  - ${f}`).join("\n");
+  const testFilesList = testFiles.length > 0
+    ? testFiles.map(f => `  - ${f}`).join("\n")
+    : "  (auto-discover — run all .spec.ts files found by playwright)";
 
   const previousFailuresBlock = previousFailures
-    ? `## Previous Loop Failures (Attempt ${loopAttempt - 1})\n\nThese tests failed in the previous attempt. Pay attention to them:\n${previousFailures}`
+    ? `## Previous Loop Failures (Attempt ${loopAttempt - 1})\n\nThese tests failed in the previous attempt:\n${previousFailures}`
     : "";
 
   return [
-    "You are Play Tester — an autonomous test execution agent.",
+    "You are Play Tester — an autonomous test runner.",
     "",
-    `This is loop attempt ${loopAttempt} of 3.`,
+    `This is loop attempt ${loopAttempt} of 10.`,
     "",
     "## Your Job",
-    "Run each Playwright test file listed below using Playwright MCP browser tools.",
-    "The dev servers are already running. You do NOT need to start them.",
-    `The app is available at: ${devServerUrl}`,
+    "Run ALL Playwright e2e tests in this project using the run_command tool.",
+    "Parse the CLI output to determine which tests passed and which failed.",
     "",
-    "## Test Files to Run",
-    "(These were generated by Play Writer specifically for this epic. Run ALL of them.)",
+    "## Test Files in This Project",
     testFilesList,
     "",
     previousFailuresBlock,
@@ -1208,62 +1279,105 @@ export function playTesterPrompt(
     `## Epic: ${epic.title}`,
     epic.goalText,
     "",
-    "## How to Execute Each Test",
+    "## How to Run Tests",
     "",
-    "For each test file:",
-    "  1. Read the test file content using your read_file tool.",
-    "  2. Identify each \`test(...)\` block and what it does.",
-    "  3. For each test:",
-    "     a. Use \`browser_navigate\` to go to the page under test.",
-    "     b. Use \`browser_click\`, \`browser_type\`, \`browser_snapshot\` etc. to perform the test steps.",
-    "     c. Use \`browser_snapshot\` to capture the page state for assertions.",
-    "     d. Compare the actual UI state to what the test expects.",
-    "     e. Mark the test as PASSED if everything matches expectations.",
-    "     f. Mark the test as FAILED if any step fails, with the exact error.",
+    "  1. Run \"npx playwright test\" using the run_command tool.",
+    "  2. Wait for the command to complete.",
+    "  3. Parse the output to extract:",
+    "     - Total tests run",
+    "     - Number passed",
+    "     - Number failed",
+    "     - For each failure: test file path, test name, and error message",
+    "  4. If any tests failed, re-run ONLY the failing tests to get detailed error output:",
+    "     \"npx playwright test <failing-test-file> --reporter=list\"",
     "",
     "## Critical Rules",
-    "  - Do NOT run \`npx playwright test\` or any shell command to run tests.",
-    "  - Do NOT use the \`run_command\` tool to execute tests.",
-    "  - Use ONLY Playwright MCP browser tools: \`browser_navigate\`, \`browser_click\`,",
-    "    \`browser_type\`, \`browser_fill\`, \`browser_snapshot\`, \`browser_evaluate\`,",
-    "    \`browser_get_text\`, \`browser_wait_for\`.",
-    "  - Run every test file listed above. Do not skip any.",
-    "  - If a test file has multiple \`test(...)\` blocks, run ALL of them.",
-    "  - Do not suggest fixes. Do not edit any files. Only report results.",
+    "  - Run the FULL test suite, not just specific files (unless re-running failures for details).",
+    "  - Do NOT edit any files. Do NOT fix any tests. Only report results.",
+    "  - Do NOT start or stop any dev servers — Playwright config handles that.",
     "",
     "## Required Output Format",
     "",
     "After running ALL tests, output exactly one FINAL_JSON block.",
-    "Include every test you ran, whether it passed or failed.",
     "",
     "Format:",
-    "<FINAL_JSON>{",
-    "  \"status\": \"passed\",",
-    "  \"summary\": { \"total\": 4, \"passed\": 4, \"failed\": 0 },",
-    "  \"results\": [",
-    "    {",
-    "      \"testFile\": \"tests/epic-theming.spec.ts\",",
-    "      \"testName\": \"dashboard has correct gradient background\",",
-    "      \"status\": \"passed\",",
-    "      \"steps\": 5,",
-    "      \"error\": null",
-    "    },",
-    "    {",
-    "      \"testFile\": \"tests/epic-theming.spec.ts\",",
-    "      \"testName\": \"cashier splash shows correct theme\",",
-    "      \"status\": \"failed\",",
-    "      \"steps\": 3,",
-    "      \"error\": \"Expected element .cashier-splash to have background #FF5500 but got transparent\"",
-    "    }",
-    "  ]",
-    "}</FINAL_JSON>",
+    '<FINAL_JSON>{',
+    '  "status": "passed",',
+    '  "summary": { "total": 4, "passed": 4, "failed": 0 },',
+    '  "results": [',
+    '    {',
+    '      "testFile": "tests/epic-theming.spec.ts",',
+    '      "testName": "dashboard has correct gradient background",',
+    '      "status": "passed",',
+    '      "steps": 5,',
+    '      "error": null',
+    '    },',
+    '    {',
+    '      "testFile": "tests/epic-theming.spec.ts",',
+    '      "testName": "cashier splash shows correct theme",',
+    '      "status": "failed",',
+    '      "steps": 3,',
+    '      "error": "Expected element .cashier-splash to have background #FF5500 but got transparent"',
+    '    }',
+    '  ]',
+    '</FINAL_JSON>',
     "",
     "Rules for FINAL_JSON:",
-    "  - `status` at the top level is `passed` only if ALL tests passed, otherwise `failed`.",
-    "  - `error` is null for passing tests.",
-    "  - `error` must be the exact failure message for failing tests — be specific.",
+    '  - "status" at the top level is "passed" only if ALL tests passed, otherwise "failed".',
+    '  - "error" is null for passing tests.',
+    '  - "error" must include the full error message from Playwright output for failing tests.',
     "  - Include every test. Do not omit passing tests from the results array.",
   ].join("\n");
+}
+
+export function playWriterFixPrompt(
+  epic: EpicRecord,
+  failures: { testFile: string; testName: string; error: string | null }[]
+): string {
+  const failureList = failures.map(f =>
+    `- **${f.testName}** in ${f.testFile}\n  Error: ${f.error ?? "unknown"}`
+  ).join("\n\n");
+
+  return [
+    "You are Play Writer — an autonomous coding agent in FIX mode.",
+    "",
+    "## Your Job",
+    "The Playwright test suite has failures. Fix the app code to make ALL tests pass.",
+    "Then commit your changes to the current branch.",
+    "",
+    `## Epic: ${epic.title}`,
+    epic.goalText,
+    "",
+    "## Failing Tests",
+    failureList,
+    "",
+    "## Instructions",
+    "",
+    "  1. Read each failing test file to understand what it expects.",
+    "  2. Read the app source files that the test exercises.",
+    "  3. Fix the app code so the test passes. Do NOT change test files unless the test itself is buggy.",
+    '  4. After fixing, run "npx playwright test" to verify all tests pass.',
+    "  5. If tests still fail, continue fixing until they all pass.",
+    "  6. When all tests pass, commit your changes:",
+    "     - Stage all changed files: git add -A",
+    "     - Commit: git commit -m 'fix: resolve e2e test failures'",
+    "",
+    "## Rules",
+    "  - Fix app code, not test code (unless the test has a clear bug like wrong selector).",
+    "  - Do NOT skip or comment out failing tests.",
+    "  - Do NOT add .skip or .fixme to tests.",
+    "  - Commit ONLY after all tests pass.",
+    "",
+    "After committing, output FINAL_JSON:",
+    '<FINAL_JSON>{"fixesApplied": ["path/to/file1.ts", "path/to/file2.ts"], "summary": "Brief description of what was fixed"}</FINAL_JSON>',
+  ].join("\n");
+}
+
+export interface StallContext {
+  stallReason?: string;
+  stallIteration?: number;
+  recentToolCalls?: { name: string; argsSummary: string; result: string }[];
+  hotResetNumber?: number;
 }
 
 export function buildCoderResumePrompt(
@@ -1271,6 +1385,7 @@ export function buildCoderResumePrompt(
   currentDiff: string,
   reviewerBlockers: string[],
   explorerOutput?: ExplorerOutput | null,
+  stallContext?: StallContext | null,
 ): string {
   const explorerSection = explorerOutput ? [
     "## Explorer Analysis (Prior)",
@@ -1278,10 +1393,33 @@ export function buildCoderResumePrompt(
     ""
   ] : [];
 
+  const stallSection = stallContext ? [
+    "## Why The Previous Coder Stalled",
+    `Reason: ${stallContext.stallReason || "Unknown — the model stopped making progress."}`,
+    stallContext.stallIteration ? `It stalled at iteration ${stallContext.stallIteration}.` : "",
+    stallContext.hotResetNumber ? `This is hot-reset #${stallContext.hotResetNumber}.` : "",
+    "",
+    stallContext.recentToolCalls && stallContext.recentToolCalls.length > 0 ? [
+      "## Recent Tool Calls Before Stall",
+      "The previous coder was doing this when it stalled:",
+      ...stallContext.recentToolCalls.slice(-10).map((tc, i) =>
+        `${i + 1}. ${tc.name}(${tc.argsSummary.slice(0, 120)}) → ${tc.result.slice(0, 120)}`
+      ),
+      "",
+    ].join("\n") : "",
+    "## Rules To Avoid Stalling Again",
+    "- Do NOT repeat the same tool calls that failed above.",
+    "- If a search_replace failed because the search text didn't match, read the file first to get the exact current content.",
+    "- If a file path was wrong, use glob_files or grep_files to find the correct path.",
+    "- If you cannot make progress, call finish with a summary of what was done and what remains.",
+    "",
+  ] : [];
+
   return [
     "## Resume Context",
     "You are continuing work on a ticket that was interrupted. File changes are already on disk.",
     "",
+    ...stallSection,
     ...explorerSection,
     "## Ticket",
     `Title: ${ticket.title}`,

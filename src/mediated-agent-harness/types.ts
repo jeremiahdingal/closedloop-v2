@@ -120,7 +120,8 @@ export type MediatedHarnessEvent =
   | { kind: "tool_result"; result: ToolResult }
   | { kind: "tool_error"; call: ToolCall; error: string }
   | { kind: "complete"; result: string; iterations: number }
-  | { kind: "error"; error: string };
+  | { kind: "error"; error: string }
+  | { kind: "duplicate_recovery"; bannedCall: string; recoveryCount: number };
 
 // ─── Result ─────────────────────────────────────────────────────────────────
 
@@ -176,6 +177,24 @@ export interface ToolCallDelta {
     name?: string;
     arguments?: string;
   };
+}
+
+// ─── Duplicate recovery types ───────────────────────────────────────────────
+
+export interface BannedCallSignature {
+  toolName: string;
+  argsHash: string;
+  errorMessage: string;
+  errorKind: string;
+  bannedAt: number;
+}
+
+export interface DuplicateRecoveryState {
+  bannedSignatures: BannedCallSignature[];
+  recoveryCount: number;
+  postRecoveryCallCount: number;
+  isInRecovery: boolean;
+  hasMadeProgress: boolean;
 }
 
 // ─── Ollama native API types ─────────────────────────────────────────────────

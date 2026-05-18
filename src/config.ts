@@ -76,9 +76,9 @@ export function loadConfig(): AppConfig {
     apiPort: Number(process.env.API_PORT || 4010),
     workerPollMs: Number(process.env.WORKER_POLL_MS || 1000),
     workerConcurrency: Number(process.env.WORKER_CONCURRENCY || 1),
-    staleRunAfterMs: Number(process.env.STALE_RUN_AFTER_MS || 300_000),
-    staleCoderRunAfterMs: Number(process.env.STALE_CODER_RUN_AFTER_MS || 900_000),
-    staleRunMaxRecoveries: Number(process.env.STALE_RUN_MAX_RECOVERIES || 3),
+    staleRunAfterMs: Number(process.env.STALE_RUN_AFTER_MS || 60_000),
+    staleCoderRunAfterMs: Number(process.env.STALE_CODER_RUN_AFTER_MS || 180_000),
+    staleRunMaxRecoveries: Number(process.env.STALE_RUN_MAX_RECOVERIES || 10),
     leaseTtlMs: Number(process.env.LEASE_TTL_MS || 60_000),
     workspaceRetentionHours: Number(process.env.WORKSPACE_RETENTION_HOURS || 48),
     localOnly: process.env.LOCAL_ONLY === "1",
@@ -100,7 +100,7 @@ export function loadConfig(): AppConfig {
       || process.env.REVIEWER_MODE === "mediated-deep"
       || process.env.REVIEWER_MODE === "direct-fast")
       ? process.env.REVIEWER_MODE
-      : "direct-fast",
+      : "mediated-deep",
     reviewGuardEnabled: process.env.REVIEW_GUARD_ENABLED !== "0",
     reviewFastTimeoutMs: Number(process.env.REVIEW_FAST_TIMEOUT_MS || process.env.REVIEWER_TIMEOUT_MS || 300_000),
     reviewDeepTimeoutMs: Number(process.env.REVIEW_DEEP_TIMEOUT_MS || process.env.REVIEWER_TIMEOUT_MS || 420_000),

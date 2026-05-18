@@ -80,6 +80,17 @@ export class AppDatabase {
       // Column already exists
     }
 
+    try {
+      this.db.exec(`ALTER TABLE epics ADD COLUMN scheduled_date TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE epics ADD COLUMN asset_paths_json TEXT NOT NULL DEFAULT '[]'`);
+    } catch {
+      // Column already exists
+    }
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS tickets (
         id TEXT PRIMARY KEY,
@@ -307,9 +318,9 @@ export class AppDatabase {
   createEpic(epic: Omit<EpicRecord, "createdAt" | "updatedAt">): EpicRecord {
     const now = nowIso();
     this.db.prepare(`
-      INSERT INTO epics (id, title, goal_text, target_dir, target_branch, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(epic.id, epic.title, epic.goalText, epic.targetDir, epic.targetBranch, epic.status, now, now);
+      INSERT INTO epics (id, title, goal_text, target_dir, target_branch, status, scheduled_date, asset_paths_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(epic.id, epic.title, epic.goalText, epic.targetDir, epic.targetBranch, epic.status, epic.scheduledDate ?? null, JSON.stringify(epic.assetPaths ?? []), now, now);
     return { ...epic, createdAt: now, updatedAt: now };
   }
 
@@ -323,39 +334,55 @@ export class AppDatabase {
       targetDir: row.target_dir,
       targetBranch: row.target_branch || null,
       status: row.status,
+      scheduledDate: row.scheduled_date ?? null,
+      assetPaths: JSON.parse(row.asset_paths_json || "[]"),
       createdAt: row.created_at,
       updatedAt: row.updated_at
     };
   }
 
   listEpics(options?: { limit?: number; offset?: number }): EpicRecord[] {
-    if (options?.limit !== undefined) {
-      return (this.db.prepare(`SELECT * FROM epics ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(options.limit, options.offset ?? 0) as any[]).map((row) => ({
-        id: row.id,
-        title: row.title,
-        goalText: row.goal_text,
-        targetDir: row.target_dir,
-        targetBranch: row.target_branch || null,
-        status: row.status,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at
-      }));
-    }
-    return (this.db.prepare(`SELECT * FROM epics ORDER BY created_at DESC`).all() as any[]).map((row) => ({
+    const mapRow = (row: any): EpicRecord => ({
       id: row.id,
       title: row.title,
       goalText: row.goal_text,
       targetDir: row.target_dir,
       targetBranch: row.target_branch || null,
       status: row.status,
+      scheduledDate: row.scheduled_date ?? null,
+      assetPaths: JSON.parse(row.asset_paths_json || "[]"),
       createdAt: row.created_at,
       updatedAt: row.updated_at
-    }));
+    });
+    if (options?.limit !== undefined) {
+      return (this.db.prepare(`SELECT * FROM epics ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(options.limit, options.offset ?? 0) as any[]).map(mapRow);
+    }
+    return (this.db.prepare(`SELECT * FROM epics ORDER BY created_at DESC`).all() as any[]).map(mapRow);
   }
 
   countEpics(): number {
     const row = this.db.prepare(`SELECT COUNT(*) as count FROM epics`).get() as { count: number };
     return row.count;
+  }
+
+  updateEpicAssets(id: string, assetPaths: string[]): void {
+    this.db.prepare(`UPDATE epics SET asset_paths_json = ?, updated_at = ? WHERE id = ?`)
+      .run(JSON.stringify(assetPaths), nowIso(), id);
+  }
+
+  listScheduledEpics(): EpicRecord[] {
+    return (this.db.prepare(`SELECT * FROM epics WHERE scheduled_date IS NOT NULL ORDER BY scheduled_date ASC`).all() as any[]).map((row: any) => ({
+      id: row.id,
+      title: row.title,
+      goalText: row.goal_text,
+      targetDir: row.target_dir,
+      targetBranch: row.target_branch || null,
+      status: row.status,
+      scheduledDate: row.scheduled_date ?? null,
+      assetPaths: JSON.parse(row.asset_paths_json || "[]"),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }));
   }
 
   updateEpicStatus(id: string, status: EpicRecord["status"]): void {

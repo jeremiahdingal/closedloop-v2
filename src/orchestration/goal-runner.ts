@@ -3,7 +3,7 @@ import { writeFile, readFile, mkdir, symlink, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import { AppDatabase } from "../db/database.ts";
 import { randomId, nowIso, sleep } from "../utils.ts";
-import { epicDecoderPrompt, epicDecoderToolingPrompt, epicReviewerBuildFixPrompt, epicReviewerDirectCliPrompt } from "./prompts.ts";
+import { epicDecoderPrompt, epicDecoderToolingPrompt, epicDecoderCompactPrompt, epicReviewerBuildFixPrompt, epicReviewerDirectCliPrompt } from "./prompts.ts";
 import type { ModelGateway } from "./models.ts";
 import type { AgentStreamPayload, EpicRecord, GoalDecomposition, GoalReview, GoalTicketPlan, TicketEpicReviewPacket, TicketRecord } from "../types.ts";
 import { TicketRunner } from "./ticket-runner.ts";
@@ -27,6 +27,7 @@ type GoalGraphState = {
   decompositionSummary: string;
   reviewVerdict: "approved" | "needs_followups" | "failed";
   reviewSummary: string;
+  playLoopSuccess: boolean | null;
   status: "pending" | "executing" | "reviewing" | "done" | "failed";
 };
 
@@ -274,6 +275,10 @@ export class GoalRunner {
   }
 
   async enqueueGoal(epicId: string): Promise<string> {
+    const epic = this.db.getEpic(epicId);
+    if (epic?.scheduledDate && new Date().toISOString().slice(0, 10) < epic.scheduledDate) {
+      throw new Error(`Epic ${epicId} is scheduled for ${epic.scheduledDate}. Not yet due.`);
+    }
     const runId = randomId("run");
     this.db.createRun({
       id: runId,
@@ -323,6 +328,7 @@ export class GoalRunner {
       decompositionSummary: z.string().default(""),
       reviewVerdict: z.enum(["approved", "needs_followups", "failed"]).default("approved"),
       reviewSummary: z.string().default(""),
+      playLoopSuccess: z.boolean().nullable().default(null),
       status: z.enum(["pending", "executing", "reviewing", "done", "failed"]).default("pending")
     });
 
@@ -350,7 +356,23 @@ export class GoalRunner {
         } satisfies Partial<GoalGraphState>;
       }
 
-      const plan = await this.withEpicHeartbeat(runId, epic.id, "decompose_goal", "Decomposing goal.", () => this.runEpicDecoder(epic, runId));
+      const MAX_DECODE_STALL_RETRIES = 3;
+      let plan: GoalDecomposition | null = null;
+      for (let stallAttempt = 0; stallAttempt < MAX_DECODE_STALL_RETRIES; stallAttempt++) {
+        try {
+          plan = await this.withEpicHeartbeat(runId, epic.id, "decompose_goal", stallAttempt === 0 ? "Decomposing goal." : `Decoder stall recovery #${stallAttempt}.`, () =>
+            this.runEpicDecoder(epic, runId, stallAttempt > 0)
+          );
+          break;
+        } catch (err) {
+          const isTimeout = err instanceof Error && (err.message.includes("timed out") || err.message.includes("Stall recovery"));
+          if (!isTimeout || stallAttempt >= MAX_DECODE_STALL_RETRIES - 1) throw err;
+
+          this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Decoder stalled (attempt ${stallAttempt + 1}/${MAX_DECODE_STALL_RETRIES}). Compacting prompt and retrying...`, runId, epicId: epic.id, sequence: 100 + stallAttempt });
+          console.log(`[EPIC-DECODER] ${epic.id} stalled on attempt ${stallAttempt + 1}. Compacting and retrying.`);
+        }
+      }
+      if (!plan) throw new Error("Epic decoder produced no result");
       const normalizedPlans = normalizeGoalTicketPlans(epic.id, plan.tickets);
       const materialized = this.db.transaction(() => this.materializeTickets(epic.id, normalizedPlans));
       console.log(`[LangGraph] Node: decompose_goal - Materialized ${materialized.ticketIds.length} tickets`);
@@ -470,16 +492,37 @@ export class GoalRunner {
       } satisfies Partial<GoalGraphState>;
     };
 
+    const runPlayLoop = async (state: GoalGraphState) => {
+      console.log(`[LangGraph] Node: play_loop, epicId: ${epic.id}`);
+      this.assertNotCancelled(epic.id);
+      this.db.updateRun({ runId, status: "running", currentNode: "play_loop", heartbeatAt: nowIso(), lastMessage: "Running Playwright e2e tests." });
+      this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: "Starting Playwright e2e test loop...", runId, epicId: epic.id, sequence: 0 });
+
+      const tickets = this.db.listTickets(epic.id);
+      try {
+        const success = await this.withEpicHeartbeat(runId, epic.id, "play_loop", "Running Playwright e2e tests.", () =>
+          this.playLoop.runPlayLoop(epic, tickets, runId)
+        );
+        this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Play loop ${success ? "passed" : "failed"}.`, runId, epicId: epic.id, sequence: 1, done: true });
+        return { playLoopSuccess: success } satisfies Partial<GoalGraphState>;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "stderr", content: `Play loop error: ${msg}`, runId, epicId: epic.id, sequence: 1, done: true });
+        return { playLoopSuccess: false } satisfies Partial<GoalGraphState>;
+      }
+    };
+
     const finalizeGoal = async (state: GoalGraphState) => {
       const approved = state.reviewVerdict === "approved";
       const failForward = state.reviewVerdict === "needs_followups";
+      const playOk = state.playLoopSuccess !== false;
       this.db.updateEpicStatus(epic.id, (approved || failForward) ? "done" : "failed");
       this.db.updateRun({
         runId,
         status: (approved || failForward) ? "succeeded" : "failed",
         currentNode: "complete",
         heartbeatAt: nowIso(),
-        lastMessage: state.reviewSummary,
+        lastMessage: state.reviewSummary + (state.playLoopSuccess !== null ? ` | Playwright: ${playOk ? "passed" : "failed"}` : ""),
         errorText: (approved || failForward) ? null : state.reviewSummary
       });
       this.db.recordEvent({
@@ -488,7 +531,7 @@ export class GoalRunner {
         runId,
         kind: "epic_reviewed",
         message: state.reviewSummary,
-        payload: { verdict: state.reviewVerdict, ticketSummaries: state.ticketSummaries }
+        payload: { verdict: state.reviewVerdict, ticketSummaries: state.ticketSummaries, playLoopSuccess: state.playLoopSuccess }
       });
       return state;
     };
@@ -497,11 +540,16 @@ export class GoalRunner {
       .addNode("decompose_goal", decomposeGoal)
       .addNode("execute_tickets", executeTickets)
       .addNode("goal_review", reviewGoal)
+      .addNode("play_loop", runPlayLoop)
       .addNode("finalize_goal", finalizeGoal)
       .addEdge(START, "decompose_goal")
       .addEdge("decompose_goal", "execute_tickets")
       .addEdge("execute_tickets", "goal_review")
-      .addEdge("goal_review", "finalize_goal")
+      .addConditionalEdges("goal_review", (state: GoalGraphState) => {
+        if (state.reviewVerdict === "approved" || state.reviewVerdict === "needs_followups") return "play_loop";
+        return "finalize_goal";
+      }, ["play_loop", "finalize_goal"])
+      .addEdge("play_loop", "finalize_goal")
       .addEdge("finalize_goal", END);
 
     const graph = graphBuilder.compile();
@@ -594,9 +642,23 @@ export class GoalRunner {
     }
   }
 
-  private async runEpicDecoder(epic: EpicRecord, runId: string): Promise<GoalDecomposition> {
-    const ragCtx = await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`);
-    const projectStructure = await ensureProjectStructureFile(epic.targetDir).catch(() => null);
+  private async runEpicDecoder(epic: EpicRecord, runId: string, compact = false): Promise<GoalDecomposition> {
+    const ragCtx = compact ? null : await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`);
+    const projectStructure = compact ? null : await ensureProjectStructureFile(epic.targetDir).catch(() => null);
+
+    let assetContext = "";
+    if (epic.assetPaths && epic.assetPaths.length > 0) {
+      assetContext = "\n\nREFERENCE IMAGES:\nThe user provided reference images for this epic. Use read_file to examine them and incorporate their content:\n"
+        + epic.assetPaths.map(p => `- ${p}`).join("\n") + "\n";
+    }
+
+    let prompt: string;
+    if (compact) {
+      prompt = epicDecoderCompactPrompt(epic, this.gateway.models.coder) + assetContext;
+    } else {
+      prompt = epicDecoderToolingPrompt(epic, ragCtx, projectStructure, this.gateway.models.coder) + assetContext;
+    }
+
     const configuredModel = this.gateway.models.epicDecoder;
     if (
       this.gateway.runEpicDecoderInWorkspace &&
@@ -609,20 +671,20 @@ export class GoalRunner {
       )
     ) {
       try {
-        const result = await this.gateway.runEpicDecoderInWorkspace({ cwd: epic.targetDir, prompt: epicDecoderToolingPrompt(epic, ragCtx, projectStructure, this.gateway.models.coder), runId, epicId: epic.id, onStream: (e) => this.recordAgentStream(e) });
+        const result = await this.gateway.runEpicDecoderInWorkspace({ cwd: epic.targetDir, prompt, runId, epicId: epic.id, onStream: (e) => this.recordAgentStream(e) });
         return result;
       } catch (err) { console.warn(`Decoder failed: ${err}`); }
     }
     if (this.gateway.runEpicDecoderOpenCode && configuredModel.startsWith("opencode:")) {
       try {
-        const result = await this.gateway.runEpicDecoderOpenCode({ cwd: epic.targetDir, prompt: epicDecoderToolingPrompt(epic, ragCtx, projectStructure, this.gateway.models.coder), runId, epicId: epic.id, onStream: (e) => this.recordAgentStream(e) });
+        const result = await this.gateway.runEpicDecoderOpenCode({ cwd: epic.targetDir, prompt, runId, epicId: epic.id, onStream: (e) => this.recordAgentStream(e) });
         return result;
       } catch (err) { console.warn(`OpenCode decoder failed: ${err}`); }
     }
-    return this.gateway.getGoalDecomposition(epicDecoderPrompt(epic, this.gateway.models.coder));
+    return this.gateway.getGoalDecomposition(prompt);
   }
 
-  private async runEpicReview(epic: EpicRecord, tickets: TicketRecord[], runId: string): Promise<GoalReview> {
+  private async runEpicReview(epic: EpicRecord, tickets: TicketRecord[], runId: string, compact = false): Promise<GoalReview> {
     this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting epic review with ${tickets.length} tickets`, runId, epicId: epic.id, sequence: 0 });
 
     // ── 1. Collect diffs from each ticket's workspaces (local, no remote fetch) ──
@@ -670,16 +732,39 @@ export class GoalRunner {
     });
 
     // ── 4. Build the unified prompt with diffs and review packets ──
-    const basePrompt = epicReviewerDirectCliPrompt({
-      epic,
-      tickets,
-      ticketGitContext,
-      reviewPackets,
-      ragContext: ragCtx ?? undefined,
-      projectStructure,
-      targetBranch: epic.targetBranch,
-      diffBase,
-    });
+    let basePrompt: string;
+    if (compact) {
+      // Compacted prompt: strip long descriptions and RAG context to avoid stalling again
+      const compactTickets = tickets.map(t =>
+        `${t.id} (${t.title}) - ${t.status}\nAcceptance: ${t.acceptanceCriteria.join("; ")}`
+      ).join("\n");
+      basePrompt = [
+        "You are the Epic Reviewer. This is a COMPACTED retry after a previous stall.",
+        "Review ALL ticket changes quickly. Use `git diff --staged` and `git status` to inspect changes.",
+        "FIX any issues DIRECTLY. Do not over-analyze — be decisive.",
+        "Changes are staged but NOT committed.",
+        "",
+        `Epic: ${epic.title}`,
+        `Goal: ${epic.goalText}`,
+        "",
+        `Tickets (${tickets.length} total):`,
+        compactTickets,
+        "",
+        "Return exactly one FINAL_JSON block:",
+        '<FINAL_JSON>{"verdict":"approved|needs_followups|failed","summary":"brief summary","followupTickets":[]}</FINAL_JSON>',
+      ].join("\n");
+    } else {
+      basePrompt = epicReviewerDirectCliPrompt({
+        epic,
+        tickets,
+        ticketGitContext,
+        reviewPackets,
+        ragContext: ragCtx ?? undefined,
+        projectStructure,
+        targetBranch: epic.targetBranch,
+        diffBase,
+      });
+    }
 
     const MAX_RETRIES = 2;
     let lastReview: GoalReview | null = null;
@@ -767,8 +852,8 @@ export class GoalRunner {
     this.db.recordEvent({ aggregateType: event.ticketId ? "ticket" : "epic", aggregateId: event.ticketId ?? event.epicId ?? event.runId ?? "stream", runId: event.runId ?? null, ticketId: event.ticketId ?? null, kind: "agent_stream", message: `${event.agentRole}:${event.streamKind}`, payload: event as any });
   }
 
-  static createEpic(db: AppDatabase, input: { id?: string; title: string; goalText: string; targetDir: string; targetBranch?: string }): EpicRecord {
-    return db.createEpic({ id: input.id ?? randomId("epic"), title: input.title, goalText: input.goalText, targetDir: input.targetDir, targetBranch: input.targetBranch ?? null, status: "planning" });
+  static createEpic(db: AppDatabase, input: { id?: string; title: string; goalText: string; targetDir: string; targetBranch?: string; scheduledDate?: string | null }): EpicRecord {
+    return db.createEpic({ id: input.id ?? randomId("epic"), title: input.title, goalText: input.goalText, targetDir: input.targetDir, targetBranch: input.targetBranch ?? null, status: "planning", scheduledDate: input.scheduledDate ?? null, assetPaths: [] });
   }
 
   private assertNotCancelled(epicId: string): void {
@@ -789,6 +874,15 @@ export class GoalRunner {
       this.db.updateRun({ runId, status: "running", currentNode: node, heartbeatAt: nowIso(), lastMessage: message });
     }, this.heartbeatIntervalMs);
     try { return await task(); } finally { clearInterval(timer); }
+  }
+
+  private withEpicReviewTimeout<T>(task: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`Epic review timed out after ${this.epicReviewTimeoutMs}ms`));
+      }, this.epicReviewTimeoutMs);
+      task().then(resolve, reject).finally(() => clearTimeout(timer));
+    });
   }
 
   async enqueueManualReview(epicId: string): Promise<string> {
@@ -850,17 +944,45 @@ export class GoalRunner {
 
     this.db.updateRun({ runId, status: "running", currentNode: "goal_review", heartbeatAt: nowIso(), lastMessage: "Running epic review." });
 
+    const MAX_STALL_RETRIES = 3;
     try {
       const tickets = this.db.listTickets(epic.id);
-      const review = await this.withEpicHeartbeat(runId, epic.id, "goal_review", "Reviewing epic.", () =>
-        this.runEpicReview(epic, tickets, runId)
-      );
+      let review: GoalReview | null = null;
+
+      for (let stallAttempt = 0; stallAttempt < MAX_STALL_RETRIES; stallAttempt++) {
+        try {
+          review = await this.withEpicHeartbeat(runId, epic.id, "goal_review", stallAttempt === 0 ? "Reviewing epic." : `Epic review stall recovery #${stallAttempt}.`, () =>
+            this.withEpicReviewTimeout(() => this.runEpicReview(epic, tickets, runId, stallAttempt > 0))
+          );
+          break; // Success
+        } catch (err) {
+          const isTimeout = err instanceof Error && err.message.includes("timed out");
+          if (!isTimeout || stallAttempt >= MAX_STALL_RETRIES - 1) throw err;
+
+          this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Epic review stalled (attempt ${stallAttempt + 1}/${MAX_STALL_RETRIES}). Compacting prompt and retrying...`, runId, epicId: epic.id, sequence: 100 + stallAttempt });
+          console.log(`[EPIC-REVIEW] ${epic.id} stalled on attempt ${stallAttempt + 1}. Compacting and retrying.`);
+        }
+      }
+
+      if (!review) throw new Error("Epic review produced no result");
       const approved = review.verdict === "approved";
       const failForward = review.verdict === "needs_followups";
       this.db.updateEpicStatus(epic.id, (approved || failForward) ? "done" : "failed");
       const runStatus = approved ? "succeeded" : failForward ? "succeeded" : "failed";
       this.db.updateRun({ runId, status: runStatus, currentNode: "complete", heartbeatAt: nowIso(), lastMessage: review.summary, errorText: (approved || failForward) ? null : review.summary });
       this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Epic review ${approved ? "approved" : failForward ? "approved with followups" : "rejected"}: ${review.summary}`, runId, epicId: epic.id, sequence: 3, done: true });
+
+      // Auto-trigger play loop on approval
+      if (approved || failForward) {
+        try {
+          this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: "Auto-triggering Playwright e2e test loop...", runId, epicId: epic.id, sequence: 4 });
+          const tickets = this.db.listTickets(epic.id);
+          const playSuccess = await this.playLoop.runPlayLoop(epic, tickets, runId);
+          this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Play loop ${playSuccess ? "passed" : "failed"}.`, runId, epicId: epic.id, sequence: 5, done: true });
+        } catch (err) {
+          this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "stderr", content: `Play loop error: ${err instanceof Error ? err.message : String(err)}`, runId, epicId: epic.id, sequence: 5, done: true });
+        }
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       this.db.updateRun({ runId, status: "failed", currentNode: "error", heartbeatAt: nowIso(), lastMessage: msg, errorText: msg });

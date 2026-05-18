@@ -1,6 +1,7 @@
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import { AgentEvent, AgentModelInfo, AgentStreamStatus } from "../types.ts";
-import { formatTime, mergeStreamingEvents } from "../utils.ts";
+import { mergeStreamingEvents } from "../utils.ts";
+import { AgentEventCard } from "./AgentEventCard.tsx";
 
 export function AgentModal(props: {
   role: string;
@@ -18,10 +19,15 @@ export function AgentModal(props: {
   const hasMultipleAdapters = safeAdapters.length > 1;
   const currentDesc =
     safeAdapters.find((a) => a.id === (info?.currentModel ?? ""))?.description ?? "";
+  const feedEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    feedEndRef.current?.scrollIntoView({ behavior: "instant" });
+  }, [mergedItems.length]);
 
   return (
     <div className="modal-backdrop" onClick={props.onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal agent-stream-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <div className="modal-header-left">
             <span>📁</span>
@@ -70,20 +76,11 @@ export function AgentModal(props: {
         )}
         <div className="modal-stream-list">
           {mergedItems.length ? (
-            mergedItems.map((item) => (
-              <div className="modal-stream-item" key={item.id}>
-                <div className="modal-stream-meta">
-                  <span className={`pill pill-${item.payload?.streamKind || "raw"}`}>
-                    {item.payload?.streamKind || "raw"}
-                  </span>
-                  <span className="modal-stream-time">{formatTime(item.created_at)}</span>
-                </div>
-                <pre>{item.payload?.content || item.message}</pre>
-              </div>
-            ))
+            mergedItems.map((item) => <AgentEventCard key={item.id} event={item} />)
           ) : (
             <p className="modal-empty">No stream output yet.</p>
           )}
+          <div ref={feedEndRef} />
         </div>
         <div className="modal-footer">
           <button className="btn" onClick={props.onClose}>

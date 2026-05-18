@@ -34,6 +34,9 @@ const KIND_LABEL: Record<string, string> = {
   raw: "raw",
   system: "sys",
   error: "err",
+  duplicate_recovery: "recovery",
+  streaming_thinking: "think",
+  streaming_text: "text",
 };
 
 /** Detect if content looks like it contains markdown with code blocks */
@@ -188,6 +191,37 @@ function ExpandableOp({ op, index }: { op: any; index: number }) {
   );
 }
 
+/** Collapsible thinking block — collapsed by default */
+function ThinkingBlock({ content }: { content: string }) {
+  const [expanded, setExpanded] = React.useState(false);
+  const isLong = content.length > 200;
+  const preview = isLong ? content.slice(0, 200) + "..." : content;
+
+  return (
+    <div className="tev-thinking-block">
+      <button
+        className="tev-thinking-toggle"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span className="tev-thinking-toggle-icon">{expanded ? "▼" : "▶"}</span>
+        <span className="tev-thinking-toggle-label">
+          {expanded ? "Hide thinking" : `Show thinking${isLong ? ` (${content.length.toLocaleString()} chars)` : ""}`}
+        </span>
+      </button>
+      {expanded && (
+        <div className="tev-thinking-content markdown-body">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            {content}
+          </ReactMarkdown>
+        </div>
+      )}
+      {!expanded && (
+        <div className="tev-thinking-preview">{preview}</div>
+      )}
+    </div>
+  );
+}
+
 export function AgentEventCard({ event }: { event: AgentEvent }) {
   const p = event.payload;
   if (!p) return null;
@@ -202,7 +236,7 @@ export function AgentEventCard({ event }: { event: AgentEvent }) {
   const isToolResult = kind === "tool_result";
   const isToolError = kind === "tool_error";
   const isError = kind === "stderr" || kind === "tool_error" || (p.metadata?.isError as boolean);
-  const isThinking = kind === "thinking";
+  const isThinking = kind === "thinking" || kind === "streaming_thinking";
   const isSystem = kind === "system";
   const isText = kind === "assistant" || kind === "raw" || kind === "system";
 
@@ -319,6 +353,19 @@ export function AgentEventCard({ event }: { event: AgentEvent }) {
         <pre className="tev-tool-args" style={{ color: "#b00", background: "#fff5f5" }}>{p.content || "Unknown error"}</pre>
       </div>
     );
+  } else if (kind === "duplicate_recovery") {
+    mainContent = (
+      <div className="tev-tool-body">
+        <span className="tev-tool-name" style={{ color: "#c90" }}>
+          Duplicate recovery #{String(p.metadata?.recoveryCount ?? "?")}
+        </span>
+        <pre className="tev-tool-args" style={{ color: "#654", background: "#fffbea" }}>
+          {p.content || "Duplicate tool call detected and blocked. Context compacted."}
+        </pre>
+      </div>
+    );
+  } else if (isThinking) {
+    mainContent = <ThinkingBlock content={p.content || ""} />;
   } else if (isText) {
     const coderView = role === "coder" ? renderCoderPayload(p.content) : null;
     mainContent = coderView ? (

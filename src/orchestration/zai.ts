@@ -565,6 +565,13 @@ export class ZaiRunner {
       child.stderr?.setEncoding("utf8");
 
       let stdoutBuffer = "";
+      let thinkingBuffer = "";
+      const flushThinking = () => {
+        if (thinkingBuffer.length > 0) {
+          emit("thinking", thinkingBuffer);
+          thinkingBuffer = "";
+        }
+      };
       child.stdout?.on("data", (chunk: string) => {
         stdoutBuffer += chunk;
         const lines = stdoutBuffer.split(/\r?\n/u);
@@ -575,14 +582,35 @@ export class ZaiRunner {
           if (!trimmed) continue;
 
           try {
-            const event = JSON.parse(trimmed) as Record<string, unknown>;
+            let event = JSON.parse(trimmed) as Record<string, unknown>;
+
+            // Unwrap stream_event wrapper from Claude Code CLI
+            if (event.type === "stream_event" && event.event && typeof event.event === "object") {
+              event = event.event as Record<string, unknown>;
+            }
+
             const toolEvent = summarizeClaudeToolEvent(event);
             if (toolEvent) {
+              flushThinking();
               emit(toolEvent.kind, toolEvent.text);
               continue;
             }
 
             const type = typeof event.type === "string" ? event.type : "";
+            const delta = event.delta as Record<string, unknown> | undefined;
+
+            // Handle thinking deltas — buffer and flush on non-thinking events
+            if (type === "content_block_delta" && delta?.type === "thinking_delta" && typeof delta.thinking === "string") {
+              thinkingBuffer += delta.thinking;
+              if (thinkingBuffer.length >= 200) {
+                flushThinking();
+              }
+              continue;
+            }
+
+            // Any non-thinking event flushes the thinking buffer
+            flushThinking();
+
             const maybeText = extractTextFromClaudeEvent(event).join("");
             if (maybeText) {
               chunks.push(maybeText);
@@ -590,14 +618,21 @@ export class ZaiRunner {
               continue;
             }
 
+            // Skip low-level SSE events that have no meaningful text
+            if (["content_block_start", "content_block_stop", "message_start", "message_delta", "message_stop"].includes(type)) {
+              continue;
+            }
+
             emit("status", trimmed);
           } catch {
+            flushThinking();
             chunks.push(line);
             emit("assistant", line);
           }
         }
       });
       child.stderr?.on("data", (chunk: string) => {
+        flushThinking();
         const kind = /think|reason/i.test(chunk) ? "thinking" : "stderr";
         emit(kind, chunk);
       });
@@ -605,10 +640,14 @@ export class ZaiRunner {
         reject(new ZaiLaunchError("spawn_error", `Z AI Claude spawn failed: ${(error as Error).message}`, launch.info, { cause: error }))
       );
       child.on("close", (code) => {
+        flushThinking();
         const trailing = stdoutBuffer.trim();
         if (trailing) {
           try {
-            const event = JSON.parse(trailing) as Record<string, unknown>;
+            let event = JSON.parse(trailing) as Record<string, unknown>;
+            if (event.type === "stream_event" && event.event && typeof event.event === "object") {
+              event = event.event as Record<string, unknown>;
+            }
             const toolEvent = summarizeClaudeToolEvent(event);
             if (toolEvent) {
               emit(toolEvent.kind, toolEvent.text);

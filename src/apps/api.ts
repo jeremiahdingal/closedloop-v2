@@ -1,7 +1,7 @@
 ﻿import { GoalRunner } from "../orchestration/goal-runner.ts";
 import { createGateway } from "../orchestration/models.ts";
 import http from "node:http";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { bootstrap } from "./bootstrap.ts";
@@ -548,8 +548,10 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "zai:glm-4.7", label: "Z AI (glm-4.7)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:qwen3.5:9b", label: "Mediated (qwen3.5:9b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:vladimirgav/qwen3.6-27b-16gb-vram-uncensored", label: "Mediated (Qwen3.6-27B Uncensored)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:batiai/qwen3.6-27b:iq3", label: "Mediated (BatiAI Qwen3.6-27B iq3)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:isotnek/qwen3.6-27b-batiai-iq3", label: "Mediated (Isotnek Qwen3.6-27B iq3)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:ibm/granite4.1:30b-q3_K_M", label: "Mediated (Granite 4.1 30B)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:26b", label: "Mediated (gemma4:26b)", description: "Local tool execution via Ollama + harness" },
@@ -596,6 +598,11 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "qwen3:4b", label: "Ollama (qwen3:4b)", description: "Direct Ollama call - no workspace tools" }
   ],
   playWriter: [
+    { id: "zai:glm-5.1", label: "Z.ai (Claude / GLM-5.1)", description: "Claude via Z.ai Anthropic API" },
+    { id: "zai:claude-sonnet-4-6", label: "Z.ai (Claude Sonnet 4.6)", description: "Claude Sonnet 4.6 via Z.ai" },
+    { id: "zai:claude-opus-4-7", label: "Z.ai (Claude Opus 4.7)", description: "Claude Opus 4.7 via Z.ai" },
+    { id: "mediated:qwen3.5:9b", label: "Mediated (qwen3.5:9b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
     { id: "gemini-cli", label: "Gemini CLI", description: "Workspace-aware local Gemini CLI execution" },
     { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" }
@@ -672,6 +679,49 @@ async function readBody(req: http.IncomingMessage): Promise<any> {
   for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
   if (!chunks.length) return {};
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+async function readMultipartBody(req: http.IncomingMessage): Promise<{ fields: Record<string, string>; files: Array<{ name: string; filename: string; data: Buffer; contentType: string }> }> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+  const body = Buffer.concat(chunks);
+  const contentType = req.headers["content-type"] || "";
+  const boundaryMatch = contentType.match(/boundary=(.+?)(?:;|$)/);
+  if (!boundaryMatch) return { fields: {}, files: [] };
+  const boundary = boundaryMatch[1].trim();
+  const delim = Buffer.from(`--${boundary}`);
+  const parts: Array<{ name: string; filename: string; data: Buffer; contentType: string }> = [];
+  const fields: Record<string, string> = {};
+  let pos = body.indexOf(delim);
+  if (pos === -1) return { fields, files: parts };
+  pos += delim.length;
+
+  while (pos < body.length) {
+    if (body[pos] === 0x2d && body[pos + 1] === 0x2d) break; // --end
+    if (body[pos] === 0x0d) pos += 2; // \r\n
+    const nextDelim = body.indexOf(delim, pos);
+    if (nextDelim === -1) break;
+    const partData = body.subarray(pos, nextDelim - 2); // -2 for \r\n before delim
+    pos = nextDelim + delim.length;
+
+    // Parse headers
+    const headerEnd = partData.indexOf(Buffer.from("\r\n\r\n"));
+    if (headerEnd === -1) continue;
+    const headers = partData.subarray(0, headerEnd).toString("utf8");
+    const content = partData.subarray(headerEnd + 4);
+
+    const nameMatch = headers.match(/name="([^"]+)"/);
+    const filenameMatch = headers.match(/filename="([^"]+)"/);
+    const ctMatch = headers.match(/Content-Type:\s*(.+)/i);
+    const name = nameMatch ? nameMatch[1] : "";
+
+    if (filenameMatch) {
+      parts.push({ name, filename: filenameMatch[1], data: Buffer.from(content), contentType: ctMatch ? ctMatch[1].trim() : "application/octet-stream" });
+    } else {
+      fields[name] = content.toString("utf8");
+    }
+  }
+  return { fields, files: parts };
 }
 
 function setCors(res: http.ServerResponse): void {
@@ -769,15 +819,63 @@ async function main() {
         return;
       }
       if (url.pathname === "/api/epics" && req.method === "POST") {
-        const body = await readBody(req);
-        const epic = GoalRunner.createEpic(db, {
-          title: String(body.title || "Untitled epic"),
-          goalText: String(body.goalText || ""),
-          targetDir: String(body.targetDir || process.cwd()),
-          targetBranch: body.targetBranch ? String(body.targetBranch) : undefined
-        });
-        const runId = await goalRunner.enqueueGoal(epic.id);
+        const contentType = req.headers["content-type"] || "";
+        let title: string, goalText: string, targetDir: string, targetBranch: string | undefined;
+        let scheduledDate: string | null = null;
+        let uploadedFiles: Array<{ filename: string; data: Buffer; contentType: string }> = [];
+
+        if (contentType.startsWith("multipart/form-data")) {
+          const { fields, files } = await readMultipartBody(req);
+          title = String(fields.title || "Untitled epic");
+          goalText = String(fields.goalText || "");
+          targetDir = String(fields.targetDir || process.cwd());
+          targetBranch = fields.targetBranch || undefined;
+          scheduledDate = fields.scheduledDate || null;
+          uploadedFiles = files;
+        } else {
+          const body = await readBody(req);
+          title = String(body.title || "Untitled epic");
+          goalText = String(body.goalText || "");
+          targetDir = String(body.targetDir || process.cwd());
+          targetBranch = body.targetBranch ? String(body.targetBranch) : undefined;
+          scheduledDate = body.scheduledDate || null;
+        }
+
+        const epic = GoalRunner.createEpic(db, { title, goalText, targetDir, targetBranch, scheduledDate });
+
+        // Handle image uploads
+        if (uploadedFiles.length > 0) {
+          const assetsDir = path.join(config.dataDir, "epic_assets", epic.id);
+          await mkdir(assetsDir, { recursive: true });
+          const assetPaths = [...epic.assetPaths];
+          for (const file of uploadedFiles) {
+            const safeName = path.basename(file.filename).replace(/[^a-zA-Z0-9._-]/g, "_");
+            await writeFile(path.join(assetsDir, safeName), file.data);
+            assetPaths.push(`epic_assets/${epic.id}/${safeName}`);
+          }
+          db.updateEpicAssets(epic.id, assetPaths);
+        }
+
+        // Don't start scheduled epics whose date hasn't arrived
+        const today = new Date().toISOString().slice(0, 10);
+        let runId: string | null = null;
+        if (!scheduledDate || today >= scheduledDate) {
+          runId = await goalRunner.enqueueGoal(epic.id);
+        }
         return json(res, 201, { epic, runId });
+      }
+      const epicAssetMatch = /^\/api\/epic-assets\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+      if (epicAssetMatch && req.method === "GET") {
+        const epicId = decodeURIComponent(epicAssetMatch[1]);
+        const filename = path.basename(decodeURIComponent(epicAssetMatch[2]));
+        const filePath = path.join(config.dataDir, "epic_assets", epicId, filename);
+        if (!existsSync(filePath)) return json(res, 404, { error: "not_found" });
+        const data = await readFile(filePath);
+        const ext = path.extname(filename).toLowerCase();
+        const mimeMap: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
+        res.writeHead(200, { "content-type": mimeMap[ext] || "application/octet-stream", "cache-control": "public, max-age=86400" });
+        res.end(data);
+        return;
       }
       const cancelEpicMatch = /^\/api\/epics\/([^/]+)\/cancel$/.exec(url.pathname);
       if (cancelEpicMatch && req.method === "POST") {
@@ -990,11 +1088,11 @@ async function main() {
         }
 
         const timestamp = new Date().toISOString();
-        const reason = "Force rerun requested by user (in place).";
+        const reason = "Force rerun in place: hot-resetting coder.";
         db.updateRun({
           runId: run.id,
           status: "queued",
-          currentNode: "recovery",
+          currentNode: "coder",
           heartbeatAt: timestamp,
           lastMessage: reason,
           errorText: null,
@@ -1002,13 +1100,13 @@ async function main() {
         });
         db.updateTicketRunState({
           ticketId: ticket.id,
-          status: "queued",
+          status: "building",
           currentRunId: run.id,
-          currentNode: "recovery",
+          currentNode: "coder",
           lastHeartbeatAt: timestamp,
           lastMessage: reason
         });
-        db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id, recovery: true });
+        db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id, forceCoderReset: true });
         db.recordEvent({
           aggregateType: "ticket",
           aggregateId: ticket.id,

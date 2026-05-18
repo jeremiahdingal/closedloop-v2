@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
+import Calendar from "react-calendar";
+import "react-calendar/dist/Calendar.css";
 import "./styles.css";
 
 import {
@@ -45,6 +47,10 @@ export function App() {
   const [targetDirEditing, setTargetDirEditing] = useState(false);
   const [targetBranch, setTargetBranch] = useState("");
   const [epicMode, setEpicMode] = useState<"build" | "plan">("build");
+  const [isScheduled, setIsScheduled] = useState(false);
+  const [scheduledDate, setScheduledDate] = useState("");
+  const [epicImages, setEpicImages] = useState<File[]>([]);
+  const [schedulerDate, setSchedulerDate] = useState<string>("");
   const [planSessionId, setPlanSessionId] = useState<string | null>(null);
   const [planMinimized, setPlanMinimized] = useState(false);
   const [planReady, setPlanReady] = useState(false);
@@ -68,6 +74,7 @@ export function App() {
   const [selectedTicketEvents, setSelectedTicketEvents] = useState<AgentEvent[]>([]);
   const selectedTicketRef = useRef<Ticket | null>(null);
   const latestAgentEventIdRef = useRef(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   async function refreshModels() {
     try {
@@ -131,7 +138,7 @@ export function App() {
   }, [autoRefresh]);
 
   const [lastEventTime, setLastEventTime] = useState<Map<string, number>>(new Map());
-  const [collapsedPanels, setCollapsedPanels] = useState<Set<string>>(new Set());
+  const [collapsedPanels, setCollapsedPanels] = useState<Set<string>>(new Set(["scheduler"]));
   const [nowTick, setNowTick] = useState<number>(Date.now());
 
   useEffect(() => {
@@ -163,6 +170,15 @@ export function App() {
     selectedTicketRef.current = selectedTicket;
   }, [selectedTicket]);
 
+  // Keep selectedTicket synced with latest ticket data (e.g., new currentRunId after retry)
+  useEffect(() => {
+    if (!selectedTicket) return;
+    const fresh = data.tickets.find(t => t.id === selectedTicket.id);
+    if (fresh && (fresh.status !== selectedTicket.status || fresh.currentRunId !== selectedTicket.currentRunId)) {
+      setSelectedTicket(fresh);
+    }
+  }, [data.tickets]);
+
   useEffect(() => {
     latestAgentEventIdRef.current = data.agentEvents.at(-1)?.id ?? 0;
   }, [data.agentEvents]);
@@ -186,9 +202,7 @@ export function App() {
       setSelectedTicketEvents((current) => {
         const selected = selectedTicketRef.current;
         if (!selected) return current;
-        const matchesTicket = row.ticket_id === selected.id;
-        const matchesRun = Boolean(selected.currentRunId) && row.run_id === selected.currentRunId;
-        if (!matchesTicket && !matchesRun) return current;
+        if (row.ticket_id !== selected.id) return current;
         const next = [...current, row];
         const deduped = Array.from(new Map(next.map((item) => [item.id, item])).values());
         return deduped.slice(-3000);
@@ -207,7 +221,6 @@ export function App() {
 
     let cancelled = false;
     const params = new URLSearchParams({ ticketId: selectedTicket.id, limit: "3000" });
-    if (selectedTicket.currentRunId) params.set("runId", selectedTicket.currentRunId);
 
     void fetchJson<AgentEvent[]>(`/api/agent-events?${params.toString()}`)
       .then((events) => {
@@ -331,6 +344,25 @@ export function App() {
     return grouped;
   }, [dedupedTickets]);
 
+  function localDate(d: Date) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+
+  const scheduledEpics = useMemo(
+    () => data.epics.filter((e) => e.scheduledDate).sort((a, b) => a.scheduledDate!.localeCompare(b.scheduledDate!)),
+    [data.epics],
+  );
+
+  const displayEpics = useMemo(() => {
+    if (!schedulerDate) return data.epics;
+    return data.epics.filter((e) => e.scheduledDate === schedulerDate);
+  }, [data.epics, schedulerDate]);
+
+  const displayScheduledEpics = useMemo(() => {
+    if (schedulerDate) return scheduledEpics.filter((e) => e.scheduledDate === schedulerDate);
+    return scheduledEpics;
+  }, [scheduledEpics, schedulerDate]);
+
   const activeCount = dedupedTickets.filter(
     (t) => t.status === "building" || t.status === "reviewing" || t.status === "testing"
   ).length;
@@ -359,15 +391,30 @@ export function App() {
     }
     try {
       setSubmitting(true);
-      await fetchJson("/api/epics", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title, goalText, targetDir, targetBranch: targetBranch || undefined }),
-      });
+      if (epicImages.length > 0 || isScheduled) {
+        const form = new FormData();
+        form.append("title", title);
+        form.append("goalText", goalText);
+        form.append("targetDir", targetDir);
+        if (targetBranch) form.append("targetBranch", targetBranch);
+        if (isScheduled && scheduledDate) form.append("scheduledDate", scheduledDate);
+        for (const f of epicImages) form.append("images", f);
+        await fetchJson("/api/epics", { method: "POST", body: form });
+      } else {
+        await fetchJson("/api/epics", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ title, goalText, targetDir, targetBranch: targetBranch || undefined }),
+        });
+      }
       await refresh();
       setTitle("");
       setGoalText("");
       setTargetBranch("");
+      setIsScheduled(false);
+      setScheduledDate("");
+      setEpicImages([]);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -891,8 +938,9 @@ export function App() {
             <div className="win-titlebar">
               <div className="win-titlebar-text">
                 <span>📁</span>
-                <span>Epics ({data.epics.length})</span>
+                <span>Epics ({displayEpics.length})</span>
                 {selectedEpic && <span className="filter-badge">🔍 {truncateId(selectedEpic)}</span>}
+                {schedulerDate && <span className="filter-badge">📅 {schedulerDate}</span>}
               </div>
               <div className="win-titlebar-buttons">
                 <div className="win-btn-box" onClick={() => togglePanel("epics")}>
@@ -905,7 +953,7 @@ export function App() {
               className={`win-content win-inset ${collapsedPanels.has("epics") ? "collapsed" : ""}`}
             >
               <div className="pagination-bar">
-                <button 
+                <button
                   className="mini-btn" 
                   disabled={epicPage === 0} 
                   onClick={() => setEpicPage(p => p - 1)}
@@ -924,8 +972,8 @@ export function App() {
                 </button>
               </div>
               <div className="epic-list">
-                {data.epics.length ? (
-                  data.epics.map((epic) => (
+                {displayEpics.length ? (
+                  displayEpics.map((epic) => (
                     <div
                       key={epic.id}
                       className={`epic-item ${selectedEpic === epic.id ? "selected" : epic.status}`}
@@ -1129,6 +1177,64 @@ export function App() {
             </div>
           </div>
 
+          {/* Scheduler */}
+          <div className="win-panel">
+            <div className="win-titlebar win-titlebar-blue">
+              <div className="win-titlebar-text">
+                <span>📅</span>
+                <span>Scheduler</span>
+                {scheduledEpics.length > 0 && <span className="win-titlebar-count">{scheduledEpics.length}</span>}
+              </div>
+              <div className="win-titlebar-buttons">
+                <div className="win-btn-box" onClick={() => togglePanel("scheduler")}>_</div>
+                <div className="win-btn-box">×</div>
+              </div>
+            </div>
+            <div className={`win-content ${collapsedPanels.has("scheduler") ? "collapsed" : ""}`}>
+              <div className="scheduler-content">
+                <Calendar
+                  calendarType="gregory"
+                  value={schedulerDate ? new Date(schedulerDate + "T00:00:00") : null}
+                  onClickDay={(date) => {
+                    const iso = localDate(date);
+                    setSchedulerDate(schedulerDate === iso ? "" : iso);
+                  }}
+                  tileContent={({ date, view }) => {
+                    if (view !== "month") return null;
+                    const iso = localDate(date);
+                    const dayEpics = scheduledEpics.filter(e => e.scheduledDate === iso);
+                    if (dayEpics.length === 0) return null;
+                    return (
+                      <div className="scheduler-tile-dots">
+                        {dayEpics.slice(0, 3).map((_, i) => (
+                          <span key={i} className="scheduler-tile-dot" />
+                        ))}
+                      </div>
+                    );
+                  }}
+                />
+                <div className="scheduler-events-label">Events</div>
+                <div className="scheduler-events">
+                  {displayScheduledEpics.length === 0 ? (
+                    <div className="scheduler-empty">No scheduled epics</div>
+                  ) : (
+                    displayScheduledEpics.map((epic) => (
+                      <div
+                        key={epic.id}
+                        className="scheduler-event"
+                        onClick={() => setSelectedEpic(epic.id)}
+                      >
+                        <span className="scheduler-event-date">{epic.scheduledDate}</span>
+                        <span className="scheduler-event-title">{epic.title}</span>
+                        <span className={`pill pill-${epic.status}`}>{epic.status}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
           {/* Live Preview */}
           <div className="win-panel">
             <div className="win-titlebar">
@@ -1242,6 +1348,45 @@ export function App() {
                     {targetDirEditing ? "💾" : "✏️"}
                   </button>
                 </div>
+                <div className="target-dir-row">
+                  <label className="scheduler-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={isScheduled}
+                      onChange={(e) => setIsScheduled(e.target.checked)}
+                    />
+                    <span>Scheduled</span>
+                  </label>
+                  {isScheduled && (
+                    <input
+                      type="date"
+                      className="date-input"
+                      value={scheduledDate}
+                      min={new Date().toISOString().slice(0, 10)}
+                      onChange={(e) => setScheduledDate(e.target.value)}
+                    />
+                  )}
+                </div>
+                <div className="target-dir-row">
+                  <label className="target-dir-label">Images:</label>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    style={{ display: "none" }}
+                    onChange={(e) => setEpicImages(Array.from(e.target.files ?? []))}
+                  />
+                  <button
+                    className="btn target-dir-btn"
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    📎
+                  </button>
+                  {epicImages.length > 0 && (
+                    <span className="file-count">{epicImages.length} file(s)</span>
+                  )}
+                </div>
                 <button
                   className="btn btn-primary"
                   onClick={() => void createEpic()}
@@ -1259,9 +1404,9 @@ export function App() {
             <div className="win-titlebar">
               <div className="win-titlebar-text">
                 <span>📁</span>
-                <span>Epics ({data.epics.length})</span>
+                <span>Epics ({displayEpics.length})</span>
                 {selectedEpic && <span className="filter-badge">🔍 {truncateId(selectedEpic)}</span>}
-              </div>
+                {schedulerDate && <span className="filter-badge">📅 {schedulerDate}</span>}              </div>
               <div className="win-titlebar-buttons">
                 <div className="win-btn-box" onClick={() => togglePanel("epicsDesktop")}>
                   _
@@ -1294,8 +1439,8 @@ export function App() {
                 </button>
               </div>
               <div className="epic-list">
-                {data.epics.length ? (
-                  data.epics.map((epic) => (
+                {displayEpics.length ? (
+                  displayEpics.map((epic) => (
                     <div
                       key={epic.id}
                       className={`epic-item ${selectedEpic === epic.id ? "selected" : epic.status}`}

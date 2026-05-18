@@ -31,6 +31,7 @@ async function main() {
     // If nothing to run, aggressively ensure queued tickets have jobs
     if (jobs.length === 0 && capacity > 0) {
       await ensureQueuedTicketsHaveJobs(db, recovery);
+      await startDueScheduledEpics(db, recovery);
       // Re-check after ensuring
       jobs = db.nextQueuedJobs(capacity);
     }
@@ -51,6 +52,12 @@ async function ensureQueuedTicketsHaveJobs(db: any, recovery: any): Promise<void
     if (!ticket.epicId) continue;
     const epic = db.getEpic(ticket.epicId);
     if (!epic || epic.status === "cancelled") continue;
+
+    // Gate: don't start tickets if the epic is scheduled for a future date
+    if (epic.scheduledDate) {
+      const today = new Date().toISOString().slice(0, 10);
+      if (today < epic.scheduledDate) continue;
+    }
 
     // Check dependencies
     const supersededIds = new Set(
@@ -131,6 +138,24 @@ async function ensureQueuedTicketsHaveJobs(db: any, recovery: any): Promise<void
       kind: "worker_auto_start",
       message: "Worker auto-started queued ticket with fresh run."
     });
+  }
+}
+
+async function startDueScheduledEpics(db: any, recovery: any): Promise<void> {
+  const today = new Date().toISOString().slice(0, 10);
+  const epics = db.listEpics();
+  const goalRunner = recovery.goalRunner;
+  if (!goalRunner) return;
+  for (const epic of epics) {
+    if (epic.status !== "planning") continue;
+    if (!epic.scheduledDate) continue;
+    if (today < epic.scheduledDate) continue;
+    console.log(`[WORKER] Starting scheduled epic ${epic.id} (due ${epic.scheduledDate})`);
+    try {
+      await goalRunner.enqueueGoal(epic.id);
+    } catch (err) {
+      console.warn(`[WORKER] Failed to start scheduled epic ${epic.id}:`, (err as Error).message);
+    }
   }
 }
 

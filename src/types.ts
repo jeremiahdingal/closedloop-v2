@@ -30,6 +30,8 @@ export type EpicRecord = {
   targetDir: string;
   targetBranch: string | null;
   status: EpicStatus;
+  scheduledDate: string | null;
+  assetPaths: string[];
   createdAt: string;
   updatedAt: string;
 };
@@ -212,7 +214,7 @@ export type WriteFileInput = {
 export type AgentStreamPayload = {
   agentRole: AgentRole;
   source: "opencode" | "orchestrator" | "mediated-harness" | "zai";
-  streamKind: "stdout" | "stderr" | "thinking" | "assistant" | "system" | "status" | "raw" | "tool_call" | "tool_result" | "tool_error" | "error" | "plan_cleared" | "streaming_text" | "streaming_thinking";
+  streamKind: "stdout" | "stderr" | "thinking" | "assistant" | "system" | "status" | "raw" | "tool_call" | "tool_result" | "tool_error" | "error" | "plan_cleared" | "streaming_text" | "streaming_thinking" | "duplicate_recovery";
   content: string;
   runId?: string | null;
   ticketId?: string | null;

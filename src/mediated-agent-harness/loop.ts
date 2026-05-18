@@ -13,9 +13,18 @@ import type {
 import { StagnationError, ModelConnectionError, LoopTimeoutError } from "./errors.ts";
 import { StreamParser } from "./stream-parser.ts";
 import { WORKSPACE_TOOLS, BROWSER_TOOLS, executeToolCall, getAvailableToolsList, resetExploreModeFiles } from "./tools.ts";
-import { CallHistory, validateAndRepair } from "./validator.ts";
+import { CallHistory, validateAndRepair, stableStringify } from "./validator.ts";
 import { computeBudget, shouldCompact, summarizeMessages, estimateMessagesTokens } from "./context-budget.ts";
 import { classifyStall, computeStallLevel, getRecoveryAction, createStallState, recordStall, resetStallCounters, type StallState, type StallKind } from "./stall-recovery.ts";
+import {
+  createDuplicateRecoveryState,
+  checkDuplicateCall,
+  isCallBanned,
+  performDuplicateRecovery,
+  recordPostRecoveryProgress,
+  shouldForceFinishAfterRecovery,
+} from "./duplicate-detector.ts";
+import type { DuplicateRecoveryState } from "./types.ts";
 
 const KNOWN_TOOL_NAMES = new Set([
   "explore_mode",
@@ -39,9 +48,9 @@ export function resolveModelContextWindow(model: string): number {
   let result = 65536;
   if (model.startsWith("glm-4.7-flash")) result = 65536;
   else if (model.startsWith("qwen3.5:9b")) result = 65536;
+  else if (model.startsWith("qwen3.5:4b")) result = 65536;
   else if (model.startsWith("qwen3.5:27b")) result = 65536;
-  else if (model.startsWith("vladimirgav/qwen3.6-27b")) result = 65536;
-  else if (model.startsWith("batiai/qwen3.6-27b")) result = 16384;
+  else if (model.includes("qwen3.6-27b")) result = 6144;
   else if (model.startsWith("ibm/granite4.1:30b-q3")) result = 8192;
   else if (model.startsWith("ibm/granite4.1")) result = 32768;
   else if (model.startsWith("qwen3:14b")) result = 65536;
@@ -100,6 +109,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
   const startTime = Date.now();
   let lastActivityTime = startTime;
   let stallState = createStallState();
+  let dupRecoveryState = createDuplicateRecoveryState();
 
   emit({ kind: "text", text: `--- SYSTEM PROMPT ---\n${systemPrompt}\n\n--- USER PROMPT ---\n${userPrompt}\n-------------------` });
 
@@ -212,6 +222,12 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         if (result.removedTokens > 0) {
           messages.length = 0;
           messages.push(...result.messages);
+          // Force the model to continue after compaction — without this it stalls
+          // on the COMPACTED HISTORY blob and produces empty responses.
+          messages.push({
+            role: "user",
+            content: "[SYSTEM] Context was compacted to free space. Continue working on your task. Pick up where you left off. Call a tool now."
+          });
           stallState = {
             ...stallState,
             compaction: {
@@ -441,13 +457,14 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     // Process tool calls
     const assistantToolCalls: OpenAIToolCall[] = [];
     const toolResults: ChatMessage[] = [];
+    let recoveryTriggered = false;
 
     for (const completeCall of state.toolCalls) {
       // Role-based tool access control
       if (!allowedToolSet.has(completeCall.name)) {
         const errorMsg = `Unauthorized tool: ${completeCall.name}. Your role (${config.role}) is only allowed to use: ${availableToolNames.join(", ")}`;
         emit({ kind: "tool_error", call: { id: completeCall.id, name: completeCall.name, args: {} }, error: errorMsg });
-        
+
         assistantToolCalls.push({
           id: completeCall.id,
           type: "function",
@@ -480,6 +497,47 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
           throw validated;
         }
 
+        // ToolValidationError — check for duplicate failed validation before feeding back
+        let rawArgs: Record<string, unknown> = {};
+        try { rawArgs = JSON.parse(completeCall.arguments); } catch {}
+        const rawHash = stableStringify(rawArgs);
+
+        if (isCallBanned(completeCall.name, rawArgs, dupRecoveryState)) {
+          const bannedMsg = `This exact call (${completeCall.name}) is BANNED because it previously failed validation with the same arguments. Fix the parameters.`;
+          emit({ kind: "tool_error", call: { id: completeCall.id, name: completeCall.name, args: {} }, error: bannedMsg });
+          history.record(completeCall.name, rawArgs, true, bannedMsg);
+          assistantToolCalls.push({
+            id: completeCall.id, type: "function",
+            function: { name: completeCall.name, arguments: completeCall.arguments },
+          });
+          toolResults.push({ role: "tool", content: `Error: ${bannedMsg}`, tool_call_id: completeCall.id });
+          continue;
+        }
+
+        const dupCheck = checkDuplicateCall(completeCall.name, rawArgs, history, dupRecoveryState);
+        if (dupCheck.isDuplicate && dupCheck.bannedSignature && dupRecoveryState.recoveryCount < 2) {
+          console.log(`  [DUPLICATE-RECOVERY] ${completeCall.name} repeated validation error — compacting and restarting`);
+          emit({
+            kind: "duplicate_recovery",
+            bannedCall: `${completeCall.name}(${completeCall.arguments.slice(0, 80)})`,
+            recoveryCount: dupRecoveryState.recoveryCount + 1,
+          });
+          const recoveryPrompt = await performDuplicateRecovery(
+            messages, systemPrompt, dupCheck.bannedSignature, numCtx, baseURL,
+          );
+          dupRecoveryState = {
+            bannedSignatures: [...dupRecoveryState.bannedSignatures, dupCheck.bannedSignature],
+            recoveryCount: dupRecoveryState.recoveryCount + 1,
+            postRecoveryCallCount: 0, isInRecovery: true, hasMadeProgress: false,
+          };
+          messages.length = 0;
+          messages.push({ role: "system", content: systemPrompt }, { role: "user", content: recoveryPrompt });
+          stallState = createStallState();
+          emit({ kind: "text", text: `[duplicate-recovery] Restart #${dupRecoveryState.recoveryCount}: validation-error loop, banned ${completeCall.name}` });
+          recoveryTriggered = true;
+          break;
+        }
+
         // ToolValidationError — feed error back to model
         const toolCall: ToolCall = {
           id: completeCall.id,
@@ -487,7 +545,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
           args: {},
         };
         emit({ kind: "tool_error", call: toolCall, error: validated.message });
-        history.record(completeCall.name, {}, true);
+        history.record(completeCall.name, rawArgs, true, validated.message);
 
         console.log(`  [ERROR] ${completeCall.name}: ${validated.message}`);
 
@@ -555,6 +613,62 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         };
       }
 
+      // ── Duplicate recovery: check for banned or duplicate failed calls ──
+      if (isCallBanned(validated.name, validated.args, dupRecoveryState)) {
+        const bannedMsg = `This exact call (${validated.name} with these arguments) is BANNED because it previously failed with the same arguments. You must use different arguments or a completely different approach. Do NOT repeat this call.`;
+        emit({ kind: "tool_error", call: toolCall, error: bannedMsg });
+        history.record(validated.name, validated.args, true, bannedMsg);
+
+        assistantToolCalls.push({
+          id: completeCall.id,
+          type: "function",
+          function: { name: validated.name, arguments: JSON.stringify(validated.args) },
+        });
+        toolResults.push({
+          role: "tool",
+          content: `Error: ${bannedMsg}`,
+          tool_call_id: completeCall.id,
+        });
+        continue;
+      }
+
+      const dupCheck = checkDuplicateCall(validated.name, validated.args, history, dupRecoveryState);
+      if (dupCheck.isDuplicate && dupCheck.bannedSignature && dupRecoveryState.recoveryCount < 2) {
+        console.log(`  [DUPLICATE-RECOVERY] ${validated.name} repeated after error — compacting and restarting (recovery #${dupRecoveryState.recoveryCount + 1})`);
+        emit({
+          kind: "duplicate_recovery",
+          bannedCall: `${validated.name}(${JSON.stringify(validated.args).slice(0, 80)})`,
+          recoveryCount: dupRecoveryState.recoveryCount + 1,
+        });
+
+        const recoveryPrompt = await performDuplicateRecovery(
+          messages, systemPrompt, dupCheck.bannedSignature, numCtx, baseURL,
+        );
+
+        dupRecoveryState = {
+          bannedSignatures: [...dupRecoveryState.bannedSignatures, dupCheck.bannedSignature],
+          recoveryCount: dupRecoveryState.recoveryCount + 1,
+          postRecoveryCallCount: 0,
+          isInRecovery: true,
+          hasMadeProgress: false,
+        };
+
+        // Clear messages and inject recovery context
+        messages.length = 0;
+        messages.push(
+          { role: "system", content: systemPrompt },
+          { role: "user", content: recoveryPrompt },
+        );
+
+        // Reset stall state since we have a fresh context
+        stallState = createStallState();
+
+        emit({ kind: "text", text: `[duplicate-recovery] Restart #${dupRecoveryState.recoveryCount}: compacted context, banned ${validated.name}` });
+
+        recoveryTriggered = true;
+        break;
+      }
+
       // Execute tool
       emit({ kind: "tool_call", call: toolCall });
       collectedToolCalls.push(toolCall);
@@ -562,11 +676,27 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       console.log(`  [TOOL] ${validated.name}(${JSON.stringify(validated.args).slice(0, 100)})`);
 
       const result = await executeToolCall(toolCall, ctx);
-      history.record(validated.name, validated.args, result.isError ?? false);
+      const resultError = result.isError ? result.output.slice(0, 200) : undefined;
+      history.record(validated.name, validated.args, result.isError ?? false, resultError);
 
       // Reset stall counters on successful tool execution
       if (!result.isError) {
         stallState = resetStallCounters(stallState);
+      }
+
+      // Post-recovery progress tracking
+      if (dupRecoveryState.isInRecovery) {
+        dupRecoveryState = recordPostRecoveryProgress(dupRecoveryState, result.isError ?? false);
+        if (!result.isError) {
+          dupRecoveryState = { ...dupRecoveryState, hasMadeProgress: true };
+        }
+        if (shouldForceFinishAfterRecovery(dupRecoveryState)) {
+          messages.push({
+            role: "user",
+            content: "[SYSTEM] No progress after recovery. You MUST call the finish tool NOW with whatever you have.",
+          });
+          emit({ kind: "text", text: `[duplicate-recovery] No progress after 3 calls post-recovery, forcing finish...` });
+        }
       }
 
       emit({ kind: "tool_result", result });
@@ -587,6 +717,11 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         content: result.output,
         tool_call_id: completeCall.id,
       });
+    }
+
+    // If recovery was triggered, skip appending and continue to next iteration
+    if (recoveryTriggered) {
+      continue;
     }
 
     // Append assistant message with tool calls
@@ -1024,7 +1159,7 @@ async function fetchOllama(
       } : {}),
       stream: true,
       think: noThink ? false : undefined,
-      options: { temperature, top_p: topP, top_k: topK, num_ctx: numCtx },
+      options: { temperature, top_p: topP, top_k: topK, num_ctx: numCtx, num_gpu: -1 },
     }),
   });
 }

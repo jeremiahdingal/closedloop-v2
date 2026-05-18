@@ -1,22 +1,15 @@
-import { writeFile, mkdir, symlink, stat, readdir } from "node:fs/promises";
-import { dirname } from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
+import { readdir } from "node:fs/promises";
 import { AppDatabase } from "../db/database.ts";
-import { randomId, nowIso } from "../utils.ts";
-import { epicDecoderPrompt, epicDecoderToolingPrompt, epicReviewerPrompt, epicReviewerToolingPrompt, epicReviewerCodexPrompt, epicReviewerBuildFixPrompt, playWriterPrompt, playTesterPrompt } from "./prompts.ts";
+import { nowIso } from "../utils.ts";
+import { playWriterPrompt, playWriterFixPrompt, playTesterPrompt } from "./prompts.ts";
 import type { ModelGateway } from "./models.ts";
-import type { AgentStreamPayload, EpicRecord, GoalDecomposition, GoalReview, GoalTicketPlan, TicketRecord } from "../types.ts";
+import type { AgentStreamPayload, EpicRecord, GoalDecomposition, GoalReview, TicketRecord } from "../types.ts";
 import { TicketRunner } from "./ticket-runner.ts";
 import { loadConfig } from "../config.ts";
-import { loadLangGraphRuntime, type LangGraphRuntime } from "./langgraph-loader.ts";
-import { formatOpenCodeFailure } from "./opencode.ts";
-import { formatCodexFailure } from "./codex.ts";
-import { formatQwenFailure } from "./qwen.ts";
 import { LifecycleService } from "./lifecycle.ts";
 import { WorkspaceBridge } from "../bridge/workspace-bridge.ts";
 import { buildContextForQuery } from "../rag/context-builder.ts";
 import { git } from "../bridge/git.ts";
-import { ensureProjectStructureFile } from "./project-structure.ts";
 
 type PlayWriterResult = {
   testsCreated: string[];
@@ -36,6 +29,11 @@ type PlayTesterResult = {
   status: "passed" | "failed";
   summary: { total: number; passed: number; failed: number };
   results: PlayTesterTestResult[];
+};
+
+type PlayWriterFixResult = {
+  fixesApplied: string[];
+  summary: string;
 };
 
 export type { PlayWriterResult, PlayTesterTestResult, PlayTesterResult };
@@ -77,50 +75,26 @@ export class PlayLoopService {
   }
 
   private recordAgentStream(e: AgentStreamPayload): void {
-    // This would need to be implemented to match GoalRunner's method
-    // For now, we'll use console.log for debugging
     if (e.streamKind === "stderr" || e.streamKind === "status") {
       console.error(`[${e.agentRole}] ${e.content}`);
     }
-  }
-
-  private async startDevServer(
-    cwd: string,
-    command: string,
-    readyMs: number
-  ): Promise<ChildProcess> {
-    const [cmd, ...args] = command.split(" ");
-    const proc = spawn(cmd, args, {
-      cwd,
-      stdio: "ignore",
-      detached: false,
-      shell: process.platform === "win32"
+    this.db.recordEvent({
+      aggregateType: e.ticketId ? "ticket" : "epic",
+      aggregateId: e.ticketId ?? e.epicId ?? e.runId ?? "stream",
+      runId: e.runId ?? null,
+      ticketId: e.ticketId ?? null,
+      kind: "agent_stream",
+      message: `${e.agentRole}:${e.streamKind}`,
+      payload: e as any
     });
-    proc.on("error", (err) => {
-      console.warn(`[PlayTester] Dev server process error: ${err.message}`);
-    });
-    await new Promise<void>(resolve => setTimeout(resolve, readyMs));
-    return proc;
   }
 
-  private stopDevServer(proc: ChildProcess): void {
-    try {
-      if (process.platform === "win32") {
-        spawn("taskkill", ["/pid", String(proc.pid), "/f", "/t"], { stdio: "ignore" });
-      } else {
-        proc.kill("SIGTERM");
-      }
-    } catch (err) {
-      console.warn(`[PlayTester] Failed to stop dev server: ${err}`);
-    }
-  }
-
-  private async listExistingTestFiles(targetDir: string): Promise<string[]> {
+  private async listAllTestFiles(targetDir: string): Promise<string[]> {
     const testsDir = `${targetDir}/tests`;
     try {
       const entries = await readdir(testsDir);
       return entries
-        .filter(f => f.endsWith(".spec.ts"))
+        .filter(f => f.endsWith(".spec.ts") || f.endsWith(".test.ts"))
         .map(f => `tests/${f}`);
     } catch {
       return [];
@@ -161,6 +135,20 @@ export class PlayLoopService {
           steps: Number(r.steps ?? 0),
           error: r.error ?? null
         })) : []
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private parsePlayWriterFixResult(rawText: string): PlayWriterFixResult | null {
+    const match = rawText.match(/<FINAL_JSON>([\s\S]*?)<\/FINAL_JSON>/);
+    if (!match) return null;
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      return {
+        fixesApplied: Array.isArray(parsed.fixesApplied) ? parsed.fixesApplied : [],
+        summary: String(parsed.summary ?? "")
       };
     } catch {
       return null;
@@ -222,7 +210,7 @@ export class PlayLoopService {
     runId: string
   ): Promise<boolean> {
     return await this.withHeartbeat(runId, epic.id, "play_loop", "Running Playwright loop.", async () => {
-      const MAX_LOOP_ATTEMPTS = 3;
+      const MAX_LOOP_ATTEMPTS = 10;
       const config = loadConfig();
 
       const playWorkspace = await this.bridge.createWorkspace({
@@ -241,9 +229,9 @@ export class PlayLoopService {
       };
 
       try {
-        // Run Play Writer
         const worktreePath = playWorkspace.worktreePath;
-        
+
+        // ── Phase 1: Play Writer (fix build + generate tests) ──
         const tcResult = await this.bridge.runNamedCommand({
           workspaceId: playWorkspace.id,
           runId,
@@ -257,7 +245,7 @@ export class PlayLoopService {
           ? `${tcResult.stdout}\n${tcResult.stderr}`.trim()
           : null;
 
-        const existingTestFiles = await this.listExistingTestFiles(epic.targetDir);
+        const existingTestFiles = await this.listAllTestFiles(epic.targetDir);
         const ragCtx = await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`);
 
         const writerPrompt = playWriterPrompt(
@@ -278,74 +266,91 @@ export class PlayLoopService {
         });
 
         let rawText = "";
+        const playWriterModel = config.models.playWriter ?? "";
+        const MAX_PLAYWRITER_STALL_RETRIES = 3;
 
-        if (this.gateway.runEpicReviewerCodex && config.models.playWriter === "qwen-cli") {
-          try {
-            const result = await this.withTimeout(
-              this.gateway.runEpicReviewerCodex({
-                cwd: worktreePath,
-                prompt: writerPrompt,
-                runId,
-                epicId: epic.id,
-                onStream: (e: AgentStreamPayload) => {
-                  this.recordAgentStream({ ...e, agentRole: "playWriter" });
-                  rawText += e.content ?? "";
-                }
-              }),
-              this.epicReviewTimeoutMs,
-              "Play Writer timed out"
-            );
-            rawText = JSON.stringify(result);
-          } catch (err) {
+        for (let stallAttempt = 0; stallAttempt < MAX_PLAYWRITER_STALL_RETRIES; stallAttempt++) {
+          rawText = "";
+          const isRetry = stallAttempt > 0;
+          const currentPrompt = isRetry
+            ? "COMPACTED RETRY after stall. Be concise — fix build errors and generate tests quickly.\n\n" +
+              `Epic: ${epic.title}\nGoal: ${epic.goalText}\nTarget: ${worktreePath}\n` +
+              (buildErrors ? `Build errors:\n${buildErrors}\n\n` : "") +
+              "Fix build errors if any, then create Playwright e2e test files in tests/. Return <FINAL_JSON> with testsCreated, buildFixed, summary."
+            : writerPrompt;
+
+          if (isRetry) {
             this.recordAgentStream({
               agentRole: "playWriter",
               source: "orchestrator",
-              streamKind: "stderr",
-              content: `qwen-cli failed: ${err instanceof Error ? err.message : String(err)}. Falling back to codex-cli.`,
+              streamKind: "status",
+              content: `Play Writer stalled (attempt ${stallAttempt + 1}/${MAX_PLAYWRITER_STALL_RETRIES}). Compacting prompt and retrying...`,
               runId,
               epicId: epic.id
             });
-            rawText = "";
           }
-        }
 
-        if (!rawText && this.gateway.runEpicReviewerCodex) {
           try {
-            const result = await this.withTimeout(
-              this.gateway.runEpicReviewerCodex({
-                cwd: worktreePath,
-                prompt: writerPrompt,
-                runId,
-                epicId: epic.id,
-                onStream: (e: AgentStreamPayload) => {
-                  this.recordAgentStream({ ...e, agentRole: "playWriter" });
-                  rawText += e.content ?? "";
-                }
-              }),
-              this.epicReviewTimeoutMs,
-              "Play Writer (codex fallback) timed out"
-            );
-            rawText = JSON.stringify(result);
+            if (playWriterModel.startsWith("zai:") || playWriterModel.startsWith("mediated:")) {
+              const result = await this.withTimeout(
+                this.gateway.runEpicDecoderInWorkspace!({
+                  cwd: worktreePath,
+                  prompt: currentPrompt,
+                  runId,
+                  epicId: epic.id,
+                  onStream: (e: AgentStreamPayload) => {
+                    this.recordAgentStream({ ...e, agentRole: "playWriter" });
+                    rawText += e.content ?? "";
+                  }
+                }),
+                this.epicReviewTimeoutMs,
+                "Play Writer timed out"
+              );
+              rawText = rawText || JSON.stringify(result);
+            } else if (this.gateway.runEpicReviewerCodex) {
+              const result = await this.withTimeout(
+                this.gateway.runEpicReviewerCodex({
+                  cwd: worktreePath,
+                  prompt: currentPrompt,
+                  runId,
+                  epicId: epic.id,
+                  onStream: (e: AgentStreamPayload) => {
+                    this.recordAgentStream({ ...e, agentRole: "playWriter" });
+                    rawText += e.content ?? "";
+                  }
+                }),
+                this.epicReviewTimeoutMs,
+                "Play Writer timed out"
+              );
+              rawText = rawText || JSON.stringify(result);
+            }
+            break; // Success
           } catch (err) {
-            this.recordAgentStream({
-              agentRole: "playWriter",
-              source: "orchestrator",
-              streamKind: "stderr",
-              content: `codex-cli fallback also failed: ${err instanceof Error ? err.message : String(err)}`,
-              runId,
-              epicId: epic.id
-            });
+            const errMsg = err instanceof Error ? err.message : String(err);
+            const isTimeout = errMsg.includes("timed out");
+            if (!isTimeout || stallAttempt >= MAX_PLAYWRITER_STALL_RETRIES - 1) {
+              this.recordAgentStream({
+                agentRole: "playWriter",
+                source: "orchestrator",
+                streamKind: "stderr",
+                content: `Play Writer failed after ${stallAttempt + 1} attempts: ${errMsg}`,
+                runId,
+                epicId: epic.id
+              });
+              break;
+            }
           }
         }
 
         const parsed = this.parsePlayWriterResult(rawText);
+        const allTestFiles = await this.listAllTestFiles(worktreePath);
 
-        if (!parsed || parsed.testsCreated.length === 0) {
+        if (allTestFiles.length === 0) {
           this.recordAgentStream({
             agentRole: "playWriter",
             source: "orchestrator",
             streamKind: "stderr",
-            content: "Play Writer did not produce any test files. Skipping Play Tester loop.",
+            content: "No test files found in tests/ directory. Skipping Play Tester loop.",
             runId,
             epicId: epic.id
           });
@@ -356,16 +361,14 @@ export class PlayLoopService {
           agentRole: "playWriter",
           source: "orchestrator",
           streamKind: "assistant",
-          content: `Play Writer complete. Tests created: ${parsed.testsCreated.join(", ")}. ${parsed.summary}`,
+          content: `Play Writer complete. Test files: ${allTestFiles.join(", ")}. ${parsed?.summary ?? ""}`,
           runId,
           epicId: epic.id,
           done: true
         });
 
-        // Play Tester loop
-        let currentTestFiles = parsed.testsCreated;
+        // ── Phase 2: Play Tester loop (run npx playwright test) ──
         let previousFailures: PlayTesterTestResult[] | undefined = undefined;
-        let currentTickets = tickets;
 
         for (let attempt = 1; attempt <= MAX_LOOP_ATTEMPTS; attempt++) {
           const previousFailuresJson = previousFailures && previousFailures.length > 0
@@ -374,7 +377,7 @@ export class PlayLoopService {
 
           const testerPrompt = playTesterPrompt(
             { ...epic, targetDir: worktreePath },
-            currentTestFiles,
+            allTestFiles,
             config.playwrightDevServerUrl,
             config.playwrightDevServerCommand,
             attempt,
@@ -385,16 +388,10 @@ export class PlayLoopService {
             agentRole: "playTester",
             source: "orchestrator",
             streamKind: "status",
-            content: `Play Tester started (attempt ${attempt}/3). Starting dev server: ${config.playwrightDevServerCommand}`,
+            content: `Play Tester started (attempt ${attempt}/${MAX_LOOP_ATTEMPTS}). Running npx playwright test...`,
             runId,
             epicId: epic.id
           });
-
-          const devServer = await this.startDevServer(
-            worktreePath,
-            config.playwrightDevServerCommand,
-            config.playwrightDevServerReadyMs
-          );
 
           let testerRawText = "";
 
@@ -420,71 +417,75 @@ export class PlayLoopService {
             );
             testerRawText = testerRawText || JSON.stringify(result);
           } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
             this.recordAgentStream({
               agentRole: "playTester",
               source: "orchestrator",
               streamKind: "stderr",
-              content: `Play Tester failed: ${err instanceof Error ? err.message : String(err)}`,
+              content: `Play Tester error (attempt ${attempt}/${MAX_LOOP_ATTEMPTS}): ${errMsg}`,
               runId,
               epicId: epic.id
             });
-            this.stopDevServer(devServer);
-            return false;
-          } finally {
-            this.stopDevServer(devServer);
-            this.recordAgentStream({
-              agentRole: "playTester",
-              source: "orchestrator",
-              streamKind: "status",
-              content: "Dev server stopped.",
-              runId,
-              epicId: epic.id
-            });
+            // Treat as a synthetic failure so playWriter can fix it
+            previousFailures = [{
+              testFile: "playwright",
+              testName: "Play Tester execution error",
+              status: "failed",
+              steps: 0,
+              error: `${errMsg}\n\nRaw output:\n${testerRawText.slice(0, 3000)}`
+            }];
           }
 
           const testerParsed = this.parsePlayTesterResult(testerRawText);
 
-          if (!testerParsed) {
+          if (!testerParsed && !previousFailures) {
             this.recordAgentStream({
               agentRole: "playTester",
               source: "orchestrator",
               streamKind: "stderr",
-              content: "Play Tester did not produce a valid FINAL_JSON. Treating as full failure.",
+              content: `Play Tester did not produce FINAL_JSON (attempt ${attempt}/${MAX_LOOP_ATTEMPTS}). Feeding raw output to Play Writer.`,
               runId,
               epicId: epic.id
             });
-            return false;
+            previousFailures = [{
+              testFile: "playwright",
+              testName: "Play Tester produced no parseable output",
+              status: "failed",
+              steps: 0,
+              error: `No FINAL_JSON in output.\n\nRaw output:\n${testerRawText.slice(0, 3000)}`
+            }];
+          } else if (testerParsed) {
+            this.recordAgentStream({
+              agentRole: "playTester",
+              source: "orchestrator",
+              streamKind: "assistant",
+              content: `Play Tester complete (attempt ${attempt}/${MAX_LOOP_ATTEMPTS}). ${testerParsed.summary.passed}/${testerParsed.summary.total} passed.`,
+              runId,
+              epicId: epic.id,
+              done: true
+            });
+
+            if (testerParsed.status === "passed") {
+              return true;
+            }
+
+            const failingTests = testerParsed.results.filter(r => r.status === "failed");
+            previousFailures = failingTests;
+
+            this.recordAgentStream({
+              agentRole: "playTester",
+              source: "orchestrator",
+              streamKind: "stderr",
+              content: `Attempt ${attempt}/${MAX_LOOP_ATTEMPTS}: ${failingTests.length} test(s) failed:\n` +
+                failingTests.map(f => `  - ${f.testName} in ${f.testFile}: ${f.error}`).join("\n"),
+              runId,
+              epicId: epic.id
+            });
           }
 
-          this.recordAgentStream({
-            agentRole: "playTester",
-            source: "orchestrator",
-            streamKind: "assistant",
-            content: `Play Tester complete (attempt ${attempt}). ${testerParsed.summary.passed}/${testerParsed.summary.total} passed.`,
-            runId,
-            epicId: epic.id,
-            done: true
-          });
-
-          if (testerParsed.status === "passed") {
-            return true;
-          }
-
-          const failingTests = testerParsed.results.filter(r => r.status === "failed");
-          previousFailures = failingTests;
-
-          this.recordAgentStream({
-            agentRole: "playTester",
-            source: "orchestrator",
-            streamKind: "stderr",
-            content: `Attempt ${attempt}/${MAX_LOOP_ATTEMPTS}: ${failingTests.length} test(s) failed:\n` +
-              failingTests.map(f => `  - ${f.testName} in ${f.testFile}: ${f.error}`).join("\n"),
-            runId,
-            epicId: epic.id
-          });
-
+          // ── Exhausted all attempts? ──
           if (attempt >= MAX_LOOP_ATTEMPTS) {
-            const failureSummary = failingTests
+            const failureSummary = (previousFailures ?? [])
               .map(f => `${f.testName} (${f.testFile}): ${f.error}`)
               .join("\n");
 
@@ -492,7 +493,7 @@ export class PlayLoopService {
               agentRole: "playTester",
               source: "orchestrator",
               streamKind: "stderr",
-              content: `Exhausted ${MAX_LOOP_ATTEMPTS} Play Tester attempts. Escalating epic.\n\nFailing tests:\n${failureSummary}`,
+              content: `Exhausted ${MAX_LOOP_ATTEMPTS} Play Tester attempts. Escalating.\n\nFailing tests:\n${failureSummary}`,
               runId,
               epicId: epic.id,
               done: true
@@ -500,98 +501,110 @@ export class PlayLoopService {
             return false;
           }
 
-          // === REFEEP: Feed failures back to Epic Decoder for re-decomposition ===
-          const failureContext = [
-            `## Playwright Test Failures (Attempt ${attempt})`,
-            "",
-            "The following tests were generated for this epic and are now failing.",
-            "You must decompose new tickets to fix ONLY these failing tests.",
-            "Do not change tickets that are already working.",
-            "",
-            "## Failing Tests",
-            ...failingTests.map(f => [
-              `### ${f.testName}`,
-              `**File:** ${f.testFile}`,
-              `**Error:** ${f.error}`,
-              `**Steps executed before failure:** ${f.steps}`,
-            ].join("\n")),
-            "",
-            "## Instructions for Re-Decomposition",
-            "Create tickets that fix the root cause of each failing test.",
-            "Each ticket should fix exactly one failing test.",
-            "Do not create tickets for tests that already pass.",
-            "The test files themselves should generally NOT be changed — fix the app code instead.",
-            "Only change a test file if the test itself is wrong (e.g. wrong selector, wrong URL).",
-          ].join("\n");
-
+          // ── Phase 3: Play Writer FIX mode — fix failing tests and commit ──
+          const failuresToFix = previousFailures ?? [];
           this.recordAgentStream({
-            agentRole: "epicDecoder",
+            agentRole: "playWriter",
             source: "orchestrator",
             streamKind: "status",
-            content: `Re-feeding ${failingTests.length} failures into Epic Decoder for attempt ${attempt + 1}...`,
+            content: `Feeding ${failuresToFix.length} failures to Play Writer (fix mode)...`,
             runId,
             epicId: epic.id
           });
 
-          // 1. Call Epic Decoder with failure context
-          const epicWithFailure: EpicRecord = {
-            ...epic,
-            goalText: `${epic.goalText}\n\n${failureContext}`
-          };
+          const fixPrompt = playWriterFixPrompt(
+            { ...epic, targetDir: worktreePath },
+            failuresToFix
+          );
 
-          const decomposition = await this.callbacks.runEpicDecoder(epicWithFailure, runId);
+          let fixRawText = "";
+          const MAX_FIX_STALL_RETRIES = 3;
 
-          if (!decomposition.tickets || decomposition.tickets.length === 0) {
-            this.recordAgentStream({
-              agentRole: "epicDecoder",
-              source: "orchestrator",
-              streamKind: "stderr",
-              content: "Epic Decoder returned no tickets for the failure context. Escalating.",
-              runId,
-              epicId: epic.id
-            });
-            return false;
+          for (let fixStallAttempt = 0; fixStallAttempt < MAX_FIX_STALL_RETRIES; fixStallAttempt++) {
+            fixRawText = "";
+            const isFixRetry = fixStallAttempt > 0;
+            const currentFixPrompt = isFixRetry
+              ? "COMPACTED RETRY after stall. Be concise — fix the errors quickly.\n\n" +
+                `Target: ${worktreePath}\n` +
+                `Failing tests:\n${failuresToFix.map(f => `- ${f.testName} (${f.testFile}): ${f.error}`).join("\n")}\n\n` +
+                "Fix the code, commit changes. Return <FINAL_JSON> with fixesApplied, summary."
+              : fixPrompt;
+
+            if (isFixRetry) {
+              this.recordAgentStream({
+                agentRole: "playWriter",
+                source: "orchestrator",
+                streamKind: "status",
+                content: `Play Writer fix stalled (attempt ${fixStallAttempt + 1}/${MAX_FIX_STALL_RETRIES}). Compacting and retrying...`,
+                runId,
+                epicId: epic.id
+              });
+            }
+
+            try {
+              if (playWriterModel.startsWith("zai:") || playWriterModel.startsWith("mediated:")) {
+                const result = await this.withTimeout(
+                  this.gateway.runEpicDecoderInWorkspace!({
+                    cwd: worktreePath,
+                    prompt: currentFixPrompt,
+                    runId,
+                    epicId: epic.id,
+                    onStream: (e: AgentStreamPayload) => {
+                      this.recordAgentStream({ ...e, agentRole: "playWriter" });
+                      fixRawText += e.content ?? "";
+                    }
+                  }),
+                  this.epicReviewTimeoutMs,
+                  "Play Writer fix timed out"
+                );
+                fixRawText = fixRawText || JSON.stringify(result);
+              } else if (this.gateway.runEpicReviewerCodex) {
+                const result = await this.withTimeout(
+                  this.gateway.runEpicReviewerCodex({
+                    cwd: worktreePath,
+                    prompt: currentFixPrompt,
+                    runId,
+                    epicId: epic.id,
+                    onStream: (e: AgentStreamPayload) => {
+                      this.recordAgentStream({ ...e, agentRole: "playWriter" });
+                      fixRawText += e.content ?? "";
+                    }
+                  }),
+                  this.epicReviewTimeoutMs,
+                  "Play Writer fix timed out"
+                );
+                fixRawText = fixRawText || JSON.stringify(result);
+              }
+              break; // Success
+            } catch (err) {
+              const errMsg = err instanceof Error ? err.message : String(err);
+              const isTimeout = errMsg.includes("timed out");
+              if (!isTimeout || fixStallAttempt >= MAX_FIX_STALL_RETRIES - 1) {
+                this.recordAgentStream({
+                  agentRole: "playWriter",
+                  source: "orchestrator",
+                  streamKind: "stderr",
+                  content: `Play Writer fix failed after ${fixStallAttempt + 1} attempts: ${errMsg}`,
+                  runId,
+                  epicId: epic.id
+                });
+                break;
+              }
+            }
           }
 
-          // 2. Create repair tickets in DB
-          const repairTickets: TicketRecord[] = [];
-          for (const ticketPlan of decomposition.tickets) {
-            const repairId = `${ticketPlan.id}-REPAIR-${Date.now()}`;
-            const ticket = this.db.createTicket({
-              id: repairId,
-              epicId: epic.id,
-              title: ticketPlan.title,
-              description: ticketPlan.description,
-              acceptanceCriteria: ticketPlan.acceptanceCriteria ?? [],
-              dependencies: [],
-              allowedPaths: ticketPlan.allowedPaths ?? ["src/"],
-              priority: ticketPlan.priority ?? "high",
-              status: "queued",
-              metadata: { isRepairTicket: true, sourceTicketId: repairId }
-            });
-            repairTickets.push(ticket);
-          }
-
+          const fixParsed = this.parsePlayWriterFixResult(fixRawText);
           this.recordAgentStream({
-            agentRole: "epicDecoder",
+            agentRole: "playWriter",
             source: "orchestrator",
             streamKind: "assistant",
-            content: `Re-decomposition created ${repairTickets.length} repair ticket(s): ${repairTickets.map(t => t.id).join(", ")}`,
+            content: `Play Writer fix complete (attempt ${attempt}). ${fixParsed?.summary ?? "No FINAL_JSON produced."}`,
             runId,
             epicId: epic.id,
             done: true
           });
 
-          // 3. Execute repair tickets (build + review)
-          await this.callbacks.executeTickets(epic, repairTickets, runId);
-
-          // 4. Run Epic Reviewer again
-          await this.callbacks.runEpicReview(epic, [...tickets, ...repairTickets], runId);
-
-          // Update current tickets for next iteration
-          currentTickets = [...tickets, ...repairTickets];
-
-          // Loop continues - will run Play Writer again, then Play Tester
+          // Loop continues — playTester will re-run npx playwright test
         }
 
         return true;

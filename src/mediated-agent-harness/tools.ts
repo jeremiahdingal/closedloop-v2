@@ -1924,9 +1924,10 @@ export function getAvailableToolsList(role: string, options?: { availableCommand
   }
   if (role === "coder") {
     const writeTools = ["write_file", "write_files", "search_replace"];
+    const gitTools = ["git_diff", "git_diff_staged", "git_status", "list_changed_files"];
     return availableCommands.has("install")
-      ? [...common, ...writeTools, "run_command"]
-      : [...common, ...writeTools];
+      ? [...common, ...writeTools, ...gitTools, "run_command"]
+      : [...common, ...writeTools, ...gitTools];
   }
   if (role === "reviewer") {
     return ["read_file", "list_dir", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files", "finish"];
@@ -1935,7 +1936,7 @@ export function getAvailableToolsList(role: string, options?: { availableCommand
     return ["read_file", "glob_files", "grep_files", "list_dir", "semantic_search", "web_search", "finish"];
   }
   if (role === "epic-reviewer" || role === "epicReviewer") {
-    return ["read_file", "list_dir", "write_file", "write_files", "remove_file", "run_command", "git_diff", "git_diff_staged", "git_status", "list_changed_files", "finish"];
+    return ["read_file", "read_files", "list_dir", "write_file", "write_files", "search_replace", "remove_file", "glob_files", "grep_files", "run_command", "git_diff", "git_diff_staged", "git_status", "list_changed_files", "finish"];
   }
   if (role === "tester") {
     return [...common, "run_command", "git_diff", "git_status"];

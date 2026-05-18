@@ -223,6 +223,22 @@ export class RecoveryService {
     const staleRunIds: string[] = [];
     for (const run of this.db.listRuns("running")) {
       if (run.epicId && (run.currentNode === "goal_review" || run.currentNode === "manual_goal_review")) {
+        const heartbeat = run.heartbeatAt ? new Date(run.heartbeatAt).getTime() : 0;
+        const epicReviewTimeout = Number(process.env.EPIC_REVIEW_TIMEOUT_MS || 300_000);
+        const threshold = Date.now() - epicReviewTimeout;
+        if (heartbeat < threshold) {
+          console.log(`[RECOVERY] Epic review run ${run.id} stalled (no heartbeat for ${Math.round((Date.now() - heartbeat) / 1000)}s). Re-enqueueing.`);
+          this.db.updateRun({ runId: run.id, status: "failed", currentNode: "error", heartbeatAt: nowIso(), lastMessage: "Epic review stalled, timed out.", errorText: "Epic review timed out" });
+          for (const job of this.db.listJobRecords()) {
+            if (job.kind === "run_epic_review" && (job.status === "queued" || job.status === "running")) {
+              const payload = job.payload as Record<string, unknown>;
+              if (payload?.runId === run.id || payload?.epicId === run.epicId) {
+                this.db.failJob(job.id, "Stale epic review run recovered.", true);
+              }
+            }
+          }
+          this.db.enqueueJob("run_epic_review", { epicId: run.epicId, runId: run.id });
+        }
         continue;
       }
       if (run.epicId && run.currentNode === "execute_tickets") {
@@ -373,6 +389,28 @@ export class RecoveryService {
       }
 
       await this.ticketRunner.runExisting(run.id);
+
+      // Check if all tickets in the epic are now approved — trigger epic review
+      if (ticket?.epicId) {
+        const epicTickets = this.db.listTickets(ticket.epicId);
+        const allTerminal = epicTickets.every(t =>
+          t.status === "approved" || t.status === "failed" || t.status === "escalated"
+        );
+        const anyApproved = epicTickets.some(t => t.status === "approved");
+        if (allTerminal && anyApproved) {
+          const epic = this.db.getEpic(ticket.epicId);
+          const hasPendingReview = this.db.listJobRecords().some(j =>
+            j.kind === "run_epic_review" && (j.status === "queued" || j.status === "running")
+            && (j.payload as any)?.epicId === ticket.epicId
+          );
+          if (epic && epic.status !== "approved" && epic.status !== "reviewing" && !hasPendingReview) {
+            console.log(`[RECOVERY] All tickets terminal for epic ${ticket.epicId}. Triggering epic review.`);
+            this.goalRunner.enqueueManualReview(ticket.epicId).catch(err => {
+              console.warn(`[RECOVERY] Failed to enqueue epic review: ${err}`);
+            });
+          }
+        }
+      }
       return;
     }
     if (job.kind === "run_epic") {
@@ -389,7 +427,7 @@ export class RecoveryService {
     }
     if (job.kind === "run_epic_play_loop") {
       const run = this.db.getRun(String(job.payload.runId));
-      if (!run || run.status !== "queued") return;
+      if (!run || run.status === "failed" || run.status === "succeeded" || run.status === "cancelled") return;
       await this.goalRunner.runManualPlayLoopExisting(run.id);
       return;
     }

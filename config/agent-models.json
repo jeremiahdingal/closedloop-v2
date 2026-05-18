@@ -3,10 +3,10 @@
   "builder": "mediated:gemma4:26b-a4b-it-q4_K_M",
   "reviewer": "mediated:qwen3.5:9b",
   "tester": "skip",
-  "explorer": "mediated:qwen3.5:9b",
-  "coder": "mediated:ibm/granite4.1:30b-q3_K_M",
+  "explorer": "mediated:qwen3.5:4b",
+  "coder": "mediated:qwen3.5:9b",
   "epicReviewer": "zai:glm-5.1",
-  "playWriter": "qwen-cli",
+  "playWriter": "zai:glm-5.1",
   "playTester": "mediated:qwen3.5:9b",
   "doctor": "qwen3:8b"
 }
