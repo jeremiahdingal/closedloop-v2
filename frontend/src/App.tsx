@@ -10,6 +10,7 @@ import {
   AgentStreamStatus,
   Dashboard,
   Epic,
+  OllamaPsSnapshot,
   Run,
   Ticket,
 } from "./types.ts";
@@ -36,10 +37,12 @@ import { PlanningModal } from "./components/PlanningModal.tsx";
 import { TicketModal } from "./components/TicketModal.tsx";
 import { DirectChatModal } from "./components/DirectChatModal.tsx";
 import { GameModal } from "./components/GameModal.tsx";
+import { OllamaPsPanel } from "./components/OllamaPsPanel.tsx";
 
 export function App() {
   const [data, setData] = useState<Dashboard>({ epics: [], tickets: [], runs: [], agentEvents: [] });
   const [modelsConfig, setModelsConfig] = useState<AgentModelsConfig>({});
+  const [ollamaPs, setOllamaPs] = useState<OllamaPsSnapshot>({ ok: false, status: "idle", models: [] });
   const [modelOverrides, setModelOverrides] = useState<Record<string, string>>({});
   const [title, setTitle] = useState("");
   const [goalText, setGoalText] = useState("");
@@ -57,7 +60,7 @@ export function App() {
   const [planAwaitingClarification, setPlanAwaitingClarification] = useState(false);
   const [loading, setLoading] = useState(true);
   const [epicPage, setEpicPage] = useState(0);
-  const [epicPageSize] = useState(50);
+  const [epicPageSize] = useState(5);
   const [epicTotal, setEpicTotal] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -102,14 +105,21 @@ export function App() {
   async function refresh() {
     try {
       setLoading(true);
-      const [epicResult, tickets, runs, fetchedAgentEvents] = await Promise.all([
+      const [epicResult, tickets, runs, fetchedAgentEvents, ollamaSnapshot] = await Promise.all([
         fetchJson<{ epics: Epic[]; total: number }>("/api/epics?limit=" + epicPageSize + "&offset=" + (epicPage * epicPageSize)),
         fetchJson<Ticket[]>("/api/tickets"),
         fetchJson<Run[]>("/api/runs"),
         fetchJson<AgentEvent[]>("/api/agent-events?limit=600"),
+        fetchJson<OllamaPsSnapshot>("/api/ollama/ps").catch((): OllamaPsSnapshot => ({
+          ok: false,
+          status: "error",
+          models: [],
+          error: "Failed to load Ollama process list.",
+        })),
       ]);
       
       setEpicTotal(epicResult.total);
+      setOllamaPs(ollamaSnapshot);
 
       // Merge fetched events with any SSE-captured events to avoid losing recent ones
       setData((current) => {
@@ -130,12 +140,12 @@ export function App() {
 
   useEffect(() => {
     void refresh();
-  }, []);
+  }, [epicPage]);
   useEffect(() => {
     if (!autoRefresh) return;
     const timer = window.setInterval(() => void refresh(), 5000);
     return () => window.clearInterval(timer);
-  }, [autoRefresh]);
+  }, [autoRefresh, epicPage]);
 
   const [lastEventTime, setLastEventTime] = useState<Map<string, number>>(new Map());
   const [collapsedPanels, setCollapsedPanels] = useState<Set<string>>(new Set(["scheduler"]));
@@ -500,6 +510,28 @@ export function App() {
     }
   }
 
+  async function redecodeEpic(epicId: string) {
+    const confirmed = await confirmToast({
+      title: "Re-decode epic?",
+      description: "This clears the epic's current tickets and runs, then queues a fresh decoder pass.",
+      confirmLabel: "Re-decode Epic",
+    });
+    if (!confirmed) return;
+
+    const toastId = toast.loading("Re-decoding epic...");
+    try {
+      setActionBusy(`redecode-epic-${epicId}`);
+      await fetchJson(`/api/epics/${encodeURIComponent(epicId)}/redecode`, { method: "POST" });
+      await refresh();
+      toast.success("Epic queued for a fresh decode.", { id: toastId });
+    } catch (err) {
+      setError((err as Error).message);
+      toast.error(`Failed to re-decode epic: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
   async function reviewEpic(epicId: string) {
     const epic = data.epics.find((e) => e.id === epicId);
     if (epic?.status === "done") {
@@ -568,6 +600,36 @@ export function App() {
     } catch (err) {
       setError((err as Error).message);
       toast.error(`Failed to queue play loop: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function pauseEpic(epicId: string) {
+    const toastId = toast.loading("Pausing epic...");
+    try {
+      setActionBusy(`pause-epic-${epicId}`);
+      await fetchJson(`/api/epics/${encodeURIComponent(epicId)}/pause`, { method: "POST" });
+      await refresh();
+      toast.success("Epic paused.", { id: toastId });
+    } catch (err) {
+      setError((err as Error).message);
+      toast.error(`Failed to pause epic: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function resumeEpic(epicId: string) {
+    const toastId = toast.loading("Resuming epic...");
+    try {
+      setActionBusy(`resume-epic-${epicId}`);
+      await fetchJson(`/api/epics/${encodeURIComponent(epicId)}/resume`, { method: "POST" });
+      await refresh();
+      toast.success("Epic resumed.", { id: toastId });
+    } catch (err) {
+      setError((err as Error).message);
+      toast.error(`Failed to resume epic: ${(err as Error).message}`, { id: toastId });
     } finally {
       setActionBusy(null);
     }
@@ -933,6 +995,8 @@ export function App() {
       <div className="main-grid">
         {/* Mobile Stacked View */}
         <div className="mobile-stacked">
+          <OllamaPsPanel snapshot={ollamaPs} />
+
           {/* Epics */}
           <div className="win-panel">
             <div className="win-titlebar">
@@ -986,6 +1050,25 @@ export function App() {
                         </div>
                         <div className="item-actions">
                           <span className={`pill pill-${epic.status}`}>{epic.status}</span>
+                          {epic.status === "paused" ? (
+                            <button
+                              className="mini-btn"
+                              onClick={(e) => { e.stopPropagation(); void resumeEpic(epic.id); }}
+                              disabled={actionBusy !== null}
+                              title="Resume epic"
+                            >
+                              ▶
+                            </button>
+                          ) : ["executing", "planning", "reviewing"].includes(epic.status) ? (
+                            <button
+                              className="mini-btn"
+                              onClick={(e) => { e.stopPropagation(); void pauseEpic(epic.id); }}
+                              disabled={actionBusy !== null}
+                              title="Pause epic"
+                            >
+                              ⏸
+                            </button>
+                          ) : null}
                           <button
                             className="mini-btn"
                             onClick={(e) => {
@@ -1133,8 +1216,9 @@ export function App() {
 
         {/* Desktop Left Column */}
         <div className="left-col">
-          {/* Mission Status */}
-          <div className="win-panel">
+          <OllamaPsPanel snapshot={ollamaPs} />
+          {/* Legacy Mission Status (hidden) */}
+          <div className="win-panel mission-status-panel">
             <div className="win-titlebar">
               <div className="win-titlebar-text">
                 <span>📊</span>
@@ -1453,6 +1537,25 @@ export function App() {
                         </div>
                         <div className="item-actions">
                           <span className={`pill pill-${epic.status}`}>{epic.status}</span>
+                          {epic.status === "paused" ? (
+                            <button
+                              className="mini-btn"
+                              onClick={(e) => { e.stopPropagation(); void resumeEpic(epic.id); }}
+                              disabled={actionBusy !== null}
+                              title="Resume epic"
+                            >
+                              ▶
+                            </button>
+                          ) : ["executing", "planning", "reviewing"].includes(epic.status) ? (
+                            <button
+                              className="mini-btn"
+                              onClick={(e) => { e.stopPropagation(); void pauseEpic(epic.id); }}
+                              disabled={actionBusy !== null}
+                              title="Pause epic"
+                            >
+                              ⏸
+                            </button>
+                          ) : null}
                           <button
                             className="mini-btn"
                             onClick={(e) => {
@@ -1690,11 +1793,14 @@ export function App() {
           epic={selectedEpicDetails}
           open={true}
           onClose={() => setSelectedEpicDetails(null)}
+          onRedecode={() => void redecodeEpic(selectedEpicDetails.id)}
           onRetry={() => void retryEpic(selectedEpicDetails.id)}
           onReview={() => void reviewEpic(selectedEpicDetails.id)}
           onPlayLoop={() => void playLoopEpic(selectedEpicDetails.id)}
           onMarkDone={() => void markEpicDone(selectedEpicDetails.id)}
           onCancel={() => void cancelEpic(selectedEpicDetails.id)}
+          onPause={() => void pauseEpic(selectedEpicDetails.id)}
+          onResume={() => void resumeEpic(selectedEpicDetails.id)}
           onDelete={() => void deleteEpic(selectedEpicDetails.id)}
           actionBusy={actionBusy !== null}
           epicEvents={data.agentEvents.filter((e) => e.payload?.epicId === selectedEpicDetails.id)}

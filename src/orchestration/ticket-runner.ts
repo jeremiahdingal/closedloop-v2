@@ -61,6 +61,7 @@ type TicketGraphState = {
   blockHistory: string[];
   testHistory: string[];
   reviewApproved: boolean;
+  reviewerLoops: number;
   reviewBlockers: string[];
   reviewSuggestions: string[];
   testPassed: boolean;
@@ -73,14 +74,29 @@ type TicketGraphState = {
   previousExplorerOutput: any;
   explorerOutput: any;
   canonicalEditPacket: any;
+  coderContextPacket: any;
   coderOutput: any;
   verificationResult: any;
   repeatedBlockers: boolean;
   repeatedTestFailure: boolean;
   recovery: boolean;
+  recoveryNode: string;
   forceCoderReset: boolean;
   status: "pending" | "building" | "reviewing" | "testing" | "approved" | "escalated" | "failed";
 };
+
+export function shouldRetryExplorerEscalation(result: Pick<TicketGraphState, "status" | "reviewBlockers" | "coderOutput" | "explorerOutput" | "skipExplorer" | "lastMessage" | "failureReason">): boolean {
+  if (result.status !== "escalated") return false;
+  if (result.skipExplorer) return false;
+  if (result.coderOutput) return false;
+  if ((result.reviewBlockers?.length ?? 0) > 0) return false;
+
+  // Explorer escalations can lose the explorerOutput payload by the time the graph result is materialized.
+  // Treat an escalation as explorer-originated if we still have the output, or if the terminal message
+  // clearly came from the explorer path.
+  const signalText = `${result.lastMessage ?? ""} ${result.failureReason ?? ""}`.toLowerCase();
+  return Boolean(result.explorerOutput) || signalText.includes("explorer");
+}
 
 export class TicketRunner {
   readonly config = loadConfig();
@@ -107,7 +123,7 @@ export class TicketRunner {
 
   async start(ticketId: string, epicId: string): Promise<string> {
     const existing = this.db.getTicket(ticketId);
-    if (existing && ["approved", "escalated"].includes(existing.status)) {
+    if (existing && existing.status === "approved") {
       console.log(`[TICKET] Skipping start for ${ticketId} — already ${existing.status}`);
       return existing.currentRunId ?? "skip";
     }
@@ -146,7 +162,7 @@ export class TicketRunner {
 
   async startDirect(ticketId: string, epicId: string): Promise<string> {
     const existing = this.db.getTicket(ticketId);
-    if (existing && ["approved", "escalated"].includes(existing.status)) {
+    if (existing && existing.status === "approved") {
       console.log(`[TICKET] Skipping startDirect for ${ticketId} — already ${existing.status}`);
       return existing.currentRunId ?? "skip";
     }
@@ -210,6 +226,12 @@ export class TicketRunner {
         && (job.payload as any)?.runId === runId
         && (job.payload as any)?.recovery === true
     );
+    const recoveryJob = this.db.listJobRecords().find(
+      (job: any) => job.kind === "run_ticket"
+        && (job.payload as any)?.runId === runId
+        && (job.payload as any)?.recovery === true
+    );
+    const recoveryNode = String((recoveryJob?.payload as any)?.recoveryNode ?? "");
 
     // Read forceCoderReset flag — if true, skip to coder directly with hot-reset prompt
     const forceCoderReset = this.db.listJobRecords().some(
@@ -235,6 +257,7 @@ export class TicketRunner {
       blockHistory: z.array(z.string()).default([]),
       testHistory: z.array(z.string()).default([]),
       reviewApproved: z.boolean().default(false),
+      reviewerLoops: z.number().default(0),
       reviewBlockers: z.array(z.string()).default([]),
       reviewSuggestions: z.array(z.string()).default([]),
       testPassed: z.boolean().default(false),
@@ -247,16 +270,18 @@ export class TicketRunner {
       previousExplorerOutput: z.any().default(null),
       explorerOutput: z.any().default(null),
       canonicalEditPacket: z.any().default(null),
+      coderContextPacket: z.any().default(null),
       coderOutput: z.any().default(null),
       verificationResult: z.any().default(null),
       repeatedBlockers: z.boolean().default(false),
       repeatedTestFailure: z.boolean().default(false),
       recovery: z.boolean().default(false),
+      recoveryNode: z.string().default(""),
       forceCoderReset: z.boolean().default(false),
       status: z.enum(["pending", "building", "reviewing", "testing", "approved", "escalated", "failed"]).default("pending")
     });
 
-    const recoveryInit = async (_state: TicketGraphState) => {
+    const recoveryInit = async (state: TicketGraphState) => {
       this.assertNotCancelled(ticket.id, ticket.epicId);
       this.db.updateRun({ runId, status: "running", currentNode: "recovery_init", heartbeatAt: nowIso(), lastMessage: "Recovery: loading existing workspace..." });
       this.heartbeat(runId, ticket.id, "recovery_init", "Recovery: loading existing workspace...");
@@ -268,7 +293,8 @@ export class TicketRunner {
       const diff = await this.bridge.gitDiff(workspace.id);
       const noDiff = !diff || diff.trim().length === 0;
 
-      this.heartbeat(runId, ticket.id, "recovery_init", `Recovery: workspace loaded (${noDiff ? "no changes" : "has changes"}). Running doctor...`);
+      const nextNode = state.recoveryNode === "reviewer" && !noDiff ? "reviewer" : "coder";
+      this.heartbeat(runId, ticket.id, "recovery_init", `Recovery: workspace loaded (${noDiff ? "no changes" : "has changes"}). Restarting ${nextNode}.`);
       return {
         workspaceId: workspace.id,
         buildAttempts: 0,
@@ -276,8 +302,10 @@ export class TicketRunner {
         coderAttempts: 0,
         rescueMode: false,
         noDiff,
+        lastDiff: diff,
         skipExplorer: true,
-        lastMessage: "Recovery: workspace loaded, running doctor.",
+        recoveryNode: state.recoveryNode,
+        lastMessage: `Recovery: workspace loaded, restarting ${nextNode}.`,
         status: "building" as const
       } satisfies Partial<TicketGraphState>;
     };
@@ -391,8 +419,14 @@ export class TicketRunner {
             this.heartbeat(runId, ticket.id, "system", `Explorer output was not valid JSON (attempt ${attempt + 1}/${MAX_EXPLORER_RETRIES + 1}). Retrying with corrective nudge...`);
             continue;
           }
-          this.heartbeat(runId, ticket.id, "system", "Explorer output was not valid JSON after retries. Skipping to builder.");
-          return { status: "building" as const, lastMessage: "Explorer output invalid after retries", explorerOutput: null };
+          // Last attempt: try 4b fixup to extract structured JSON from raw text
+          explorerOutput = await this.explorerOutputFixup(runId, ticket, lastExplorerRaw);
+          if (explorerOutput) {
+            this.heartbeat(runId, ticket.id, "system", "Explorer output recovered via fixup model.");
+          } else {
+            this.heartbeat(runId, ticket.id, "system", "Explorer output was not valid JSON after retries. Skipping to builder.");
+            return { status: "building" as const, lastMessage: "Explorer output invalid after retries", explorerOutput: null };
+          }
         }
 
         // Validate required fields
@@ -481,10 +515,12 @@ export class TicketRunner {
         explorerOutput,
         workspace.worktreePath
       );
+      const contextPacket = await this.buildCoderContextPacket(runId, ticket, workspace, state);
 
       return {
         explorerOutput,
         canonicalEditPacket,
+        coderContextPacket: contextPacket,
         lastMessage: "Edit packet built. Running coder...",
       } satisfies Partial<TicketGraphState>;
     };
@@ -525,6 +561,7 @@ export class TicketRunner {
           workspaceId: ws.id,
           explorerOutput: minimalExplorer,
           canonicalEditPacket: minimalPacket,
+          coderContextPacket: null,
         });
       }
 
@@ -562,7 +599,7 @@ export class TicketRunner {
         this.heartbeat(runId, ticket.id, "coder", "Existing workspace changes detected. Resuming via Hot-Reset prompt.");
         currentCoderPrompt = buildCoderResumePrompt(ticket, initialDiff, state.reviewBlockers ?? [], state.explorerOutput);
       } else {
-        currentCoderPrompt = coderPrompt(ticket, state.explorerOutput, state.canonicalEditPacket.allowedPaths, { blockers: state.reviewBlockers ?? [], suggestions: state.reviewSuggestions ?? [] }, { skipped: state.skipExplorer, reason: "Explorer was skipped by user request." }, state.canonicalEditPacket);
+        currentCoderPrompt = coderPrompt(ticket, state.explorerOutput, state.canonicalEditPacket.allowedPaths, { blockers: state.reviewBlockers ?? [], suggestions: state.reviewSuggestions ?? [] }, { skipped: state.skipExplorer, reason: "Explorer was skipped by user request." });
       }
 
       let coderResult;
@@ -701,36 +738,42 @@ export class TicketRunner {
       try {
         coderOutput = extractCoderJson(coderResult.text);
       } catch (parseErr) {
-        let existingDiff = await this.bridge.gitDiff(workspace.id);
-        if (!existingDiff || !existingDiff.trim()) {
-          const diffBase = await getEffectiveDiffBase(workspace.worktreePath, workspace.baseCommit);
-          const baseDiff = await git(workspace.worktreePath, ["diff", diffBase, "--", "."]);
-          existingDiff = baseDiff.stdout.trim() || existingDiff;
-        }
-        if (existingDiff && existingDiff.trim()) {
-          console.log(`[TICKET ${ticket.id}] Coder output was not valid JSON but workspace has diff — proceeding`);
+        // Try 4b fixup to extract structured coder output before falling back
+        coderOutput = await this.coderOutputFixup(runId, ticket, coderResult.text ?? "");
+        if (coderOutput) {
+          this.heartbeat(runId, ticket.id, "system", "Coder output recovered via fixup model.");
+        } else {
+          let existingDiff = await this.bridge.gitDiff(workspace.id);
+          if (!existingDiff || !existingDiff.trim()) {
+            const diffBase = await getEffectiveDiffBase(workspace.worktreePath, workspace.baseCommit);
+            const baseDiff = await git(workspace.worktreePath, ["diff", diffBase, "--", "."]);
+            existingDiff = baseDiff.stdout.trim() || existingDiff;
+          }
+          if (existingDiff && existingDiff.trim()) {
+            console.log(`[TICKET ${ticket.id}] Coder output was not valid JSON but workspace has diff — proceeding`);
+            return {
+              coderOutput: { operations: [], summary: "Coder output was not valid JSON but files were written to workspace", unresolvedBlockers: [] },
+              lastDiff: existingDiff,
+              noDiff: false,
+              lastMessage: "Coder output was not valid JSON but workspace contains changes.",
+              status: "reviewing" as const,
+              coderAttempts,
+              hotResets,
+              rescueMode: isRescue,
+            } satisfies Partial<TicketGraphState>;
+          }
+          this.heartbeat(runId, ticket.id, "system", `Coder finished with no edits and no diff — treating as no-op completion.`);
           return {
-            coderOutput: { operations: [], summary: "Coder output was not valid JSON but files were written to workspace", unresolvedBlockers: [] },
-            lastDiff: existingDiff,
+            coderOutput: { operations: [], summary: coderResult.text?.slice(0, 500) || "Coder finished with no edits", unresolvedBlockers: [] },
+            lastDiff: "",
             noDiff: false,
-            lastMessage: "Coder output was not valid JSON but workspace contains changes.",
+            lastMessage: "Coder finished with no edits (no-op).",
             status: "reviewing" as const,
             coderAttempts,
             hotResets,
             rescueMode: isRescue,
-          } satisfies Partial<TicketGraphState>;
+          };
         }
-        this.heartbeat(runId, ticket.id, "system", `Coder finished with no edits and no diff — treating as no-op completion.`);
-        return {
-          coderOutput: { operations: [], summary: coderResult.text?.slice(0, 500) || "Coder finished with no edits", unresolvedBlockers: [] },
-          lastDiff: "",
-          noDiff: false,
-          lastMessage: "Coder finished with no edits (no-op).",
-          status: "reviewing" as const,
-          coderAttempts,
-          hotResets,
-          rescueMode: isRescue,
-        };
       }
 
       return {
@@ -935,7 +978,27 @@ export class TicketRunner {
       console.log(`[TICKET ${ticket.id}] Reviewer starting`);
       this.heartbeat(runId, ticket.id, "reviewer", "Reviewing diff.");
       this.recordAgentStream({ agentRole: "reviewer", source: "orchestrator", streamKind: "status", content: "Reviewing diff...", runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 0, done: false });
-      const reviewVerdict = await this.getReviewerVerdictWithRetry(runId, ticket, state.lastDiff, state.workspaceId);
+
+      let reviewVerdict: ReviewerVerdict;
+      try {
+        reviewVerdict = await this.getReviewerVerdictWithRetry(runId, ticket, state.lastDiff, state.workspaceId);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.error(`[TICKET ${ticket.id}] Reviewer failed with unrecoverable error: ${errMsg}`);
+        this.recordAgentStream({ agentRole: "reviewer", source: "orchestrator", streamKind: "stderr", content: `Reviewer error: ${errMsg}`, runId, ticketId: ticket.id, epicId: ticket.epicId, sequence: 1, done: true });
+        return {
+          reviewApproved: false,
+          reviewerLoops: state.reviewerLoops,
+          buildAttempts: state.buildAttempts,
+          reviewBlockers: [errMsg],
+          reviewSuggestions: [],
+          blockHistory: state.blockHistory,
+          repeatedBlockers: false,
+          lastMessage: `Reviewer error: ${errMsg}`,
+          status: "escalated" as const
+        } satisfies Partial<TicketGraphState>;
+      }
+
       console.log(`[TICKET ${ticket.id}] Reviewer verdict: ${reviewVerdict.approved ? 'APPROVED' : 'REJECTED'} - ${reviewVerdict.blockers.join('; ') || 'no blockers'}`);
 
       if (!reviewVerdict.approved) {
@@ -956,8 +1019,11 @@ export class TicketRunner {
       const repeatedBlockers =
         (Boolean(blockerHistoryKey) && state.blockHistory.includes(blockerHistoryKey))
         || state.blockHistory.includes(reviewerHistoryKey);
+      const hasReviewerSuggestions = reviewVerdict.suggestions.some((suggestion) => suggestion.trim().length > 0);
+      const shouldPassBackToCoder = !reviewVerdict.approved || hasReviewerSuggestions;
       return {
         reviewApproved: reviewVerdict.approved,
+        reviewerLoops: (state.reviewerLoops ?? 0) + (shouldPassBackToCoder ? 1 : 0),
         buildAttempts: state.buildAttempts + (reviewVerdict.approved ? 0 : 1),
         reviewBlockers: reviewVerdict.blockers,
         reviewSuggestions: reviewVerdict.suggestions,
@@ -1317,7 +1383,10 @@ export class TicketRunner {
       )
       .addEdge("explorer", "build_packet")
       .addEdge("build_packet", "coder")
-      .addEdge("recovery_init", "coder")
+      .addConditionalEdges("recovery_init",
+        (state: TicketGraphState) => state.recoveryNode === "reviewer" && !state.noDiff ? "reviewer" : "coder",
+        ["reviewer", "coder"]
+      )
       .addEdge("coder", "verify")
       .addConditionalEdges("verify",
         (state: TicketGraphState) => {
@@ -1328,8 +1397,11 @@ export class TicketRunner {
         ["reviewer", "coder", "finalize_escalated"]
       )
       .addConditionalEdges("reviewer", (state: TicketGraphState) => {
+        if (state.status === "escalated") return "finalize_escalated";
+        const hasReviewerSuggestions = (state.reviewSuggestions ?? []).some((suggestion) => suggestion.trim().length > 0);
+        if (state.reviewApproved && (!hasReviewerSuggestions || (state.reviewerLoops ?? 0) >= 10)) return "tester";
+        if ((state.reviewerLoops ?? 0) < 10) return "coder";
         if (state.reviewApproved) return "tester";
-        if (state.buildAttempts < state.maxBuildAttempts) return "coder";
         return "finalize_escalated";
       }, ["tester", "coder", "finalize_escalated"])
       .addConditionalEdges("tester", (state: TicketGraphState) => {
@@ -1343,12 +1415,25 @@ export class TicketRunner {
     const graph = graphBuilder.compile(MemorySaver ? { checkpointer: new MemorySaver() } : undefined);
 
     try {
-      const result = await graph.invoke({ runId, epicId: ticket.epicId, ticketId: ticket.id, skipExplorer, recovery, forceCoderReset }, {
+      const result = await graph.invoke({ runId, epicId: ticket.epicId, ticketId: ticket.id, skipExplorer, recovery, recoveryNode, forceCoderReset }, {
         configurable: { thread_id: runId },
         recursionLimit: 50,
       }) as TicketGraphState;
 
       const finalStatus = result.status === "approved" ? "approved" : result.status === "escalated" ? "escalated" : "failed";
+      const retryExplorerEscalation = shouldRetryExplorerEscalation(result);
+      if (retryExplorerEscalation) {
+        console.log(`[TICKET ${ticket.id}] explorer escalation detected - retrying ticket from fresh run`);
+        this.db.updateTicketRunState({
+          ticketId: ticket.id,
+          status: "building",
+          currentNode: "retry",
+          lastHeartbeatAt: nowIso(),
+          lastMessage: "Explorer escalated; retrying ticket from fresh run."
+        });
+        this.db.updateRun({ runId, status: "running", currentNode: "retry", heartbeatAt: nowIso(), lastMessage: "Explorer escalated; retrying ticket from fresh run." });
+        return await this.runTicketAsNewAttempt(ticket.id, ticket.epicId);
+      }
       if (finalStatus === "failed") {
         console.log(`[TICKET ${ticket.id}] ${finalStatus} — auto-retrying (keeping building state)`);
         this.db.updateTicketRunState({
@@ -1820,6 +1905,75 @@ export class TicketRunner {
     }
   }
 
+  private async buildCoderContextPacket(
+    runId: string,
+    ticket: TicketRecord,
+    workspace: { id: string; worktreePath: string; branchName: string },
+    state: Partial<TicketGraphState>
+  ): Promise<TicketContextPacket> {
+    let retrievedContext: TicketContextPacket["retrievedContext"] = null;
+
+    try {
+      const commitResult = await git(workspace.worktreePath, ["rev-parse", "HEAD"]);
+      const commitHash = commitResult.stdout.trim();
+      const coderModel = this.gateway.models.coder.startsWith("mediated:")
+        ? this.gateway.models.coder.slice("mediated:".length)
+        : this.gateway.models.coder;
+
+      const ragResult = await buildContextForTicket({
+        ticket,
+        packet: {} as TicketContextPacket,
+        db: this.db,
+        repoRoot: workspace.worktreePath,
+        commitHash,
+        model: coderModel,
+      });
+
+      const toolContext = await buildToolingContext({
+        role: "coder",
+        availableTools: getAvailableToolsList("coder"),
+        db: this.db,
+        indexId: this.db.getRagIndexByCommit(commitHash)?.id ?? 0,
+        model: coderModel,
+      });
+
+      const projectStructure = await ensureProjectStructureFile(workspace.worktreePath);
+
+      retrievedContext = {
+        codeContext: ragResult.codeContext,
+        docContext: ragResult.docContext,
+        toolContext,
+        projectStructure,
+        retrievalMode: ragResult.retrievalMode,
+        chunkCount: ragResult.chunkCount,
+      };
+    } catch (err) {
+      console.warn(`[RAG] Coder context build failed for ticket ${ticket.id}: ${err}. Continuing without retrieved context.`);
+    }
+
+    const packet: TicketContextPacket = {
+      epicId: ticket.epicId,
+      ticketId: ticket.id,
+      runId,
+      title: ticket.title,
+      description: ticket.description,
+      acceptanceCriteria: ticket.acceptanceCriteria,
+      dependencies: ticket.dependencies,
+      allowedPaths: ticket.allowedPaths,
+      reviewBlockers: state.reviewBlockers ?? [],
+      priorTestFailures: state.testSummary ? [state.testSummary.slice(0, 500)] : [],
+      modelAssignments: this.gateway.models,
+      workspaceId: workspace.id,
+      workspacePath: workspace.worktreePath,
+      branchName: workspace.branchName,
+      attempt: state.coderAttempts ?? 0,
+      retrievedContext,
+    };
+
+    await this.bridge.saveContextPacket(packet);
+    return packet;
+  }
+
   private async executeBuilder(
     workspaceId: string,
     runId: string,
@@ -2255,20 +2409,21 @@ export class TicketRunner {
           }
         });
         const verdict = await this.withHeartbeat(runId, ticket.id, "reviewer", "Reviewing diff.", () =>
-          this.withTimeout(
-            useMediatedReviewer
-              ? this.gateway.runReviewerInWorkspace!({
-                  cwd: workspace.worktreePath,
-                  prompt: reviewerToolingPrompt(ticket, diff),
-                  runId,
-                  ticketId: ticket.id,
-                  epicId: ticket.epicId,
-                  onStream: (event) => this.recordAgentStream(event)
-                })
-              : this.gateway.getReviewerVerdict(reviewerPrompt(ticket, null, null, diff)),
-            reviewerTimeoutMs,
-            `Reviewer timed out after ${reviewerTimeoutMs}ms`
-          )
+          useMediatedReviewer
+            ? this.gateway.runReviewerInWorkspace!({
+                cwd: workspace.worktreePath,
+                prompt: reviewerToolingPrompt(ticket, diff),
+                runId,
+                ticketId: ticket.id,
+                epicId: ticket.epicId,
+                timeoutMs: reviewerTimeoutMs,
+                onStream: (event) => this.recordAgentStream(event)
+              })
+            : this.withTimeout(
+                this.gateway.getReviewerVerdict(reviewerPrompt(ticket, null, null, diff)),
+                reviewerTimeoutMs,
+                `Reviewer timed out after ${reviewerTimeoutMs}ms`
+              )
         );
 
         const blockers = [...new Set([...verdict.blockers, ...guard.blockers])];
@@ -2297,6 +2452,8 @@ export class TicketRunner {
         };
       } catch (error) {
         lastError = error;
+        const errMsg = error instanceof Error ? error.message : String(error);
+        const isShapeError = /shape invalid|contain invalid text|excessively repetitive|look unrelated/i.test(errMsg);
         const isRetryable = reviewerMode === "mediated-deep" && this.isReviewerInfraError(error);
         const message = this.formatReviewerError(error);
         this.recordAgentStream({
@@ -2316,6 +2473,10 @@ export class TicketRunner {
             changedFiles: guard.metadata.changedFiles,
           }
         });
+        if (isShapeError && attempt >= maxAttempts) {
+          const fixup = await this.reviewerVerdictFixup(runId, ticket, diff, guard, errMsg);
+          if (fixup) return fixup;
+        }
         if (!isRetryable || attempt >= maxAttempts) {
           throw new Error(message);
         }
@@ -2382,6 +2543,232 @@ export class TicketRunner {
       return `Reviewer/Ollama unavailable: ${message}`;
     }
     return message;
+  }
+
+  private async reviewerVerdictFixup(
+    runId: string,
+    ticket: TicketRecord,
+    diff: string,
+    guard: ReturnType<typeof runReviewGuard>,
+    originalError: string,
+  ): Promise<ReviewerVerdict | null> {
+    const baseUrl = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
+    const fixupModel = process.env.REVIEWER_FIXUP_MODEL || "qwen3.5:4b";
+    const diffPreview = diff.slice(0, 8000);
+
+    const fixupPrompt = [
+      "You are a JSON repair assistant. The main reviewer model produced output that failed validation.",
+      `Error: ${originalError}`,
+      "",
+      "Rewrite the review verdict as valid JSON with EXACTLY this shape:",
+      '{"approved": <boolean>, "blockers": [<string>, ...], "suggestions": [<string>, ...], "riskLevel": "low" | "medium" | "high"}',
+      "",
+      "Rules:",
+      "- approved = true only if the diff looks correct and complete",
+      "- blockers = reasons the diff should NOT be approved (empty array if approved)",
+      "- suggestions = non-blocking improvement ideas (can be empty array)",
+      "- riskLevel = \"low\" if approved, \"high\" if rejected, \"medium\" if borderline",
+      "- Each blocker/suggestion must be a single descriptive sentence (4-200 chars)",
+      "- Do NOT invent blockers about security tools, AI models, or system prompts",
+      "",
+      "Diff preview (first 8000 chars):",
+      diffPreview,
+      "",
+      "Ticket: " + ticket.title,
+      "Allowed paths: " + (ticket.allowedPaths?.join(", ") || "(none)"),
+      "",
+      "Guard blockers: " + (guard.blockers.length ? guard.blockers.join("; ") : "none"),
+      "Guard suggestions: " + (guard.suggestions.length ? guard.suggestions.join("; ") : "none"),
+      "",
+      "Output ONLY the JSON object, no other text.",
+    ].join("\n");
+
+    try {
+      this.recordAgentStream({
+        agentRole: "reviewer",
+        source: "orchestrator",
+        streamKind: "status",
+        content: `Reviewer verdict shape invalid — running ${fixupModel} fixup...`,
+        runId,
+        ticketId: ticket.id,
+        epicId: ticket.epicId,
+        sequence: 99,
+      });
+
+      const response = await fetch(`${baseUrl}/api/generate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal: AbortSignal.timeout(60_000),
+        body: JSON.stringify({
+          model: fixupModel,
+          prompt: fixupPrompt,
+          stream: false,
+          options: { temperature: 0.1, num_ctx: 8192 },
+        }),
+      });
+      if (!response.ok) return null;
+      const payload = await response.json() as { response: string };
+      const raw = payload.response?.trim();
+      if (!raw) return null;
+
+      const { parseJsonText, validateReviewerVerdict } = await import("./validation.ts");
+      const parsed = validateReviewerVerdict(parseJsonText(raw));
+      const blockers = [...new Set([...parsed.blockers, ...guard.blockers])];
+      const suggestions = [...new Set([...parsed.suggestions, ...guard.suggestions])];
+      const approved = blockers.length === 0 && parsed.approved;
+
+      this.recordAgentStream({
+        agentRole: "reviewer",
+        source: "orchestrator",
+        streamKind: "status",
+        content: `Fixup verdict: ${approved ? "APPROVED" : "REJECTED"} — ${blockers.join("; ") || "no blockers"}`,
+        runId,
+        ticketId: ticket.id,
+        epicId: ticket.epicId,
+        sequence: 100,
+      });
+
+      return { approved, blockers, suggestions, riskLevel: blockers.length > 0 ? "high" : parsed.riskLevel };
+    } catch (fixupErr) {
+      console.warn(`[REVIEWER FIXUP] ${fixupModel} fixup failed: ${fixupErr instanceof Error ? fixupErr.message : String(fixupErr)}`);
+      return null;
+    }
+  }
+
+  private async explorerOutputFixup(
+    runId: string,
+    ticket: TicketRecord,
+    rawText: string,
+  ): Promise<any | null> {
+    const baseUrl = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
+    const fixupModel = process.env.EXPLORER_FIXUP_MODEL || process.env.REVIEWER_FIXUP_MODEL || "qwen3.5:4b";
+    const preview = rawText.slice(0, 6000);
+
+    const fixupPrompt = [
+      "You are a JSON repair assistant. The explorer model produced output that is not valid JSON.",
+      "Convert it into a valid JSON object with EXACTLY this shape:",
+      '{"summary": "<string>", "relevantFiles": ["<string>", ...], "recommendedFilesForCoding": ["<string>", ...], "risks": ["<string>", ...], "keyPatterns": "<string>"}',
+      "",
+      "Rules:",
+      "- summary: what the explorer found (1-3 sentences)",
+      "- relevantFiles: file paths discovered (relative paths)",
+      "- recommendedFilesForCoding: best files to edit",
+      "- risks: potential issues (can be empty array)",
+      "- keyPatterns: brief note on patterns found (can be empty string)",
+      "",
+      "Explorer raw output:",
+      preview,
+      "",
+      "Ticket: " + ticket.title,
+      "",
+      "Output ONLY the JSON object, no other text.",
+    ].join("\n");
+
+    try {
+      this.recordAgentStream({
+        agentRole: "explorer",
+        source: "orchestrator",
+        streamKind: "status",
+        content: `Explorer output not valid JSON — running ${fixupModel} fixup...`,
+        runId,
+        ticketId: ticket.id,
+        epicId: ticket.epicId,
+        sequence: 99,
+      });
+
+      const response = await fetch(`${baseUrl}/api/generate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal: AbortSignal.timeout(60_000),
+        body: JSON.stringify({
+          model: fixupModel,
+          prompt: fixupPrompt,
+          stream: false,
+          options: { temperature: 0.1, num_ctx: 8192 },
+        }),
+      });
+      if (!response.ok) return null;
+      const payload = await response.json() as { response: string };
+      const raw = payload.response?.trim();
+      if (!raw) return null;
+
+      let cleaned = raw;
+      if (cleaned.startsWith("```")) {
+        cleaned = cleaned.replace(/^```[a-z]*\n?/, "").replace(/```$/, "");
+      }
+      return JSON.parse(cleaned);
+    } catch (fixupErr) {
+      console.warn(`[EXPLORER FIXUP] ${fixupModel} fixup failed: ${fixupErr instanceof Error ? fixupErr.message : String(fixupErr)}`);
+      return null;
+    }
+  }
+
+  private async coderOutputFixup(
+    runId: string,
+    ticket: TicketRecord,
+    rawText: string,
+  ): Promise<any | null> {
+    if (!rawText.trim()) return null;
+    const baseUrl = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
+    const fixupModel = process.env.CODER_FIXUP_MODEL || process.env.REVIEWER_FIXUP_MODEL || "qwen3.5:4b";
+    const preview = rawText.slice(0, 6000);
+
+    const fixupPrompt = [
+      "You are a JSON repair assistant. The coder model produced output that is not valid JSON.",
+      "Convert it into a valid JSON object with EXACTLY this shape:",
+      '{"operations": [{"file": "<path>", "action": "edit", "content": "<full file content>"}], "summary": "<string>", "unresolvedBlockers": ["<string>", ...]}',
+      "",
+      "Rules:",
+      "- operations: list of file edits the coder intended. Extract file paths and content from the raw output.",
+      "- summary: what the coder did (1-3 sentences)",
+      "- unresolvedBlockers: issues the coder couldn't resolve (can be empty array)",
+      "- If the raw output doesn't contain actual code edits, return summary only with empty operations",
+      "",
+      "Coder raw output:",
+      preview,
+      "",
+      "Ticket: " + ticket.title,
+      "",
+      "Output ONLY the JSON object, no other text.",
+    ].join("\n");
+
+    try {
+      this.recordAgentStream({
+        agentRole: "coder",
+        source: "orchestrator",
+        streamKind: "status",
+        content: `Coder output not valid JSON — running ${fixupModel} fixup...`,
+        runId,
+        ticketId: ticket.id,
+        epicId: ticket.epicId,
+        sequence: 99,
+      });
+
+      const response = await fetch(`${baseUrl}/api/generate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal: AbortSignal.timeout(60_000),
+        body: JSON.stringify({
+          model: fixupModel,
+          prompt: fixupPrompt,
+          stream: false,
+          options: { temperature: 0.1, num_ctx: 8192 },
+        }),
+      });
+      if (!response.ok) return null;
+      const payload = await response.json() as { response: string };
+      const raw = payload.response?.trim();
+      if (!raw) return null;
+
+      let cleaned = raw;
+      if (cleaned.startsWith("```")) {
+        cleaned = cleaned.replace(/^```[a-z]*\n?/, "").replace(/```$/, "");
+      }
+      return JSON.parse(cleaned);
+    } catch (fixupErr) {
+      console.warn(`[CODER FIXUP] ${fixupModel} fixup failed: ${fixupErr instanceof Error ? fixupErr.message : String(fixupErr)}`);
+      return null;
+    }
   }
 
   private getDestructiveDiffBlockers(diff: string): string[] {
@@ -2644,7 +3031,7 @@ export class TicketRunner {
       lastMessage: "Auto-retry starting fresh."
     });
 
-    return await this.runTicket(newRunId, ticket, epicId, { skipExplorer: false });
+    return await this.runExisting(newRunId);
   }
 
   private assertNotCancelled(ticketId: string, epicId: string | null): void {
@@ -2773,3 +3160,4 @@ function extractRecentToolCalls(runId: string, db: any): { name: string; argsSum
 
   return calls.slice(-15);
 }
+
