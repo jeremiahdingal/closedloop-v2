@@ -129,6 +129,36 @@ export class LifecycleService {
     return summary;
   }
 
+  async redecodeEpic(epicId: string): Promise<{ clearedTicketCount: number; clearedEpicRunCount: number }> {
+    const epic = this.db.getEpic(epicId);
+    if (!epic) throw new Error(`Epic not found: ${epicId}`);
+
+    const tickets = this.db.listTickets(epic.id);
+    for (const ticket of tickets) {
+      if (this.db.getTicket(ticket.id)) {
+        await this.deleteTicket(ticket.id);
+      }
+    }
+
+    const epicRuns = this.db.listRunsForEpic(epic.id).filter((run) => !run.ticketId);
+    await this.removeArtifactsForRuns(epicRuns);
+
+    this.db.transaction(() => {
+      for (const run of epicRuns) {
+        this.db.deleteEventsForRun(run.id);
+        this.db.deleteToolInvocationsForRun(run.id);
+        this.db.deleteArtifactsForRun(run.id);
+        this.db.deleteRun(run.id);
+      }
+      this.deleteScopedJobs((payload) => payload.epicId === epic.id);
+      this.db.deleteEventsForEpic(epic.id);
+      this.db.updateEpicPausedFromStatus(epic.id, null);
+      this.db.updateEpicStatus(epic.id, "planning");
+    });
+
+    return { clearedTicketCount: tickets.length, clearedEpicRunCount: epicRuns.length };
+  }
+
   isTicketCancelled(ticketId: string): boolean {
     const ticket = this.db.getTicket(ticketId);
     return !ticket || ticket.status === "cancelled";
@@ -137,6 +167,75 @@ export class LifecycleService {
   isEpicCancelled(epicId: string): boolean {
     const epic = this.db.getEpic(epicId);
     return !epic || epic.status === "cancelled";
+  }
+
+  isEpicPaused(epicId: string): boolean {
+    const epic = this.db.getEpic(epicId);
+    return epic?.status === "paused";
+  }
+
+  async pauseEpic(epicId: string): Promise<void> {
+    const epic = this.db.getEpic(epicId);
+    if (!epic) throw new Error(`Epic not found: ${epicId}`);
+    if (epic.status === "paused") throw new Error("Epic is already paused");
+    if (["cancelled", "done", "failed"].includes(epic.status)) throw new Error(`Cannot pause epic in ${epic.status} status`);
+
+    const previousStatus = epic.status;
+
+    this.db.updateEpicPausedFromStatus(epicId, previousStatus);
+    this.db.updateEpicStatus(epicId, "paused");
+
+    const tickets = this.db.listTickets(epicId);
+    for (const ticket of tickets) {
+      const runs = this.db.listRunsForTicket(ticket.id);
+      const activeRuns = runs.filter(r => r.status === "queued" || r.status === "running" || r.status === "waiting");
+      for (const run of activeRuns) {
+        this.db.updateRun({
+          runId: run.id, status: "cancelled", currentNode: "paused",
+          heartbeatAt: nowIso(), lastMessage: "Epic paused.", errorText: "Paused by user."
+        });
+      }
+      if (["building", "reviewing", "testing"].includes(ticket.status)) {
+        this.db.updateTicketRunState({
+          ticketId: ticket.id, status: "queued", currentRunId: null, currentNode: null,
+          lastHeartbeatAt: nowIso(), lastMessage: "Paused by user. Reset to queued."
+        });
+      }
+    }
+
+    const epicRuns = this.db.listRunsForEpic(epicId).filter(r => !r.ticketId);
+    for (const run of epicRuns) {
+      if (run.status === "queued" || run.status === "running" || run.status === "waiting") {
+        this.db.updateRun({
+          runId: run.id, status: "cancelled", currentNode: "paused",
+          heartbeatAt: nowIso(), lastMessage: "Epic paused.", errorText: "Paused by user."
+        });
+      }
+    }
+
+    this.deleteScopedJobs((payload) => payload.epicId === epicId);
+
+    this.db.recordEvent({
+      aggregateType: "epic", aggregateId: epicId, kind: "epic_paused",
+      message: "Epic paused by user.", payload: { epicId, previousStatus }
+    });
+  }
+
+  async resumeEpic(epicId: string): Promise<string> {
+    const epic = this.db.getEpic(epicId);
+    if (!epic) throw new Error(`Epic not found: ${epicId}`);
+    if (epic.status !== "paused") throw new Error(`Epic is not paused (status: ${epic.status})`);
+
+    const targetStatus = epic.pausedFromStatus || (this.db.listTickets(epicId).length > 0 ? "executing" : "planning");
+    this.db.updateEpicStatus(epicId, targetStatus);
+    this.db.updateEpicPausedFromStatus(epicId, null);
+
+    this.db.recordEvent({
+      aggregateType: "epic", aggregateId: epicId, kind: "epic_resumed",
+      message: `Epic resumed to ${targetStatus}.`, payload: { epicId, targetStatus }
+    });
+
+    return targetStatus;
   }
 
   private async cancelTicketRecord(ticket: TicketRecord): Promise<CleanupSummary> {

@@ -8,7 +8,7 @@ export type Json =
 
 export type RunStatus = "queued" | "running" | "waiting" | "succeeded" | "failed" | "escalated" | "cancelled";
 export type TicketStatus = "queued" | "building" | "reviewing" | "testing" | "approved" | "escalated" | "failed" | "cancelled";
-export type EpicStatus = "planning" | "executing" | "reviewing" | "done" | "failed" | "cancelled";
+export type EpicStatus = "planning" | "executing" | "reviewing" | "done" | "failed" | "cancelled" | "paused";
 
 export type AgentRole =
   | "epicDecoder"
@@ -30,6 +30,7 @@ export type EpicRecord = {
   targetDir: string;
   targetBranch: string | null;
   status: EpicStatus;
+  pausedFromStatus: EpicStatus | null;
   scheduledDate: string | null;
   assetPaths: string[];
   createdAt: string;

@@ -39,6 +39,8 @@ import { DirectChatModal } from "./components/DirectChatModal.tsx";
 import { GameModal } from "./components/GameModal.tsx";
 import { OllamaPsPanel } from "./components/OllamaPsPanel.tsx";
 
+const TICKET_MODAL_EVENT_LIMIT = 500;
+
 export function App() {
   const [data, setData] = useState<Dashboard>({ epics: [], tickets: [], runs: [], agentEvents: [] });
   const [modelsConfig, setModelsConfig] = useState<AgentModelsConfig>({});
@@ -212,10 +214,10 @@ export function App() {
       setSelectedTicketEvents((current) => {
         const selected = selectedTicketRef.current;
         if (!selected) return current;
-        if (row.ticket_id !== selected.id) return current;
+        if (row.ticket_id !== selected.id && row.run_id !== selected.currentRunId) return current;
         const next = [...current, row];
         const deduped = Array.from(new Map(next.map((item) => [item.id, item])).values());
-        return deduped.slice(-3000);
+        return deduped.slice(-TICKET_MODAL_EVENT_LIMIT);
       });
       const role = normalizeAgentRole(row.payload?.agentRole);
       setLastEventTime((prev) => new Map(prev).set(role, Date.now()));
@@ -230,9 +232,12 @@ export function App() {
     }
 
     let cancelled = false;
-    const params = new URLSearchParams({ ticketId: selectedTicket.id, limit: "3000" });
+    const params = new URLSearchParams({ limit: String(TICKET_MODAL_EVENT_LIMIT) });
+    if (selectedTicket.currentRunId) {
+      params.set("runId", selectedTicket.currentRunId);
+    }
 
-    void fetchJson<AgentEvent[]>(`/api/agent-events?${params.toString()}`)
+    void fetchJson<AgentEvent[]>(`/api/tickets/${encodeURIComponent(selectedTicket.id)}/events?${params.toString()}`)
       .then((events) => {
         if (!cancelled) setSelectedTicketEvents(events);
       })
@@ -243,7 +248,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedTicket]);
+  }, [selectedTicket?.id, selectedTicket?.currentRunId]);
 
   const isAgentActive = useMemo(() => {
     const now = Date.now();

@@ -21,6 +21,7 @@ import { buildToolingContext } from "../rag/context-builder.ts";
 import { getAvailableToolsList } from "../mediated-agent-harness/tools.ts";
 import { EventEmitter } from "node:events";
 import type { ChatMessage } from "../mediated-agent-harness/types.ts";
+import { getOllamaPsSnapshot } from "./ollama-ps.ts";
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
@@ -502,6 +503,8 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
   ],
   reviewer: [
+    { id: "mediated:batiai/qwen3.6-27b:iq3", label: "Mediated (BatiAI Qwen3.6-27B iq3)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:batiai/qwen3.6-35b:iq3", label: "Mediated (BatiAI Qwen3.6-35B iq3)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3.5:9b", label: "Mediated (qwen3.5:9b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:gemma4:e4b", label: "Mediated (gemma4:e4b)", description: "Local tool execution via Ollama + harness" },
@@ -550,6 +553,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3.5:9b", label: "Mediated (qwen3.5:9b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:vladimirgav/qwen3.6-27b-16gb-vram-uncensored", label: "Mediated (Qwen3.6-27B Uncensored)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:batiai/qwen3.6-35b:iq3", label: "Mediated (BatiAI Qwen3.6-35B iq3)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:batiai/qwen3.6-27b:iq3", label: "Mediated (BatiAI Qwen3.6-27B iq3)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:isotnek/qwen3.6-27b-batiai-iq3", label: "Mediated (Isotnek Qwen3.6-27B iq3)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:ibm/granite4.1:30b-q3_K_M", label: "Mediated (Granite 4.1 30B)", description: "Local tool execution via Ollama + harness" },
@@ -791,6 +795,18 @@ async function main() {
           newest: !url.searchParams.get("afterId")
         }));
       }
+      const ticketEventsMatch = /^\/api\/tickets\/([^/]+)\/events$/.exec(url.pathname);
+      if (ticketEventsMatch && req.method === "GET") {
+        const ticketId = decodeURIComponent(ticketEventsMatch[1]);
+        const requestedLimit = Number(url.searchParams.get("limit") || 500);
+        const limit = Number.isFinite(requestedLimit)
+          ? Math.max(1, Math.min(1000, requestedLimit))
+          : 500;
+        return json(res, 200, db.listAgentEventsForTicket(ticketId, {
+          runId: url.searchParams.get("runId") || undefined,
+          limit,
+        }));
+      }
       if (url.pathname === "/api/agent-stream" && req.method === "GET") {
         res.writeHead(200, {
           "content-type": "text/event-stream",
@@ -882,6 +898,30 @@ async function main() {
         const summary = await lifecycle.cancelEpic(decodeURIComponent(cancelEpicMatch[1]));
         return json(res, 200, { ok: true, ...summary });
       }
+      const pauseEpicMatch = /^\/api\/epics\/([^/]+)\/pause$/.exec(url.pathname);
+      if (pauseEpicMatch && req.method === "POST") {
+        const epicId = decodeURIComponent(pauseEpicMatch[1]);
+        const epic = db.getEpic(epicId);
+        if (!epic) return json(res, 404, { error: "epic_not_found" });
+        if (epic.status === "paused") return json(res, 409, { error: "already_paused" });
+        if (["done", "failed", "cancelled"].includes(epic.status)) {
+          return json(res, 409, { error: "cannot_pause", message: `Cannot pause epic in ${epic.status} status.` });
+        }
+        await lifecycle.pauseEpic(epicId);
+        return json(res, 200, { ok: true, epicId });
+      }
+      const resumeEpicMatch = /^\/api\/epics\/([^/]+)\/resume$/.exec(url.pathname);
+      if (resumeEpicMatch && req.method === "POST") {
+        const epicId = decodeURIComponent(resumeEpicMatch[1]);
+        const epic = db.getEpic(epicId);
+        if (!epic) return json(res, 404, { error: "epic_not_found" });
+        if (epic.status !== "paused") {
+          return json(res, 409, { error: "not_paused", message: `Epic is not paused (status: ${epic.status}).` });
+        }
+        const targetStatus = await lifecycle.resumeEpic(epicId);
+        const runId = await goalRunner.enqueueGoal(epicId);
+        return json(res, 200, { ok: true, epicId, runId, targetStatus });
+      }
       const doneEpicMatch = /^\/api\/epics\/([^/]+)\/done$/.exec(url.pathname);
       if (doneEpicMatch && req.method === "POST") {
         const id = decodeURIComponent(doneEpicMatch[1]);
@@ -939,6 +979,27 @@ async function main() {
         if (!epic) return json(res, 404, { error: "epic_not_found" });
         const runId = await goalRunner.enqueueManualPlayLoop(epicId);
         return json(res, 200, { ok: true, epicId, runId });
+      }
+      const redecodeEpicMatch = /^\/api\/epics\/([^/]+)\/redecode$/.exec(url.pathname);
+      if (redecodeEpicMatch && req.method === "POST") {
+        const epicId = decodeURIComponent(redecodeEpicMatch[1]);
+        const epic = db.getEpic(epicId);
+        if (!epic) return json(res, 404, { error: "epic_not_found" });
+
+        const resetSummary = await lifecycle.redecodeEpic(epicId);
+        const runId = await goalRunner.enqueueGoal(epicId);
+
+        db.recordEvent({
+          aggregateType: "epic",
+          aggregateId: epicId,
+          runId,
+          ticketId: null,
+          kind: "epic_redecoded",
+          message: "Epic cleared and queued for a fresh decode.",
+          payload: { epicId, runId, ...resetSummary }
+        });
+
+        return json(res, 200, { ok: true, epicId, runId, ...resetSummary });
       }
       const retryEpicMatch = /^\/api\/epics\/([^/]+)\/retry$/.exec(url.pathname);
       if (retryEpicMatch && req.method === "POST") {
@@ -1192,7 +1253,11 @@ async function main() {
           lastHeartbeatAt: timestamp,
           lastMessage: reason
         });
-        db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id, recovery: true });
+        if (node.includes("review") || node === "error") {
+          db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id, recovery: true, recoveryNode: "reviewer" });
+        } else {
+          db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id, recovery: true });
+        }
         db.recordEvent({
           aggregateType: "ticket",
           aggregateId: ticket.id,
@@ -1330,6 +1395,9 @@ async function main() {
         if (!model) return json(res, 400, { error: "missing_model" });
         updateAgentModel(role, model);
         return json(res, 200, { ok: true, models: getAgentModelsConfig() });
+      }
+      if (url.pathname === "/api/ollama/ps" && req.method === "GET") {
+        return json(res, 200, getOllamaPsSnapshot());
       }
       if (url.pathname === "/api/config" && req.method === "PUT") {
         const body = await readBody(req);

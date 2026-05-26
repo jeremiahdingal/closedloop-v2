@@ -71,8 +71,8 @@ export interface MediatedHarnessConfig {
   baseURL?: string;
   /** API key for Anthropic-compatible backends */
   apiKey?: string;
-  /** "ollama" (default) or "anthropic" for Anthropic-compatible endpoints */
-  apiBackend?: "ollama" | "anthropic";
+  /** "ollama" (default) or "anthropic" or "openrouter" for OpenRouter-compatible endpoints */
+  apiBackend?: "ollama" | "anthropic" | "openrouter";
   model: string;
   cwd: string;
   role?: string;
@@ -84,6 +84,7 @@ export interface MediatedHarnessConfig {
   temperature?: number;
   topP?: number;
   topK?: number;
+  numCtx?: number;
   braveApiKey?: string;
   onEvent?: (event: MediatedHarnessEvent) => void;
 }
@@ -91,6 +92,7 @@ export interface MediatedHarnessConfig {
 export interface ToolExecutionContext {
   cwd: string;
   workspaceId: string;
+  readTrackingKey?: string;
   allowedPaths: string[];
   availableCommands?: string[];
   braveApiKey?: string;

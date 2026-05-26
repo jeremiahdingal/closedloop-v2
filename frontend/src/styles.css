@@ -364,6 +364,70 @@ body::after {
   gap: 0;
 }
 
+.ollama-tv {
+  min-width: 0;
+}
+
+.ollama-model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  width: 100%;
+}
+
+.ollama-model-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  width: 100%;
+}
+
+.ollama-model-title {
+  padding-left: 0.25rem;
+}
+
+.ollama-model-name {
+  font-family: 'VT323', monospace;
+  font-size: 1.15rem;
+  color: #222;
+  letter-spacing: 0.03em;
+}
+
+.ollama-model-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.75rem;
+  width: 100%;
+}
+
+.ollama-metric-tv {
+  min-width: 0;
+}
+
+.ollama-metric-screen {
+  min-height: 5.4rem;
+  align-items: center;
+  justify-content: center;
+  padding: 0.35rem 0.9rem 0.05rem;
+  text-align: center;
+  gap: 0.1rem;
+}
+
+.ollama-metric-screen .crt-label {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.5rem;
+  z-index: 2;
+}
+
+.ollama-metric-value {
+  font-size: 1.9rem;
+  width: 100%;
+  text-align: center;
+  margin-top: 0;
+  margin-bottom: 0.1rem;
+}
+
 .crt-screen {
   background: linear-gradient(145deg, #f0f0e8 0%, #e8e8dc 100%);
   border: 3px solid #555;
@@ -380,6 +444,12 @@ body::after {
     inset 0 0 4px rgba(0, 0, 0, 0.15),
     2px 2px 8px rgba(0, 0, 0, 0.2);
   overflow: hidden;
+}
+
+.ollama-screen {
+  align-items: flex-start;
+  justify-content: flex-start;
+  min-height: 9rem;
 }
 
 .crt-screen::before {
@@ -427,6 +497,42 @@ body::after {
   z-index: 1;
   text-shadow: 0 0 2px rgba(0, 0, 0, 0.1);
   line-height: 1;
+}
+
+.ollama-size {
+  font-size: 1.8rem;
+  align-self: center;
+}
+
+.ollama-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.66rem;
+  color: #444;
+}
+
+.ollama-meta strong {
+  color: #222;
+  font-size: 0.62rem;
+}
+
+.ollama-error {
+  position: relative;
+  z-index: 1;
+  align-self: center;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.7rem;
+  color: #8b0000;
+  text-align: center;
+}
+
+.mission-status-panel {
+  display: none;
 }
 
 .crt-body {
@@ -1565,6 +1671,13 @@ body::after {
   max-width: 100%;
   word-break: break-all;
   white-space: pre-wrap;
+}
+
+.tev-text-content.markdown-body pre code {
+  background: none;
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
 }
 
 /* Tool result body */
@@ -2782,6 +2895,7 @@ body::after {
 .pill-failed, .status-failed     { color: #ff0000; border-color: #ff0000; background: #fff; }
 .pill-running, .status-running    { color: #ff8c00; border-color: #ff8c00; background: #fff; }
 .pill-cancelled, .status-cancelled { color: #6a1b9a; border-color: #6a1b9a; background: #fff; }
+.pill-paused, .status-paused { color: #cc8800; border-color: #cc8800; background: #fff8e0; }
 .pill-assistant { color: var(--win-blue); border-color: var(--win-blue); background: #fff; }
 .pill-status    { color: var(--win-gray-dark); border-color: var(--win-gray-dark); background: #fff; }
 .pill-thinking  { color: #800080; border-color: #800080; background: #fff; }
@@ -3730,6 +3844,10 @@ body::after {
   .agent-section-box.test-section, .agent-section-box.build-section { background: transparent; border: none; padding: 0; }
   .agent-section-box .agent-stats-grid { display: flex; flex-direction: column; gap: 0.35rem; }
   .agent-section-box .agent-stat-box { width: 100% !important; max-width: 100% !important; flex: none !important; padding: 0.7rem; min-height: 70px; display: flex; flex-direction: row; align-items: center; justify-content: flex-start; gap: 0.75rem; }
+  .ollama-model-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem; }
+  .ollama-model-name { font-size: 1rem; }
+  .ollama-metric-screen { min-height: 4.9rem; padding: 0.3rem 0.65rem 0.03rem; }
+  .ollama-metric-value { font-size: 1.55rem; }
 
   /* Ticket Modal Mobile Fix */
   .ticket-modal {
@@ -4299,6 +4417,7 @@ body::after {
     max-width: 100%;
     max-height: 100vh;
   }
+  .ollama-model-metrics { grid-template-columns: repeat(1, minmax(0, 1fr)); }
   .tetris-board {
     grid-template-columns: repeat(10, 18px);
     grid-template-rows: repeat(20, 18px);
@@ -4586,5 +4705,206 @@ body::after {
   font-size: 0.85rem;
   color: var(--win-gray-dark);
   font-family: 'VT323', monospace;
+}
+
+/* ── CLI Terminal (inside AgentModal) ── */
+.cli-terminal {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  margin: 4px;
+}
+
+.cli-terminal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.25rem 0.5rem;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.7rem;
+  border: 2px solid;
+  border-color: var(--win-gray-dark) var(--win-gray-light) var(--win-gray-light) var(--win-gray-darker);
+  border-bottom: none;
+}
+
+.cli-terminal-title {
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.cli-terminal-status {
+  font-size: 0.6rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.cli-status-idle { background: #333; color: #999; }
+.cli-status-running { background: #0a3d0a; color: #4f4; }
+.cli-status-completed { background: #003060; color: #6af; }
+.cli-status-stalled { background: #402000; color: #fa0; }
+
+.cli-terminal-body {
+  background: #0d0d1a;
+  color: #d4d4d4;
+  font-family: 'Fira Code', 'Cascadia Code', Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  padding: 0.5rem;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  border: 2px solid;
+  border-color: var(--win-gray-dark) var(--win-gray-light) var(--win-gray-light) var(--win-gray-darker);
+}
+
+.cli-line {
+  padding: 0.15rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.cli-line-empty {
+  color: #555;
+  font-style: italic;
+  text-align: center;
+  padding: 2rem;
+  border: none;
+}
+
+.cli-line-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.cli-prompt-dollar {
+  color: #4ec94e;
+  font-weight: 700;
+  margin-right: 0.3rem;
+}
+
+.cli-tool-name {
+  color: #4ec94e;
+  font-weight: 600;
+}
+
+.cli-tool-args {
+  color: #a0a0a0;
+  font-size: 0.68rem;
+  padding-left: 1rem;
+  margin: 0;
+  white-space: pre-wrap;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.cli-line-tool-result {
+  border-left: 2px solid #4ec94e;
+  padding: 0.2rem 0.4rem;
+  margin: 0.15rem 0 0.15rem 1rem;
+  background: rgba(78, 201, 78, 0.04);
+}
+
+.cli-result-name {
+  color: #4ec94e;
+  font-weight: 600;
+  font-size: 0.68rem;
+  opacity: 0.7;
+}
+
+.cli-result-content {
+  margin: 0;
+  font-size: 0.72rem;
+  color: #c0c0c0;
+  white-space: pre-wrap;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.cli-expand-btn {
+  background: none;
+  border: none;
+  color: #6af;
+  cursor: pointer;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.65rem;
+  padding: 0;
+  margin-top: 0.15rem;
+}
+.cli-expand-btn:hover { text-decoration: underline; }
+
+.cli-line-thinking {
+  color: #666;
+}
+
+.cli-thinking-toggle {
+  background: none;
+  border: none;
+  color: #777;
+  cursor: pointer;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.68rem;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0;
+}
+.cli-thinking-toggle:hover { color: #999; text-decoration: underline; }
+
+.cli-thinking-content {
+  color: #666;
+  padding: 0.2rem 0 0.2rem 1rem;
+  border-left: 2px solid #333;
+  margin: 0.15rem 0;
+  white-space: pre-wrap;
+  max-height: 300px;
+  overflow-y: auto;
+  font-size: 0.7rem;
+}
+
+.cli-line-text {
+  color: #e0e0e0;
+}
+
+.cli-line-error {
+  color: #ff6b6b;
+}
+
+.cli-line-system {
+  color: #555;
+  font-size: 0.68rem;
+}
+
+.cli-line-prompt-block {
+  color: #555;
+  font-size: 0.65rem;
+  padding: 0.3rem;
+  margin: 0.3rem 0;
+  border: 1px solid #333;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.cli-line-result {
+  color: #6af;
+  font-weight: 700;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  margin-top: 0.3rem;
+  padding-top: 0.3rem;
+}
+
+.cli-line-api-retry {
+  color: #fa0;
+  font-size: 0.68rem;
+}
+
+.cli-line-task {
+  color: #a0d0ff;
 }
 

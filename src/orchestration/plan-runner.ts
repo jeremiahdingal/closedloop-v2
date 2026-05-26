@@ -162,7 +162,7 @@ export function extractPlanFromStream(chunks: string[]): GoalDecomposition | nul
   
   if (!rawJson) return null;
   try {
-    return validateGoalDecomposition(JSON.parse(rawJson));
+    return validateGoalDecomposition(parseJsonText(rawJson));
   } catch {
     return null;
   }

@@ -298,6 +298,45 @@ function summarizeClaudeToolEvent(event: Record<string, unknown>): { kind: "tool
   return null;
 }
 
+type ParsedCliEvent = { summary: string; cliEventType: string; detail?: Record<string, unknown> };
+
+function parseCliSystemEvent(raw: Record<string, unknown>): ParsedCliEvent | null {
+  const type = typeof raw.type === "string" ? raw.type : "";
+  const subtype = typeof raw.subtype === "string" ? raw.subtype : "";
+  if (type === "system" && subtype === "init") {
+    const model = typeof raw.model === "string" ? raw.model : "unknown";
+    const tools = Array.isArray(raw.tools) ? raw.tools : [];
+    return { summary: `Session init | model: ${model} | ${tools.length} tools`, cliEventType: "init", detail: { model, cwd: raw.cwd, toolCount: tools.length } };
+  }
+  if (type === "system" && subtype === "task_started") {
+    const desc = typeof raw.description === "string" ? raw.description : "";
+    return { summary: `▶ ${desc || raw.task_id || "task"}`, cliEventType: "task_started", detail: { taskId: raw.task_id, description: desc } };
+  }
+  if (type === "system" && subtype === "task_progress") {
+    const desc = typeof raw.description === "string" ? raw.description : "";
+    return { summary: desc || `progress (${raw.task_id || "?"})`, cliEventType: "task_progress", detail: { taskId: raw.task_id, description: desc } };
+  }
+  if (type === "system" && subtype === "task_notification") {
+    return { summary: `✓ ${raw.task_id || "?"}: ${raw.status || "done"}`, cliEventType: "task_notification", detail: { taskId: raw.task_id, status: raw.status } };
+  }
+  if (type === "system" && subtype === "task_updated") {
+    return { summary: `Task updated: ${raw.task_id || "?"}`, cliEventType: "task_updated", detail: { taskId: raw.task_id } };
+  }
+  if (type === "system" && subtype === "api_retry") {
+    return { summary: `API retry (attempt ${raw.attempt ?? "?"})`, cliEventType: "api_retry", detail: { attempt: raw.attempt } };
+  }
+  if (type === "result") {
+    const dur = typeof raw.duration_ms === "number" ? ` in ${(raw.duration_ms / 1000).toFixed(1)}s` : "";
+    const text = typeof raw.result === "string" ? String(raw.result).slice(0, 200) : "";
+    return {
+      summary: `${subtype === "success" ? "✓" : "✗"} ${subtype || "done"}${dur}${text ? ": " + text : ""}`,
+      cliEventType: "result",
+      detail: { success: subtype === "success", durationMs: raw.duration_ms, result: text }
+    };
+  }
+  return null;
+}
+
 export function formatZaiFailure(error: unknown): string {
   if (error instanceof ZaiLaunchError) {
     const extra = error.exitCode == null ? "" : ` exitCode=${error.exitCode}`;
@@ -535,8 +574,9 @@ export class ZaiRunner {
     const chunks: string[] = [];
     let sequence = 0;
 
-    const emit = (streamKind: AgentStreamPayload["streamKind"], chunk: string, done = false) => {
+    const emit = (streamKind: AgentStreamPayload["streamKind"], chunk: string, done = false, opts?: { metadata?: Record<string, unknown> }) => {
       if (!chunk && !done) return;
+      const baseMeta = { cwd: input.cwd, command: launch.command, promptLength: launch.info.promptLength, model };
       input.onStream?.({
         agentRole: input.role as AgentStreamPayload["agentRole"],
         source: "orchestrator",
@@ -547,7 +587,7 @@ export class ZaiRunner {
         epicId: input.epicId,
         sequence: sequence++,
         done,
-        metadata: { cwd: input.cwd, command: launch.command, promptLength: launch.info.promptLength, model }
+        metadata: { ...baseMeta, ...(opts?.metadata ?? {}) }
       });
     };
 
@@ -623,7 +663,12 @@ export class ZaiRunner {
               continue;
             }
 
-            emit("status", trimmed);
+            const cliParsed = parseCliSystemEvent(event);
+            if (cliParsed) {
+              emit("status", cliParsed.summary, false, { metadata: { cliEvent: cliParsed.cliEventType, ...cliParsed.detail } });
+            } else {
+              emit("status", trimmed);
+            }
           } catch {
             flushThinking();
             chunks.push(line);

@@ -37,6 +37,7 @@ import { resetExploreModeFiles } from "../mediated-agent-harness/tools.ts";
 import { loadReviewContract, runReviewGuard, type ReviewerMode, type ReviewContractLoadResult } from "./review-guard.ts";
 import { ensureProjectStructureFile } from "./project-structure.ts";
 import { createHash } from "node:crypto";
+import { AgentStreamSessionRegistry } from "./agent-stream-session.ts";
 
 type TicketLoopResult = {
   runId: string;
@@ -104,6 +105,7 @@ export class TicketRunner {
   private readonly builderPlanTimeoutMs = Number(process.env.BUILDER_PLAN_TIMEOUT_MS || 180_000);
   private readonly reviewerTimeoutMs = Number(process.env.REVIEWER_TIMEOUT_MS || 420_000);
   private readonly compareBaseRef = this.normalizeCompareRef(process.env.PR_COMPARE_BASE || "origin/main");
+  private readonly streamSessions = new AgentStreamSessionRegistry();
   private readonly db: AppDatabase;
   private readonly bridge: WorkspaceBridge;
   private readonly gateway: ModelGateway;
@@ -199,14 +201,14 @@ export class TicketRunner {
     return runId;
   }
 
-  async runExisting(runId: string): Promise<TicketLoopResult> {
+  async runExisting(runId: string, options?: { skipExplorer?: boolean }): Promise<TicketLoopResult> {
     if (!this.config.useLangGraph) return this.runExistingLegacy(runId);
     const runtime = await loadLangGraphRuntime();
     if (!runtime) return this.runExistingLegacy(runId);
-    return this.runExistingWithLangGraph(runId, runtime);
+    return this.runExistingWithLangGraph(runId, runtime, options);
   }
 
-  private async runExistingWithLangGraph(runId: string, runtime: LangGraphRuntime): Promise<TicketLoopResult> {
+  private async runExistingWithLangGraph(runId: string, runtime: LangGraphRuntime, options?: { skipExplorer?: boolean }): Promise<TicketLoopResult> {
     const run = this.db.getRun(runId);
     if (!run || !run.ticketId || !run.epicId) throw new Error(`Ticket run not found: ${runId}`);
     const ticket = this.db.getTicket(run.ticketId);
@@ -214,7 +216,7 @@ export class TicketRunner {
     this.assertNotCancelled(ticket.id, ticket.epicId);
 
     // Read skipExplorer from job payload for this run
-    const skipExplorer = this.db.listJobRecords().some(
+    const skipExplorer = options?.skipExplorer === true || this.db.listJobRecords().some(
       (job: any) => job.kind === "run_ticket"
         && (job.payload as any)?.runId === runId
         && (job.payload as any)?.skipExplorer === true
@@ -393,17 +395,20 @@ export class TicketRunner {
           : "";
         const prompt = explorerPrompt(ticket, { reviewBlockers: state.reviewBlockers, priorTestFailures: state.testHistory } as any, seedFiles) + retryNudge;
 
-        const explorerRaw = await this.gateway.runExplorerInWorkspace!({
-          cwd: workspace.worktreePath,
-          prompt,
-          runId, ticketId: ticket.id, epicId: ticket.epicId,
-          onStream: (evt: any) => {
-            evt.runId = runId;
-            evt.ticketId = ticket.id;
-            evt.epicId = ticket.epicId;
-            this.recordAgentStream(evt);
-          }
-        });
+        const explorerStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "explorer");
+        let explorerRaw: string;
+        try {
+          explorerRaw = await this.gateway.runExplorerInWorkspace!({
+            cwd: workspace.worktreePath,
+            prompt,
+            runId,
+            ticketId: ticket.id,
+            epicId: ticket.epicId,
+            onStream: explorerStream.onStream,
+          });
+        } finally {
+          this.endScopedAgentStream(runId, "explorer", explorerStream.sessionId);
+        }
         lastExplorerRaw = explorerRaw;
 
         // Strip markdown code fences if present
@@ -599,23 +604,33 @@ export class TicketRunner {
         this.heartbeat(runId, ticket.id, "coder", "Existing workspace changes detected. Resuming via Hot-Reset prompt.");
         currentCoderPrompt = buildCoderResumePrompt(ticket, initialDiff, state.reviewBlockers ?? [], state.explorerOutput);
       } else {
-        currentCoderPrompt = coderPrompt(ticket, state.explorerOutput, state.canonicalEditPacket.allowedPaths, { blockers: state.reviewBlockers ?? [], suggestions: state.reviewSuggestions ?? [] }, { skipped: state.skipExplorer, reason: "Explorer was skipped by user request." });
+        currentCoderPrompt = coderPrompt(
+          ticket,
+          state.explorerOutput,
+          state.canonicalEditPacket.allowedPaths,
+          { blockers: state.reviewBlockers ?? [], suggestions: state.reviewSuggestions ?? [] },
+          { skipped: state.skipExplorer, reason: "Explorer was skipped by user request." },
+          state.coderContextPacket
+        );
       }
 
       let coderResult;
       while (true) {
         try {
-          coderResult = await activeGateway.runCoderInWorkspace!({
-            cwd: workspace.worktreePath,
-            prompt: currentCoderPrompt,
-            runId, ticketId: ticket.id, epicId: ticket.epicId, skipExplorer: state.skipExplorer,
-            onStream: (evt: any) => {
-              evt.runId = runId;
-              evt.ticketId = ticket.id;
-              evt.epicId = ticket.epicId;
-              this.recordAgentStream(evt);
-            }
-          });
+          const coderStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "coder");
+          try {
+            coderResult = await activeGateway.runCoderInWorkspace!({
+              cwd: workspace.worktreePath,
+              prompt: currentCoderPrompt,
+              runId,
+              ticketId: ticket.id,
+              epicId: ticket.epicId,
+              skipExplorer: state.skipExplorer,
+              onStream: coderStream.onStream,
+            });
+          } finally {
+            this.endScopedAgentStream(runId, "coder", coderStream.sessionId);
+          }
           break; // Success
         } catch (err) {
           const isStall = err instanceof StagnationError || err instanceof LoopTimeoutError;
@@ -1127,6 +1142,7 @@ export class TicketRunner {
             });
           }, 300_000);
         });
+        const testerStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "tester");
         const result = await Promise.race([
           this.withHeartbeat(runId, ticket.id, "tester", "Running tests.", () =>
             this.gateway.runTesterInWorkspace!({
@@ -1135,11 +1151,13 @@ export class TicketRunner {
               runId,
               ticketId: ticket.id,
               epicId: ticket.epicId,
-              onStream: (payload) => this.recordAgentStream(payload)
+              onStream: testerStream.onStream
             })
           ),
           timeoutFallback
-        ]);
+        ]).finally(() => {
+          this.endScopedAgentStream(runId, "tester", testerStream.sessionId);
+        });
         if (timeoutHandle) {
           clearTimeout(timeoutHandle);
         }
@@ -1432,7 +1450,7 @@ export class TicketRunner {
           lastMessage: "Explorer escalated; retrying ticket from fresh run."
         });
         this.db.updateRun({ runId, status: "running", currentNode: "retry", heartbeatAt: nowIso(), lastMessage: "Explorer escalated; retrying ticket from fresh run." });
-        return await this.runTicketAsNewAttempt(ticket.id, ticket.epicId);
+        return await this.runTicketAsNewAttempt(ticket.id, ticket.epicId, { skipExplorer: true });
       }
       if (finalStatus === "failed") {
         console.log(`[TICKET ${ticket.id}] ${finalStatus} — auto-retrying (keeping building state)`);
@@ -1690,6 +1708,7 @@ export class TicketRunner {
           const buildDiffDesc = lastDiff.slice(0, 2000) || "No diff available";
           const ticketGoalDesc = ticket.description || ticket.title || "No ticket description";
 
+          const testerStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "tester");
           const testerResult = await this.withHeartbeat(runId, ticket.id, "tester", "Running tests.", () =>
             this.gateway.runTesterInWorkspace!({
               cwd: workspace.worktreePath,
@@ -1697,9 +1716,11 @@ export class TicketRunner {
               runId,
               ticketId: ticket.id,
               epicId: ticket.epicId,
-              onStream: (payload) => this.recordAgentStream(payload)
+              onStream: testerStream.onStream
             })
-          );
+          ).finally(() => {
+            this.endScopedAgentStream(runId, "tester", testerStream.sessionId);
+          });
           
           testSummary = testerResult.testResults === "PASS" 
             ? `PASS (score: ${testerResult.testNecessityScore}/100)\n${testerResult.testNecessityReason}\n\nTest output:\n${testerResult.testOutput}`
@@ -1998,13 +2019,16 @@ export class TicketRunner {
           epicId: ticket.epicId,
           sequence: 0
         });
+        const builderStream = this.startScopedAgentStream(runId, ticketId, ticket.epicId, "builder");
         const result = await this.gateway.runBuilderInWorkspace({
           cwd: workspace.worktreePath,
           prompt: builderToolingPrompt(ticket, packet),
           runId,
           ticketId,
           epicId: ticket.epicId,
-          onStream: (event) => this.recordAgentStream(event)
+          onStream: builderStream.onStream
+        }).finally(() => {
+          this.endScopedAgentStream(runId, "builder", builderStream.sessionId);
         });
         const lastDiff = await this.bridge.gitDiff(workspace.id);
         const intendedFiles = this.extractChangedFiles(lastDiff);
@@ -2239,6 +2263,31 @@ export class TicketRunner {
     });
   }
 
+  private startScopedAgentStream(
+    runId: string,
+    ticketId: string | null | undefined,
+    epicId: string | null | undefined,
+    agentRole: AgentStreamPayload["agentRole"],
+  ): { sessionId: string; onStream: (event: AgentStreamPayload) => void } {
+    const sessionId = this.streamSessions.begin(runId, agentRole);
+    return {
+      sessionId,
+      onStream: (event: AgentStreamPayload) => {
+        if (!this.streamSessions.isActive(runId, agentRole, sessionId)) return;
+        this.recordAgentStream({
+          ...event,
+          runId,
+          ticketId: ticketId ?? null,
+          epicId: epicId ?? null,
+        });
+      }
+    };
+  }
+
+  private endScopedAgentStream(runId: string, agentRole: AgentStreamPayload["agentRole"], sessionId: string): void {
+    this.streamSessions.end(runId, agentRole, sessionId);
+  }
+
   private heartbeat(runId: string, ticketId: string, node: string, message: string): void {
     const ticket = this.db.getTicket(ticketId);
     this.assertNotCancelled(ticketId, ticket?.epicId ?? null);
@@ -2408,6 +2457,9 @@ export class TicketRunner {
             changedFiles: guard.metadata.changedFiles,
           }
         });
+        const reviewerStream = useMediatedReviewer
+          ? this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "reviewer")
+          : null;
         const verdict = await this.withHeartbeat(runId, ticket.id, "reviewer", "Reviewing diff.", () =>
           useMediatedReviewer
             ? this.gateway.runReviewerInWorkspace!({
@@ -2417,14 +2469,16 @@ export class TicketRunner {
                 ticketId: ticket.id,
                 epicId: ticket.epicId,
                 timeoutMs: reviewerTimeoutMs,
-                onStream: (event) => this.recordAgentStream(event)
+                onStream: reviewerStream!.onStream
               })
             : this.withTimeout(
                 this.gateway.getReviewerVerdict(reviewerPrompt(ticket, null, null, diff)),
                 reviewerTimeoutMs,
                 `Reviewer timed out after ${reviewerTimeoutMs}ms`
               )
-        );
+        ).finally(() => {
+          if (reviewerStream) this.endScopedAgentStream(runId, "reviewer", reviewerStream.sessionId);
+        });
 
         const blockers = [...new Set([...verdict.blockers, ...guard.blockers])];
         const suggestions = [...new Set([...verdict.suggestions, ...guard.suggestions])];
@@ -3003,7 +3057,7 @@ export class TicketRunner {
     return { runId, workspaceId, status: "escalated", lastDiff: "", reviewVerdict: null, testSummary: reason };
   }
 
-  private async runTicketAsNewAttempt(ticketId: string, epicId: string | null): Promise<TicketLoopResult> {
+  private async runTicketAsNewAttempt(ticketId: string, epicId: string | null, options?: { skipExplorer?: boolean }): Promise<TicketLoopResult> {
     const ticket = this.db.getTicket(ticketId);
     if (!ticket) {
       throw new Error(`Ticket ${ticketId} not found for retry`);
@@ -3019,7 +3073,7 @@ export class TicketRunner {
       currentNode: "preparing",
       attempt: 0,
       heartbeatAt: nowIso(),
-      lastMessage: "Auto-retry from fresh.",
+      lastMessage: options?.skipExplorer ? "Auto-retry from fresh (skip explorer)." : "Auto-retry from fresh.",
       errorText: null
     });
     this.db.updateTicketRunState({
@@ -3028,10 +3082,10 @@ export class TicketRunner {
       currentRunId: newRunId,
       currentNode: "preparing",
       lastHeartbeatAt: nowIso(),
-      lastMessage: "Auto-retry starting fresh."
+      lastMessage: options?.skipExplorer ? "Auto-retry starting fresh (skip explorer)." : "Auto-retry starting fresh."
     });
 
-    return await this.runExisting(newRunId);
+    return await this.runExisting(newRunId, { skipExplorer: options?.skipExplorer === true });
   }
 
   private assertNotCancelled(ticketId: string, epicId: string | null): void {

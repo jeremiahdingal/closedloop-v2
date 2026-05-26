@@ -5,6 +5,7 @@ import { AgentEvent, Run, Ticket, TicketDiffResponse } from "../types.ts";
 import {
   diffLineClass,
   fetchJson,
+  getMergedEventKey,
   mergeStreamingEvents,
   normalizeCompareUrl,
   normalizeDisplayedTicketId,
@@ -30,13 +31,7 @@ export function TicketModal(props: {
   if (!props.open) return null;
   const ticketRun =
     props.runs.find((run) => run.id === props.ticket.currentRunId) ?? null;
-  const hasCurrentRunId = Boolean(props.ticket.currentRunId);
-  const rawTicketEvents = props.events.filter(
-    (e) =>
-      e.ticket_id === props.ticket.id ||
-      (hasCurrentRunId && e.run_id === props.ticket.currentRunId)
-  );
-  const ticketEvents = useMemo(() => mergeStreamingEvents(rawTicketEvents), [rawTicketEvents]);
+  const ticketEvents = useMemo(() => mergeStreamingEvents(props.events), [props.events]);
   const feedEndRef = useRef<HTMLDivElement>(null);
   const [ticketDiff, setTicketDiff] = useState<TicketDiffResponse | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
@@ -271,7 +266,9 @@ export function TicketModal(props: {
             </div>
             <div className="ticket-events-feed">
               {ticketEvents.length ? (
-                ticketEvents.map((event) => <AgentEventCard key={event.id} event={event} />)
+                ticketEvents.map((event) => (
+                  <AgentEventCard key={getMergedEventKey(event)} event={event} />
+                ))
               ) : (
                 <p className="no-events">No events yet.</p>
               )}

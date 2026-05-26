@@ -10,21 +10,32 @@ import { chromium, type Browser, type Page, type BrowserContext } from "playwrig
 
 const execFileAsync = promisify(execFile);
 
-// Read-before-write tracking: maps cwd -> Set of file paths read this session
+// Read-before-write tracking: maps run/workspace session key -> Set of normalized file paths read
 const filesReadBySession = new Map<string, Set<string>>();
 
-export function trackFileRead(cwd: string, filePath: string): void {
-  let set = filesReadBySession.get(cwd);
-  if (!set) { set = new Set(); filesReadBySession.set(cwd, set); }
-  set.add(filePath);
+function normalizeTrackedPath(cwd: string, filePath: string): string {
+  const resolved = path.resolve(cwd, filePath);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
-export function hasFileBeenRead(cwd: string, filePath: string): boolean {
-  return filesReadBySession.get(cwd)?.has(filePath) ?? false;
+function resolveReadTrackingKey(trackingKey: string | undefined, cwd: string): string {
+  return trackingKey && trackingKey.trim().length > 0 ? trackingKey : cwd;
 }
 
-export function resetSessionTracking(cwd: string): void {
-  filesReadBySession.delete(cwd);
+export function trackFileRead(trackingKey: string | undefined, cwd: string, filePath: string): void {
+  const key = resolveReadTrackingKey(trackingKey, cwd);
+  let set = filesReadBySession.get(key);
+  if (!set) { set = new Set(); filesReadBySession.set(key, set); }
+  set.add(normalizeTrackedPath(cwd, filePath));
+}
+
+export function hasFileBeenRead(trackingKey: string | undefined, cwd: string, filePath: string): boolean {
+  const key = resolveReadTrackingKey(trackingKey, cwd);
+  return filesReadBySession.get(key)?.has(normalizeTrackedPath(cwd, filePath)) ?? false;
+}
+
+export function resetSessionTracking(trackingKey: string | undefined, cwd?: string): void {
+  filesReadBySession.delete(resolveReadTrackingKey(trackingKey, cwd ?? ""));
 }
 
 // Browser state management
@@ -553,7 +564,7 @@ export const WORKSPACE_TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "read_context_packet",
-      description: "Read the context.json file from the workspace root. Contains ticket context and workspace metadata.",
+      description: "Read the orchestrator context packet for this workspace. The canonical location is .orchestrator/context.json, with context.json supported as a legacy fallback. Do not browse for this file manually.",
       parameters: {
         type: "object",
         properties: {},
@@ -1221,7 +1232,7 @@ async function execReadFile(
     return { callId, name: "read_file", output: `Error: file not found: ${filePath}`, isError: true };
   }
 
-  trackFileRead(ctx.cwd, filePath);
+  trackFileRead(ctx.readTrackingKey, ctx.cwd, filePath);
 
   // Truncate large files
   const maxLen = 50000;
@@ -1265,7 +1276,7 @@ async function execReadFiles(
     if (content === undefined) {
       parts.push(`--- ${fp} ---\n(Error: file not found)`);
     } else {
-      trackFileRead(ctx.cwd, fp);
+      trackFileRead(ctx.readTrackingKey, ctx.cwd, fp);
       const maxLen = 30000;
       const output = content.length > maxLen
         ? content.slice(0, maxLen) + `\n... [truncated]`
@@ -1304,7 +1315,7 @@ async function execWriteFile(
   const targetPath = path.resolve(ctx.cwd, filePath);
   try {
     const st = await stat(targetPath);
-    if (st.isFile() && !hasFileBeenRead(ctx.cwd, filePath)) {
+    if (st.isFile() && !hasFileBeenRead(ctx.readTrackingKey, ctx.cwd, filePath)) {
       return {
         callId,
         name: "write_file",
@@ -1387,7 +1398,7 @@ async function execWriteFiles(
     const targetPath = path.resolve(ctx.cwd, f.path);
     try {
       const st = await stat(targetPath);
-      if (st.isFile() && !hasFileBeenRead(ctx.cwd, f.path)) {
+      if (st.isFile() && !hasFileBeenRead(ctx.readTrackingKey, ctx.cwd, f.path)) {
         return {
           callId,
           name: "write_files",
@@ -1491,7 +1502,7 @@ async function execSearchReplace(
   }
 
   // Read-before-replace guard: model must read the file first to have exact content
-  if (!hasFileBeenRead(ctx.cwd, filePath)) {
+  if (!hasFileBeenRead(ctx.readTrackingKey, ctx.cwd, filePath)) {
     return {
       callId,
       name: "search_replace",
@@ -1695,14 +1706,25 @@ async function execReadContextPacket(
   callId: string,
   ctx: ToolExecutionContext
 ): Promise<ToolResult> {
-  const contextPath = path.join(ctx.cwd, "context.json");
+  const contextPaths = [
+    path.join(ctx.cwd, ".orchestrator", "context.json"),
+    path.join(ctx.cwd, "context.json"),
+  ];
   try {
-    const content = await readFile(contextPath, "utf-8");
-    return { callId, name: "read_context_packet", output: content };
-  } catch (err: any) {
-    if (err.code === "ENOENT") {
-      return { callId, name: "read_context_packet", output: "(no context.json found)" };
+    for (const contextPath of contextPaths) {
+      try {
+        const content = await readFile(contextPath, "utf-8");
+        return { callId, name: "read_context_packet", output: content };
+      } catch (err: any) {
+        if (err.code !== "ENOENT") throw err;
+      }
     }
+    return {
+      callId,
+      name: "read_context_packet",
+      output: "(no orchestrator context packet found; continue with the prompt, compacted history, git_diff/git_status, and targeted file reads)",
+    };
+  } catch (err: any) {
     return { callId, name: "read_context_packet", output: `Error: ${err.message}`, isError: true };
   }
 }
@@ -1913,14 +1935,14 @@ export function getCompactToolContract(toolNames: string[]): string {
 
 export function getAvailableToolsList(role: string, options?: { availableCommands?: string[] }): string[] {
   const availableCommands = new Set(options?.availableCommands ?? []);
-  const common = ["explore_mode", "read_file", "read_files", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
+  const common = ["explore_mode", "read_file", "read_files", "read_context_packet", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
   if (role === "builder") {
     return [...common, "write_file", "write_files", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files"];
   }
   if (role === "explorer") {
     return availableCommands.has("install")
       ? [...common, "run_command"]
-      : ["explore_mode", "read_file", "read_files", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
+      : ["explore_mode", "read_file", "read_files", "read_context_packet", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
   }
   if (role === "coder") {
     const writeTools = ["write_file", "write_files", "search_replace"];

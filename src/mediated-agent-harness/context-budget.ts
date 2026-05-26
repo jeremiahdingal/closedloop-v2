@@ -8,7 +8,7 @@ export interface ContextBudget {
   usedFraction: number;
 }
 
-export type CompactionLevel = "none" | "summarize" | "force_finish";
+export type CompactionLevel = "none" | "summarize";
 
 export interface CompactionState {
   passCount: number;
@@ -61,8 +61,7 @@ export function computeBudget(
 }
 
 export function shouldCompact(budget: ContextBudget): CompactionLevel {
-  if (budget.usedFraction >= 0.92) return "force_finish";
-  if (budget.usedFraction >= 0.85) return "summarize";
+  if (budget.usedFraction >= 0.95) return "summarize";
   return "none";
 }
 

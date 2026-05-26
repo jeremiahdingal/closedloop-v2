@@ -78,7 +78,7 @@ export function loadConfig(): AppConfig {
     workerConcurrency: Number(process.env.WORKER_CONCURRENCY || 1),
     staleRunAfterMs: Number(process.env.STALE_RUN_AFTER_MS || 60_000),
     staleCoderRunAfterMs: Number(process.env.STALE_CODER_RUN_AFTER_MS || 180_000),
-    staleRunMaxRecoveries: Number(process.env.STALE_RUN_MAX_RECOVERIES || 10),
+    staleRunMaxRecoveries: Number(process.env.STALE_RUN_MAX_RECOVERIES || 30),
     leaseTtlMs: Number(process.env.LEASE_TTL_MS || 60_000),
     workspaceRetentionHours: Number(process.env.WORKSPACE_RETENTION_HOURS || 48),
     localOnly: process.env.LOCAL_ONLY === "1",

@@ -25,18 +25,46 @@ export function mergeStreamingEvents(events: AgentEvent[]): AgentEvent[] {
       const last = result[result.length - 1];
       if (last?.payload && last.payload.streamKind === targetKind && last.payload.agentRole === event.payload?.agentRole) {
         // Append content to existing merged card
-        last.payload = { ...last.payload, content: last.payload.content + (event.payload?.content ?? "") };
+        const stableKey = (last.payload.metadata as Record<string, unknown> | undefined)?.mergeKey ?? last.id;
+        last.payload = {
+          ...last.payload,
+          content: last.payload.content + (event.payload?.content ?? ""),
+          metadata: {
+            ...(last.payload.metadata ?? {}),
+            mergeKey: stableKey,
+          },
+        };
         last.id = event.id;
         last.created_at = event.created_at;
       } else {
         // Start a new merged card
-        result.push({ ...event, payload: { ...event.payload!, streamKind: targetKind } });
+        result.push({
+          ...event,
+          payload: {
+            ...event.payload!,
+            streamKind: targetKind,
+            metadata: {
+              ...(event.payload?.metadata ?? {}),
+              mergeKey: event.id,
+            },
+          },
+        });
       }
     } else if ((sk === "assistant" || sk === "thinking") && result.length > 0) {
       // Final non-streaming event: replace the preceding merged card
       const last = result[result.length - 1];
       if (last?.payload && last.payload.streamKind === sk && last.payload.agentRole === event.payload?.agentRole) {
-        result[result.length - 1] = event;
+        const stableKey = (last.payload.metadata as Record<string, unknown> | undefined)?.mergeKey ?? last.id;
+        result[result.length - 1] = {
+          ...event,
+          payload: {
+            ...event.payload!,
+            metadata: {
+              ...(event.payload?.metadata ?? {}),
+              mergeKey: stableKey,
+            },
+          },
+        };
       } else {
         result.push(event);
       }
@@ -45,6 +73,11 @@ export function mergeStreamingEvents(events: AgentEvent[]): AgentEvent[] {
     }
   }
   return result;
+}
+
+export function getMergedEventKey(event: AgentEvent): string {
+  const mergeKey = event.payload?.metadata?.mergeKey;
+  return typeof mergeKey === "string" || typeof mergeKey === "number" ? String(mergeKey) : String(event.id);
 }
 
 export function isRunActiveForRole(role: string, run: Run): boolean {

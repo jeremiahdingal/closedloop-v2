@@ -1,5 +1,4 @@
 import type {
-  CanonicalEditPacket,
   CoderOutput,
   EditOperation,
   EpicRecord,
@@ -330,31 +329,24 @@ export function coderPrompt(
   allowedPaths: string[],
   reviewerContext?: { blockers: string[]; suggestions: string[] },
   skipContext?: { skipped: boolean; reason?: string },
-  editPacket?: CanonicalEditPacket | null
+  packet?: TicketContextPacket | null
 ): string {
-  const fileSnippets = editPacket?.files
-    ?.filter(f => f.exists && (f.content || f.excerpts?.length))
-    .map(f => {
-      const body = f.content ?? f.excerpts!.map(e => e.content).join("\n");
-      return `### ${f.path} (sha256: ${f.sha256?.slice(0, 12)}…)\n\`\`\`\n${body}\n\`\`\``;
-    }) ?? [];
-
-  return [
+  const sections = [
     "You are the Coder agent. Write code changes AND tests to satisfy the ticket.",
     "",
     "## How to Edit",
     "Use search_replace for targeted edits to existing files (preferred for small changes).",
     "Use write_file for new files or when rewriting most of an existing file (you MUST read it first).",
     "Use write_files for writing multiple files at once.",
-    "If you need to read file contents, use read_file — do not guess or assume file contents.",
+    "If you need to read file contents, use read_file - do not guess or assume file contents.",
     "Write ALL files (implementation + tests) before calling finish.",
     "",
     "## Writing Tests",
     "You MUST write test files alongside implementation files.",
-    "BEFORE writing any test, read an existing test file in the project to discover the test framework (vitest, jest, mocha, etc.), import style, and assertion patterns. Do NOT assume Jest — many projects use vitest with describe/it/expect but import from 'vitest'.",
+    "BEFORE writing any test, read an existing test file in the project to discover the test framework (vitest, jest, mocha, etc.), import style, and assertion patterns. Do NOT assume Jest - many projects use vitest with describe/it/expect but import from 'vitest'.",
     "Follow the exact import and assertion patterns you find in existing tests.",
     "Each test file should import and test the functions/components you create.",
-    "Use the acceptance criteria as test assertions — every criterion should have a corresponding test.",
+    "Use the acceptance criteria as test assertions - every criterion should have a corresponding test.",
     "",
     ...(reviewerContext && (reviewerContext.blockers?.length || reviewerContext.suggestions?.length)
       ? [
@@ -373,25 +365,42 @@ export function coderPrompt(
       skipContext.reason ?? "The explorer node was bypassed for this run.",
       "Focus on the files listed in allowedPaths. If missing context, read the files you need."
     ] : []),
+  ];
+
+  if (packet?.retrievedContext) {
+    if (packet.retrievedContext.projectStructure) {
+      sections.push("", "## Project Structure", packet.retrievedContext.projectStructure);
+    }
+    if (packet.retrievedContext.toolContext) {
+      sections.push("", packet.retrievedContext.toolContext);
+    }
+    if (packet.retrievedContext.docContext) {
+      sections.push("", packet.retrievedContext.docContext);
+    }
+    if (packet.retrievedContext.codeContext) {
+      sections.push("", packet.retrievedContext.codeContext);
+    }
+    sections.push("", `[Context retrieved via ${packet.retrievedContext.retrievalMode} search: ${packet.retrievedContext.chunkCount} chunks]`);
+  }
+
+  sections.push(
     "",
     "## Explorer Analysis",
     JSON.stringify(explorerOutput, null, 2),
-    ...(fileSnippets.length > 0
-      ? ["", "## File Contents (from edit packet)", ...fileSnippets]
-      : []),
     "",
     "## Allowed Paths",
     "You may only edit/create files within these paths:",
     ...allowedPaths.map(p => `- ${p}`),
     "",
     "## Rules",
-    "1. READ files listed in the explorer analysis FIRST — use read_file to read them. Do NOT guess or assume file contents.",
-    "2. Only use glob/grep/list_dir if the explorer analysis is missing a file you critically need. This should be rare.",
-    "3. Every change MUST address at least one acceptance criterion. No scope drift.",
-    "4. Do NOT delete or rename files unless explicitly permitted.",
-    "5. If file content already matches what the acceptance criteria require, produce ZERO changes and explain in summary.",
-    "6. Do NOT produce identity transforms where search === replace.",
-    "7. You MUST write both implementation code AND test files. Every ticket should have at least one test file.",
+    "1. READ files listed in the explorer analysis FIRST - use read_file to read them. Do NOT guess or assume file contents.",
+    "2. If retrieved context is present, use it as high-signal guidance before broad searching.",
+    "3. Only use glob/grep/list_dir if the explorer analysis and retrieved context are missing a file you critically need. This should be rare.",
+    "4. Every change MUST address at least one acceptance criterion. No scope drift.",
+    "5. Do NOT delete or rename files unless explicitly permitted.",
+    "6. If file content already matches what the acceptance criteria require, produce ZERO changes and explain in summary.",
+    "7. Do NOT produce identity transforms where search === replace.",
+    "8. You MUST write both implementation code AND test files. Every ticket should have at least one test file.",
     "",
     "## Finish Output",
     "Call finish with JSON:",
@@ -401,16 +410,17 @@ export function coderPrompt(
       testFiles: ["tests/file1.test.ts"]
     }, null, 2),
     "",
-    "=".repeat(60),
+    "============================================================",
     "## TICKET (YOUR PRIMARY OBJECTIVE)",
     `Title: ${ticket.title}`,
     `Goal: ${ticket.description}`,
     `Acceptance criteria:`,
     ...ticket.acceptanceCriteria.map(c => `  - ${c}`),
-    "=".repeat(60),
-  ].join("\n\n");
-}
+    "============================================================",
+  );
 
+  return sections.join("\n\n");
+}
 export function epicReviewerPrompt(epic: EpicRecord, tickets: TicketRecord[]): string {
   // Build structured ticket listing with ALL tickets
   const ticketListing = tickets
@@ -563,7 +573,8 @@ export function epicDecoderToolingPrompt(
   epic: EpicRecord,
   ragContext?: BuiltContext | null,
   projectStructure?: string | null,
-  coderModel?: string
+  coderModel?: string,
+  retryNote?: string
 ): string {
   const role = "epic-decoder";
   const availableTools = getAvailableToolsList(role);
@@ -577,6 +588,7 @@ export function epicDecoderToolingPrompt(
     "Understand the codebase structure, existing patterns, and conventions before decomposing the epic.",
     `Epic: ${epic.title}`,
     `Goal: ${epic.goalText}`,
+    retryNote ? `PREVIOUS ATTEMPT FEEDBACK:\n${retryNote}` : "",
     [
       "EXECUTOR CONSTRAINT — read this before writing a single ticket:",
       executorConstraint(coderModel),
@@ -587,6 +599,7 @@ export function epicDecoderToolingPrompt(
       "  - Small — the full change should fit comfortably in a single LLM response",
       "If a task feels large or multi-faceted, SPLIT IT. Prefer 10 simple tickets over 4 complex ones.",
       "Do NOT create tickets like 'Implement the feature end-to-end' or 'Refactor the module'. Break those into individual file-level changes.",
+      "Every ticket must include allowedPaths and use forward slashes in all paths.",
     ].join("\n"),
     "",
     [
@@ -602,6 +615,7 @@ export function epicDecoderToolingPrompt(
       "  - Follow the exact pattern from path/to/existing.tsx lines 100-120",
       "  - Remove the now-unused OldComponent import if no other usage remains",
       "WHY: NewComponent provides a styled, consistent UI matching the rest of the app.",
+      "Every ticket must include allowedPaths and use forward slashes in all paths.",
       "",
       "acceptanceCriteria must be specific and testable:",
       "  - BAD: 'UI looks good', 'Component works correctly'",
@@ -615,6 +629,7 @@ export function epicDecoderToolingPrompt(
       "",
       "dependencies: list ticket IDs that MUST complete before this one starts.",
       "  - Use to enforce build order: install deps before using them, create types before importing them, build foundation components before pages that use them.",
+      "All JSON paths in the final answer must use forward slashes. Do not paste raw grep/list output into JSON strings.",
     ].join("\n"),
   ];
 
@@ -642,6 +657,7 @@ export function epicDecoderToolingPrompt(
         description: "string",
         acceptanceCriteria: ["string"],
         dependencies: ["string"],
+        allowedPaths: ["string"],
         priority: "high|medium|low",
         testSpecs: ["string — test assertions, e.g. 'expect(add(2,3)).toBe(5)'"]
       }]
@@ -653,7 +669,8 @@ export function epicDecoderToolingPrompt(
 
 export function epicDecoderCompactPrompt(
   epic: EpicRecord,
-  coderModel?: string
+  coderModel?: string,
+  retryNote?: string
 ): string {
   return [
     "You are the Epic Decoder agent. This is a COMPACTED retry after a previous stall.",
@@ -662,6 +679,7 @@ export function epicDecoderCompactPrompt(
     "Do not try to call bash, ls, find, run, or any other unavailable shell tool.",
     `Epic: ${epic.title}`,
     `Goal: ${epic.goalText}`,
+    retryNote ? `PREVIOUS ATTEMPT FEEDBACK:\n${retryNote}` : "",
     "",
     "EXECUTOR CONSTRAINT — read this before writing a single ticket:",
     executorConstraint(coderModel),
@@ -669,6 +687,7 @@ export function epicDecoderCompactPrompt(
     "",
     "TICKET QUALITY REQUIREMENTS — every ticket MUST have:",
     "Description using WHAT/WHERE/HOW/WHY format. Specific acceptance criteria. At least one test-related criterion.",
+    "Every ticket must include allowedPaths and use forward slashes in all paths.",
     "",
     "Steps:",
     "1. Quick glob/grep to confirm layout (2-3 calls max)",
@@ -683,6 +702,7 @@ export function epicDecoderCompactPrompt(
         description: "string",
         acceptanceCriteria: ["string"],
         dependencies: ["string"],
+        allowedPaths: ["string"],
         priority: "high|medium|low",
         testSpecs: ["string — test assertions"]
       }]
@@ -1099,6 +1119,7 @@ export function epicDecoderPlanModePrompt(
       "  - Replace X elements with a map rendering NewComponent with props={...}",
       "  - Follow the exact pattern from path/to/existing.tsx lines 100-120",
       "WHY: NewComponent provides a styled, consistent UI matching the rest of the app.",
+      "Every ticket must include allowedPaths and use forward slashes in all paths.",
       "",
       "TDD REQUIREMENT: Every ticket MUST include at least one test-related acceptance criterion specifying:",
       "  - The test file path (e.g., 'tests/unit/foo.test.ts' or '__tests__/foo.test.ts')",
@@ -1134,6 +1155,7 @@ export function epicDecoderPlanModePrompt(
         description: "string",
         acceptanceCriteria: ["string"],
         dependencies: ["string"],
+        allowedPaths: ["string"],
         priority: "high|medium|low",
         testSpecs: ["string — test assertions, e.g. 'expect(add(2,3)).toBe(5)'"]
       }]

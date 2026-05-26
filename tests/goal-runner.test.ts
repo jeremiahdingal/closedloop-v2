@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { bootstrapForTest, initGitRepo, makeTempDir } from "./helpers.ts";
-import { GoalRunner } from "../src/orchestration/goal-runner.ts";
+import { GoalRunner, buildDecoderRetryNote, classifyDecoderFailure, isRetryableDecoderFailure } from "../src/orchestration/goal-runner.ts";
 import { MockGateway } from "../src/orchestration/models.ts";
 import { TicketRunner } from "../src/orchestration/ticket-runner.ts";
 
@@ -305,4 +305,18 @@ test("goal runner manual review runs checks and invokes epic reviewer for approv
   } finally {
     services.restore();
   }
+});
+
+test("decoder retry classification and note builder stay parse-failure aware", () => {
+  const failure = new Error("JSON text could not be parsed: unexpected token");
+  assert.deepEqual(classifyDecoderFailure(failure), {
+    kind: "parse",
+    message: failure.message
+  });
+  assert.equal(isRetryableDecoderFailure(failure), true);
+
+  const note = buildDecoderRetryNote(failure);
+  assert.ok(note.includes("strict JSON only"));
+  assert.ok(note.includes("forward slashes"));
+  assert.ok(note.includes("allowedPaths"));
 });

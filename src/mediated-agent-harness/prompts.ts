@@ -14,6 +14,7 @@ const TOOL_USAGE = `
 - list_dir: { "path": "src/components" }
 - read_file: { "path": "src/config.ts" }
 - read_files: { "paths": ["src/a.ts", "src/b.ts"] }
+- read_context_packet: {}
 - write_file: { "path": "src/new.ts", "content": "..." }
 - write_files: { "files": [{ "path": "a.ts", "content": "..." }, { "path": "b.ts", "content": "..." }] }
 - search_replace: { "path": "src/foo.ts", "search": "old code", "replace": "new code" }
@@ -29,6 +30,7 @@ const READ_ONLY_TOOLS = [
   "list_dir(path: string)",
   "read_file(path: string)",
   "read_files(paths: string[])",
+  "read_context_packet()",
   "web_search(query: string)",
   "semantic_search(query: string)",
   "finish(summary: string, result: string)",
@@ -230,13 +232,14 @@ ${TOOL_USAGE}
 ## Finish Output
 Call ${toolExample(_toolMode, "finish")} with JSON:
 {
-  "verdict": "approved" | "rejected",
-  "summary": "string",
-  "issues": []
+  "approved": true,
+  "blockers": ["string"],
+  "suggestions": ["string"],
+  "riskLevel": "low"
 }
 
-If approved: { "verdict": "approved", "summary": "Changes look good", "issues": [] }
-If rejected: { "verdict": "rejected", "summary": "reason", "issues": ["issue1"] }
+If approved: { "approved": true, "blockers": [], "suggestions": [], "riskLevel": "low" }
+If rejected: { "approved": false, "blockers": ["issue1"], "suggestions": [], "riskLevel": "high" }
 
 Workspace: ${workspaceRoot}
 
@@ -351,6 +354,7 @@ ${TOOL_USAGE}
 - Use the test specifications from the ticket's testSpecs/acceptanceCriteria to write meaningful assertions.
 - DO NOT re-explore. The explorer already found the files. DO NOT glob, grep, or browse directories unless critically necessary.
 - Trust the edit packet. If a file's content is there, use it — do not re-read it "to verify".
+- Do NOT search for .orchestrator/context.json manually. If you truly need the context packet after compaction, call read_context_packet once. If it is missing, continue from the prompt, compacted history, git_diff/git_status, and targeted file reads.
 - NEVER return unresolvedBlockers. If you are missing context, READ the file instead of giving up.
 - ${options?.allowInstallCommand ? `run_command(name="install") is available and MUST be used when adding/changing npm dependencies.` : "Do NOT call run_command."}
 

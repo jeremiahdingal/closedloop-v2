@@ -105,6 +105,41 @@ function normalizeGoalTicketPlans(epicId: string, tickets: GoalTicketPlan[]): Go
   }));
 }
 
+export type DecoderFailureKind = "parse" | "validation" | "timeout" | "infrastructure" | "other";
+
+export function classifyDecoderFailure(error: unknown): { kind: DecoderFailureKind; message: string } {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/timed out|stall recovery/i.test(message)) return { kind: "timeout", message };
+  if (/JSON text could not be parsed|Unexpected token|Bad escaped character|Bad control character|Unexpected end of JSON input|cannot parse/i.test(message)) {
+    return { kind: "parse", message };
+  }
+  if (/Goal decomposition shape invalid|Goal review shape invalid|Builder plan shape invalid|reviewer verdict shape invalid/i.test(message)) {
+    return { kind: "validation", message };
+  }
+  if (error instanceof Error && /LaunchError$/i.test(error.name)) {
+    return { kind: "infrastructure", message };
+  }
+  return { kind: "other", message };
+}
+
+export function isRetryableDecoderFailure(error: unknown): boolean {
+  const kind = classifyDecoderFailure(error).kind;
+  return kind === "parse" || kind === "validation" || kind === "timeout";
+}
+
+export function buildDecoderRetryNote(error: unknown): string {
+  const { kind, message } = classifyDecoderFailure(error);
+  const detail = message.length > 600 ? `${message.slice(0, 600)}...` : message;
+  return [
+    "PREVIOUS ATTEMPT FEEDBACK:",
+    `The prior FINAL_JSON failed because of a ${kind} error: ${detail}`,
+    "Output strict JSON only and keep exactly one FINAL_JSON block.",
+    "Use forward slashes in paths and escape backslashes, quotes, and control characters.",
+    "Do not paste raw grep/list output into JSON string values.",
+    "Include allowedPaths for every ticket.",
+  ].join("\n");
+}
+
 function resolveEpicDiffBase(repoRoot: string, candidateBases: string[]): string | null {
   const uniqueBases = Array.from(new Set(candidateBases.filter(Boolean)));
   if (!uniqueBases.length) return null;
@@ -155,6 +190,7 @@ export class GoalRunner {
 
   private async executeTickets(epic: EpicRecord, tickets: TicketRecord[], runId: string): Promise<void> {
     this.assertNotCancelled(epic.id);
+    this.assertNotPaused(epic.id);
     this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Executing ${tickets.length} repair tickets`, runId, epicId: epic.id, sequence: 0 });
 
     const workQueue: TicketRecord[] = [...tickets];
@@ -169,6 +205,7 @@ export class GoalRunner {
     for (let qi = 0; qi < workQueue.length; qi++) {
       const ticket = workQueue[qi];
       this.assertNotCancelled(epic.id);
+      this.assertNotPaused(epic.id);
 
       let current = this.db.getTicket(ticket.id);
       while (current && (current.status === "queued" || current.status === "building" || current.status === "reviewing" || current.status === "testing")) {
@@ -207,6 +244,7 @@ export class GoalRunner {
       }
     }
 
+    this.assertNotPaused(epic.id);
     this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Repair tickets execution complete`, runId, epicId: epic.id, sequence: 0 });
   }
 
@@ -316,6 +354,7 @@ export class GoalRunner {
     const epic = this.db.getEpic(run.epicId);
     if (!epic) throw new Error(`Epic not found: ${run.epicId}`);
     this.assertNotCancelled(epic.id);
+    this.assertNotPaused(epic.id);
 
     this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting LangGraph epic run for: ${epic.title}`, runId, epicId: epic.id, sequence: 0 });
 
@@ -335,6 +374,7 @@ export class GoalRunner {
     const decomposeGoal = async (_state: GoalGraphState) => {
       console.log(`[LangGraph] Node: decompose_goal, epicId: ${epic.id}`);
       this.assertNotCancelled(epic.id);
+      this.assertNotPaused(epic.id);
       this.db.updateRun({ runId, status: "running", currentNode: "decompose_goal", heartbeatAt: nowIso(), lastMessage: "Decomposing goal." });
       this.db.updateEpicStatus(epic.id, "executing");
 
@@ -356,20 +396,31 @@ export class GoalRunner {
         } satisfies Partial<GoalGraphState>;
       }
 
-      const MAX_DECODE_STALL_RETRIES = 3;
+      const MAX_DECODE_RETRIES = 3;
       let plan: GoalDecomposition | null = null;
-      for (let stallAttempt = 0; stallAttempt < MAX_DECODE_STALL_RETRIES; stallAttempt++) {
+      let lastDecoderError: unknown = null;
+      for (let attempt = 0; attempt < MAX_DECODE_RETRIES; attempt++) {
         try {
-          plan = await this.withEpicHeartbeat(runId, epic.id, "decompose_goal", stallAttempt === 0 ? "Decomposing goal." : `Decoder stall recovery #${stallAttempt}.`, () =>
-            this.runEpicDecoder(epic, runId, stallAttempt > 0)
+          const retryNote = attempt > 0 && lastDecoderError ? buildDecoderRetryNote(lastDecoderError) : null;
+          plan = await this.withEpicHeartbeat(runId, epic.id, "decompose_goal", attempt === 0 ? "Decomposing goal." : `Decoder recovery #${attempt}.`, () =>
+            this.runEpicDecoder(epic, runId, attempt > 0, retryNote)
           );
           break;
         } catch (err) {
-          const isTimeout = err instanceof Error && (err.message.includes("timed out") || err.message.includes("Stall recovery"));
-          if (!isTimeout || stallAttempt >= MAX_DECODE_STALL_RETRIES - 1) throw err;
+          lastDecoderError = err;
+          if (!isRetryableDecoderFailure(err) || attempt >= MAX_DECODE_RETRIES - 1) throw err;
 
-          this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Decoder stalled (attempt ${stallAttempt + 1}/${MAX_DECODE_STALL_RETRIES}). Compacting prompt and retrying...`, runId, epicId: epic.id, sequence: 100 + stallAttempt });
-          console.log(`[EPIC-DECODER] ${epic.id} stalled on attempt ${stallAttempt + 1}. Compacting and retrying.`);
+          const failure = classifyDecoderFailure(err);
+          this.recordAgentStream({
+            agentRole: "system",
+            source: "orchestrator",
+            streamKind: "status",
+            content: `Decoder ${failure.kind} failure (attempt ${attempt + 1}/${MAX_DECODE_RETRIES}). Compacting prompt and retrying...`,
+            runId,
+            epicId: epic.id,
+            sequence: 100 + attempt
+          });
+          console.log(`[EPIC-DECODER] ${epic.id} ${failure.kind} failure on attempt ${attempt + 1}. Compacting and retrying.`);
         }
       }
       if (!plan) throw new Error("Epic decoder produced no result");
@@ -396,6 +447,7 @@ export class GoalRunner {
     const executeTickets = async (state: GoalGraphState) => {
       console.log(`[LangGraph] Node: execute_tickets, epicId: ${epic.id}, ticketCount: ${state.ticketIds.length}`);
       this.assertNotCancelled(epic.id);
+      this.assertNotPaused(epic.id);
       this.db.updateRun({ runId, status: "running", currentNode: "execute_tickets", heartbeatAt: nowIso(), lastMessage: "Executing tickets." });
       this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Found ${state.ticketIds.length} tickets to execute`, runId, epicId: epic.id, sequence: 0 });
 
@@ -420,6 +472,7 @@ export class GoalRunner {
         for (let qi = 0; qi < workQueue.length; qi++) {
           const ticket = workQueue[qi];
           this.assertNotCancelled(epic.id);
+          this.assertNotPaused(epic.id);
           let current = this.db.getTicket(ticket.id);
           while (current && (current.status === "queued" || current.status === "building" || current.status === "reviewing" || current.status === "testing")) {
             const queuedRun = this.db.listRuns().find((record) => record.ticketId === ticket.id && (record.status === "queued" || record.status === "running" || record.status === "waiting"));
@@ -465,6 +518,7 @@ export class GoalRunner {
     const reviewGoal = async (state: GoalGraphState) => {
       console.log(`[LangGraph] Node: goal_review, epicId: ${epic.id}`);
       this.assertNotCancelled(epic.id);
+      this.assertNotPaused(epic.id);
       this.db.updateRun({ runId, status: "running", currentNode: "goal_review", heartbeatAt: nowIso(), lastMessage: "Reviewing epic." });
       this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting goal review with ${state.ticketIds.length} tickets`, runId, epicId: epic.id, sequence: 0 });
       await this.drainActiveTickets(epic.id);
@@ -495,6 +549,7 @@ export class GoalRunner {
     const runPlayLoop = async (state: GoalGraphState) => {
       console.log(`[LangGraph] Node: play_loop, epicId: ${epic.id}`);
       this.assertNotCancelled(epic.id);
+      this.assertNotPaused(epic.id);
       this.db.updateRun({ runId, status: "running", currentNode: "play_loop", heartbeatAt: nowIso(), lastMessage: "Running Playwright e2e tests." });
       this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: "Starting Playwright e2e test loop...", runId, epicId: epic.id, sequence: 0 });
 
@@ -557,6 +612,7 @@ export class GoalRunner {
       await graph.invoke({ runId, epicId: epic.id });
     } catch (error) {
       if (error instanceof EpicCancelledError) return;
+      if (error instanceof EpicPausedError) return;
       const msg = error instanceof Error ? error.message : String(error);
       this.db.updateEpicStatus(epic.id, "failed");
       this.db.updateRun({ runId, status: "failed", currentNode: "error", heartbeatAt: nowIso(), lastMessage: msg, errorText: msg });
@@ -570,6 +626,7 @@ export class GoalRunner {
     const epic = this.db.getEpic(run.epicId);
     if (!epic) throw new Error(`Epic not found: ${run.epicId}`);
     this.assertNotCancelled(epic.id);
+    this.assertNotPaused(epic.id);
 
     this.db.updateRun({ runId, status: "running", currentNode: "decompose_goal", heartbeatAt: nowIso(), lastMessage: "Decomposing goal." });
     this.db.updateEpicStatus(epic.id, "executing");
@@ -614,6 +671,7 @@ export class GoalRunner {
       this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Epic review ${approved ? "approved" : failForward ? "approved with followups" : "rejected"}: ${review.summary}`, runId, epicId: epic.id, sequence: 3, done: true });
     } catch (error) {
       if (error instanceof EpicCancelledError) return;
+      if (error instanceof EpicPausedError) return;
       if (!legacyFinalized) {
         const msg = error instanceof Error ? error.message : String(error);
         this.db.updateEpicStatus(epic.id, "failed");
@@ -630,6 +688,7 @@ export class GoalRunner {
       let current = this.db.getTicket(ticket.id);
       while (current && activeStates.has(current.status)) {
         this.assertNotCancelled(epicId);
+        this.assertNotPaused(epicId);
         const activeRun = this.db.listRuns().find(r => r.ticketId === ticket.id && (r.status === "queued" || r.status === "running" || r.status === "waiting"));
         if (!activeRun) break;
         if (activeRun.status === "queued") {
@@ -642,7 +701,7 @@ export class GoalRunner {
     }
   }
 
-  private async runEpicDecoder(epic: EpicRecord, runId: string, compact = false): Promise<GoalDecomposition> {
+  private async runEpicDecoder(epic: EpicRecord, runId: string, compact = false, retryNote?: string | null): Promise<GoalDecomposition> {
     const ragCtx = compact ? null : await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`);
     const projectStructure = compact ? null : await ensureProjectStructureFile(epic.targetDir).catch(() => null);
 
@@ -654,9 +713,9 @@ export class GoalRunner {
 
     let prompt: string;
     if (compact) {
-      prompt = epicDecoderCompactPrompt(epic, this.gateway.models.coder) + assetContext;
+      prompt = epicDecoderCompactPrompt(epic, this.gateway.models.coder, retryNote ?? undefined) + assetContext;
     } else {
-      prompt = epicDecoderToolingPrompt(epic, ragCtx, projectStructure, this.gateway.models.coder) + assetContext;
+      prompt = epicDecoderToolingPrompt(epic, ragCtx, projectStructure, this.gateway.models.coder, retryNote ?? undefined) + assetContext;
     }
 
     const configuredModel = this.gateway.models.epicDecoder;
@@ -853,11 +912,15 @@ export class GoalRunner {
   }
 
   static createEpic(db: AppDatabase, input: { id?: string; title: string; goalText: string; targetDir: string; targetBranch?: string; scheduledDate?: string | null }): EpicRecord {
-    return db.createEpic({ id: input.id ?? randomId("epic"), title: input.title, goalText: input.goalText, targetDir: input.targetDir, targetBranch: input.targetBranch ?? null, status: "planning", scheduledDate: input.scheduledDate ?? null, assetPaths: [] });
+    return db.createEpic({ id: input.id ?? randomId("epic"), title: input.title, goalText: input.goalText, targetDir: input.targetDir, targetBranch: input.targetBranch ?? null, status: "planning", pausedFromStatus: null, scheduledDate: input.scheduledDate ?? null, assetPaths: [] });
   }
 
   private assertNotCancelled(epicId: string): void {
     if (this.lifecycle.isEpicCancelled(epicId)) throw new EpicCancelledError(`Epic ${epicId} cancelled by user.`);
+  }
+
+  private assertNotPaused(epicId: string): void {
+    if (this.lifecycle.isEpicPaused(epicId)) throw new EpicPausedError(`Epic ${epicId} paused by user.`);
   }
 
   private async buildRagContext(repoPath: string, query: string, role?: string): Promise<(BuiltContext & { indexId: number | null }) | null> {
@@ -941,6 +1004,7 @@ export class GoalRunner {
     const epic = this.db.getEpic(run.epicId);
     if (!epic) throw new Error(`Epic not found: ${run.epicId}`);
     this.assertNotCancelled(epic.id);
+    this.assertNotPaused(epic.id);
 
     this.db.updateRun({ runId, status: "running", currentNode: "goal_review", heartbeatAt: nowIso(), lastMessage: "Running epic review." });
 
@@ -996,6 +1060,7 @@ export class GoalRunner {
     const epic = this.db.getEpic(run.epicId);
     if (!epic) throw new Error(`Epic not found: ${run.epicId}`);
     this.assertNotCancelled(epic.id);
+    this.assertNotPaused(epic.id);
 
     this.db.updateRun({ runId, status: "running", currentNode: "play_loop", heartbeatAt: nowIso(), lastMessage: "Running play loop." });
 
@@ -1037,3 +1102,4 @@ export class GoalRunner {
 }
 
 class EpicCancelledError extends Error {}
+class EpicPausedError extends Error {}

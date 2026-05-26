@@ -90,6 +90,11 @@ export class AppDatabase {
     } catch {
       // Column already exists
     }
+    try {
+      this.db.exec(`ALTER TABLE epics ADD COLUMN paused_from_status TEXT`);
+    } catch {
+      // Column already exists
+    }
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS tickets (
@@ -228,6 +233,8 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_jobs_status_available ON jobs(status, available_at);
       CREATE INDEX IF NOT EXISTS idx_runs_ticket_status ON runs(ticket_id, status);
       CREATE INDEX IF NOT EXISTS idx_events_aggregate ON events(aggregate_type, aggregate_id);
+      CREATE INDEX IF NOT EXISTS idx_events_ticket_id ON events(ticket_id, id);
+      CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id, id);
     `);
 
     // RAG tables
@@ -318,9 +325,9 @@ export class AppDatabase {
   createEpic(epic: Omit<EpicRecord, "createdAt" | "updatedAt">): EpicRecord {
     const now = nowIso();
     this.db.prepare(`
-      INSERT INTO epics (id, title, goal_text, target_dir, target_branch, status, scheduled_date, asset_paths_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(epic.id, epic.title, epic.goalText, epic.targetDir, epic.targetBranch, epic.status, epic.scheduledDate ?? null, JSON.stringify(epic.assetPaths ?? []), now, now);
+      INSERT INTO epics (id, title, goal_text, target_dir, target_branch, status, paused_from_status, scheduled_date, asset_paths_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(epic.id, epic.title, epic.goalText, epic.targetDir, epic.targetBranch, epic.status, epic.pausedFromStatus ?? null, epic.scheduledDate ?? null, JSON.stringify(epic.assetPaths ?? []), now, now);
     return { ...epic, createdAt: now, updatedAt: now };
   }
 
@@ -334,6 +341,7 @@ export class AppDatabase {
       targetDir: row.target_dir,
       targetBranch: row.target_branch || null,
       status: row.status,
+      pausedFromStatus: row.paused_from_status ?? null,
       scheduledDate: row.scheduled_date ?? null,
       assetPaths: JSON.parse(row.asset_paths_json || "[]"),
       createdAt: row.created_at,
@@ -349,6 +357,7 @@ export class AppDatabase {
       targetDir: row.target_dir,
       targetBranch: row.target_branch || null,
       status: row.status,
+      pausedFromStatus: row.paused_from_status ?? null,
       scheduledDate: row.scheduled_date ?? null,
       assetPaths: JSON.parse(row.asset_paths_json || "[]"),
       createdAt: row.created_at,
@@ -378,6 +387,7 @@ export class AppDatabase {
       targetDir: row.target_dir,
       targetBranch: row.target_branch || null,
       status: row.status,
+      pausedFromStatus: row.paused_from_status ?? null,
       scheduledDate: row.scheduled_date ?? null,
       assetPaths: JSON.parse(row.asset_paths_json || "[]"),
       createdAt: row.created_at,
@@ -387,6 +397,10 @@ export class AppDatabase {
 
   updateEpicStatus(id: string, status: EpicRecord["status"]): void {
     this.db.prepare(`UPDATE epics SET status = ?, updated_at = ? WHERE id = ?`).run(status, nowIso(), id);
+  }
+
+  updateEpicPausedFromStatus(id: string, pausedFromStatus: EpicRecord["status"] | null): void {
+    this.db.prepare(`UPDATE epics SET paused_from_status = ?, updated_at = ? WHERE id = ?`).run(pausedFromStatus, nowIso(), id);
   }
 
   deleteEpic(id: string): void {
@@ -799,6 +813,39 @@ export class AppDatabase {
 
   listEventsForRun(runId: string, limit = 200): Array<Record<string, unknown>> {
     return (this.db.prepare(`SELECT * FROM events WHERE run_id = ? ORDER BY id DESC LIMIT ?`).all(runId, limit) as Array<Record<string, unknown>>).map((row: any) => ({
+      ...row,
+      payload_json: row.payload_json,
+      payload: row.payload_json ? JSON.parse(String(row.payload_json)) : null
+    }));
+  }
+
+  listAgentEventsForTicket(ticketId: string, options?: { runId?: string; limit?: number }): Array<Record<string, unknown>> {
+    const limit = options?.limit ?? 500;
+    let rows: Array<Record<string, unknown>>;
+
+    if (options?.runId) {
+      rows = this.db.prepare(`
+        SELECT * FROM (
+          SELECT * FROM events
+          WHERE kind = 'agent_stream' AND (ticket_id = ? OR run_id = ?)
+          ORDER BY id DESC
+          LIMIT ?
+        )
+        ORDER BY id ASC
+      `).all(ticketId, options.runId, limit) as Array<Record<string, unknown>>;
+    } else {
+      rows = this.db.prepare(`
+        SELECT * FROM (
+          SELECT * FROM events
+          WHERE kind = 'agent_stream' AND ticket_id = ?
+          ORDER BY id DESC
+          LIMIT ?
+        )
+        ORDER BY id ASC
+      `).all(ticketId, limit) as Array<Record<string, unknown>>;
+    }
+
+    return rows.map((row: any) => ({
       ...row,
       payload_json: row.payload_json,
       payload: row.payload_json ? JSON.parse(String(row.payload_json)) : null

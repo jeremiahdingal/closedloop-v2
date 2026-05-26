@@ -70,6 +70,22 @@ export type AgentModelInfo = {
 
 export type AgentModelsConfig = Record<string, AgentModelInfo>;
 
+export type OllamaPsModel = {
+  name: string;
+  id: string;
+  size: string;
+  processor: string;
+  context: string;
+  until: string;
+};
+
+export type OllamaPsSnapshot = {
+  ok: boolean;
+  status: "ready" | "idle" | "error";
+  models: OllamaPsModel[];
+  error?: string;
+};
+
 export type TicketDiffResponse = {
   ticketId: string;
   diff: string;

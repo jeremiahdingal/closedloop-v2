@@ -4,7 +4,7 @@ import path from "node:path";
 import { makeTempDir, initGitRepo, bootstrapForTest } from "./helpers.ts";
 import { GoalRunner } from "../src/orchestration/goal-runner.ts";
 import { MediatedAgentHarnessGateway, MockGateway } from "../src/orchestration/models.ts";
-import { TicketRunner } from "../src/orchestration/ticket-runner.ts";
+import { TicketRunner, shouldRetryExplorerEscalation } from "../src/orchestration/ticket-runner.ts";
 import { OpenCodeLaunchError } from "../src/orchestration/opencode.ts";
 import { readModelsFile, writeModelsFile } from "../src/config.ts";
 import type { ReviewerVerdict } from "../src/types.ts";
@@ -75,6 +75,160 @@ test("ticket runner completes a successful build-review-test loop", async () => 
 test("config defaults reviewer to direct qwen3:14b", () => {
   const models = readModelsFile();
   assert.equal(models.reviewer, "qwen3:14b");
+});
+
+test("ticket runner can queue a fresh run for an escalated ticket", async () => {
+  const repoRoot = await makeTempDir("repo-");
+  const dataDir = await makeTempDir("data-");
+  await initGitRepo(repoRoot);
+
+  const services = await bootstrapForTest({
+    REPO_ROOT: repoRoot,
+    DATA_DIR: dataDir,
+    TEST_COMMAND: "node --eval \"process.exit(0)\"",
+    LINT_COMMAND: "node --eval \"process.exit(0)\"",
+    TYPECHECK_COMMAND: "node --eval \"process.exit(0)\""
+  }, { dryRun: true });
+
+  try {
+    const epic = GoalRunner.createEpic(services.db, {
+      id: "epic_rerun_escalated",
+      title: "Rerun escalated epic",
+      goalText: "Retry a failed ticket.",
+      targetDir: repoRoot
+    });
+    services.db.createTicket({
+      id: "ticket_rerun_escalated",
+      epicId: epic.id,
+      title: "Retry escalated ticket",
+      description: "Allow the ticket to be queued again.",
+      acceptanceCriteria: ["A new run is queued"],
+      dependencies: [],
+      allowedPaths: ["README.md"],
+      priority: "high",
+      status: "escalated",
+      metadata: {}
+    });
+    services.db.createRun({
+      id: "run_old_escalated",
+      kind: "ticket",
+      epicId: epic.id,
+      ticketId: "ticket_rerun_escalated",
+      status: "escalated",
+      currentNode: "escalated",
+      attempt: 3,
+      heartbeatAt: null,
+      lastMessage: "Old escalated run.",
+      errorText: "Old escalated run."
+    });
+    services.db.updateTicketRunState({
+      ticketId: "ticket_rerun_escalated",
+      status: "escalated",
+      currentRunId: "run_old_escalated",
+      currentNode: "escalated",
+      lastHeartbeatAt: null,
+      lastMessage: "Old escalated run."
+    });
+
+    const runner = new TicketRunner(services.db, services.bridge, new MockGateway(), services.lifecycle);
+    const runId = await runner.start("ticket_rerun_escalated", epic.id);
+
+    assert.notEqual(runId, "run_old_escalated");
+    assert.notEqual(runId, "skip");
+    assert.equal(services.db.getTicket("ticket_rerun_escalated")?.status, "queued");
+    assert.equal(services.db.getTicket("ticket_rerun_escalated")?.currentRunId, runId);
+    assert.equal(services.db.getRun(runId)?.status, "queued");
+    assert.equal(
+      services.db.listJobRecords().some((job) => job.kind === "run_ticket" && String((job.payload as any).runId ?? "") === runId),
+      true
+    );
+  } finally {
+    services.restore();
+  }
+});
+
+test("explorer escalations retry even when explorer output is not preserved", () => {
+  const retryable = shouldRetryExplorerEscalation({
+    status: "escalated",
+    reviewBlockers: [],
+    coderOutput: null,
+    explorerOutput: null,
+    skipExplorer: false,
+    lastMessage: "Explorer stalled after retries.",
+    failureReason: ""
+  });
+
+  const blocked = shouldRetryExplorerEscalation({
+    status: "escalated",
+    reviewBlockers: ["blocked"],
+    coderOutput: null,
+    explorerOutput: null,
+    skipExplorer: false,
+    lastMessage: "Explorer stalled after retries.",
+    failureReason: ""
+  });
+
+  assert.equal(retryable, true);
+  assert.equal(blocked, false);
+});
+
+test("fresh retry can preserve skipExplorer", async () => {
+  const repoRoot = await makeTempDir("repo-");
+  const dataDir = await makeTempDir("data-");
+  await initGitRepo(repoRoot);
+
+  const services = await bootstrapForTest({
+    REPO_ROOT: repoRoot,
+    DATA_DIR: dataDir,
+    TEST_COMMAND: 'node --eval "process.exit(0)"',
+    LINT_COMMAND: 'node --eval "process.exit(0)"',
+    TYPECHECK_COMMAND: 'node --eval "process.exit(0)"'
+  }, { dryRun: true });
+
+  try {
+    const epic = GoalRunner.createEpic(services.db, {
+      id: "epic_skip_explorer_retry",
+      title: "Skip explorer retry epic",
+      goalText: "Retry directly into coder after explorer escalation.",
+      targetDir: repoRoot
+    });
+    services.db.createTicket({
+      id: "ticket_skip_explorer_retry",
+      epicId: epic.id,
+      title: "Retry without explorer",
+      description: "Preserve skipExplorer across fresh retry.",
+      acceptanceCriteria: ["Skip explorer on the fresh retry"],
+      dependencies: [],
+      allowedPaths: ["README.md"],
+      priority: "high",
+      status: "queued",
+      metadata: { maxBuildAttempts: 2 }
+    });
+
+    const runner = new TicketRunner(services.db, services.bridge, new MockGateway(), services.lifecycle);
+    let captured: { runId: string; options: { skipExplorer?: boolean } | undefined } | null = null;
+    (runner as any).runExisting = async (runId: string, options?: { skipExplorer?: boolean }) => {
+      captured = { runId, options };
+      return {
+        runId,
+        workspaceId: "ws_test",
+        status: "approved",
+        lastDiff: "",
+        reviewVerdict: null,
+        testSummary: null
+      };
+    };
+
+    const result = await (runner as any).runTicketAsNewAttempt("ticket_skip_explorer_retry", epic.id, { skipExplorer: true });
+
+    assert.equal(result.status, "approved");
+    assert.ok(captured);
+    assert.equal(captured?.options?.skipExplorer, true);
+    assert.equal(services.db.getRun(captured!.runId)?.lastMessage, "Auto-retry from fresh (skip explorer).");
+    assert.equal(services.db.getTicket("ticket_skip_explorer_retry")?.currentRunId, captured!.runId);
+  } finally {
+    services.restore();
+  }
 });
 
 test("ticket runner approves via guard-only path when reviewer mode is off", async () => {

@@ -156,7 +156,7 @@ The worker runs a recovery sweep on every poll cycle:
 3. **Stale runs** — any `running` run without a heartbeat for > `STALE_RUN_AFTER_MS` (default 3 min) is picked up by the Doctor:
    - Doctor reads recent `agent_stream` events and classifies the failure
    - Decision: `retry` (requeue), `blocked`, or `escalate` (mark failed)
-   - Max `STALE_RUN_MAX_RECOVERIES` (default 3) attempts per run
+   - Max `STALE_RUN_MAX_RECOVERIES` (default 30) attempts per run
 
 ---
 
@@ -229,7 +229,7 @@ node --experimental-strip-types src/__tests__/harness-live.test.ts qwen3-coder:3
 | `USE_LANGGRAPH` | `1` | Set to `0` to use the legacy controller |
 | `DRY_RUN` | — | `1` = deterministic dry-run gateway (no real model calls) |
 | `STALE_RUN_AFTER_MS` | `180000` | Heartbeat age before a run is considered stale |
-| `STALE_RUN_MAX_RECOVERIES` | `3` | Max auto-recovery attempts per run |
+| `STALE_RUN_MAX_RECOVERIES` | `30` | Max auto-recovery attempts per run |
 | `TEST_COMMAND` | — | Override the default test command |
 | `LINT_COMMAND` | — | Override the default lint command |
 | `TYPECHECK_COMMAND` | — | Override the default typecheck command |

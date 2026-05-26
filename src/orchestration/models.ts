@@ -24,7 +24,7 @@ import { CodexRunner } from "./codex.ts";
 import { QwenRunner } from "./qwen.ts";
 import { GeminiRunner } from "./gemini.ts";
 import { ZaiRunner } from "./zai.ts";
-import { MediatedAgentHarness, resetSessionTracking } from "../mediated-agent-harness/index.ts";
+import { MediatedAgentHarness } from "../mediated-agent-harness/index.ts";
 import type { ToolExecutionContext } from "../mediated-agent-harness/types.ts";
 import { ensureModelLoaded, markModelLoaded, unloadCurrentModel } from "./ollama-memory-manager.ts";
 
@@ -39,7 +39,7 @@ export interface ModelGateway {
   getGoalReview(prompt: string): Promise<GoalReview>;
   getFailureDecision(prompt: string): Promise<FailureDecision>;
   runBuilderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<OpenCodeBuilderResult>;
-  runReviewerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ReviewerVerdict>;
+  runReviewerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; timeoutMs?: number; onStream?: StreamHook }): Promise<ReviewerVerdict>;
   runTesterInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<TesterResult>;
   runExplorerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string>;
   runCoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; skipExplorer?: boolean; onStream?: StreamHook }): Promise<CoderRunResult>;
@@ -58,7 +58,8 @@ function resolveOllamaContextWindow(model: string): number {
   if (model.startsWith("glm-4.7-flash")) return 65536;
   if (model.startsWith("qwen3.5:9b")) return 65536;
   if (model.startsWith("qwen3.5:27b")) return 65536;
-  if (model.startsWith("vladimirgav/qwen3.6-27b")) return 65536;
+  if (model.includes("qwen3.6-35b")) return 8192;
+  if (model.includes("qwen3.6-27b")) return 32768;
   if (model.startsWith("ibm/granite4.1:30b-q3")) return 8192;
   if (model.startsWith("ibm/granite4.1")) return 32768;
   if (model.startsWith("devstral-small-2:24b")) return 393216;
@@ -618,6 +619,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
   private readonly zai: ZaiRunner;
   private readonly ollamaBaseURL: string;
   private readonly braveApiKey: string | undefined;
+  private readonly openrouterApiKey: string | undefined;
   private readonly anthropicOverride?: { baseURL: string; apiKey: string; apiBackend: "anthropic"; model: string };
 
   constructor(ollamaBaseURL?: string, models?: Record<AgentRole, string>, anthropicOverride?: { baseURL: string; apiKey: string; apiBackend: "anthropic"; model: string }) {
@@ -630,6 +632,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     this.gemini = new GeminiRunner();
     this.zai = new ZaiRunner();
     this.braveApiKey = process.env.BRAVE_API_KEY;
+    this.openrouterApiKey = process.env.OPENROUTER_API_KEY;
     this.anthropicOverride = anthropicOverride;
   }
 
@@ -659,6 +662,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     runId?: string | null;
     ticketId?: string | null;
     epicId?: string | null;
+    timeoutMs?: number;
     onStream?: StreamHook;
   }): Promise<ReviewerVerdict> {
     const model = this.resolveHarnessModel("reviewer");
@@ -673,23 +677,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, "reviewer");
-    const harness = new MediatedAgentHarness({
-      baseURL: this.ollamaBaseURL,
-      apiKey: "",
-      model,
-      braveApiKey: this.braveApiKey,
-      toolContext,
-    });
+    const toolContext = this.buildToolContext(input.cwd, "reviewer", undefined, undefined, input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("reviewer", model, toolContext));
 
-    await ensureModelLoaded(model);
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("reviewer", input.prompt, {
       maxIterations: 80,
-      timeoutMs: 300_000,
+      timeoutMs: input.timeoutMs ?? 300_000,
       toolMode: this.resolveToolMode(model),
       onEvent: this.buildHarnessEventHandler("reviewer", model, input),
     });
-    markModelLoaded(model);
+    if (isOllama) markModelLoaded(model);
 
     return validateReviewerVerdict(parseJsonText(result.text));
   }
@@ -741,24 +740,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, "epicDecoder", { ragIndexId: input.ragIndexId, db: input.db });
+    const toolContext = this.buildToolContext(input.cwd, "epicDecoder", { ragIndexId: input.ragIndexId, db: input.db }, undefined, input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("epicDecoder", model, toolContext));
 
-    const harness = new MediatedAgentHarness({
-      baseURL: this.ollamaBaseURL,
-      apiKey: "",
-      model,
-      braveApiKey: this.braveApiKey,
-      toolContext,
-    });
-
-    await ensureModelLoaded(model);
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("epicDecoder", input.prompt, {
       maxIterations: 80,
       timeoutMs: 900_000,
       toolMode: this.resolveToolMode(model),
       onEvent: this.buildHarnessEventHandler("epicDecoder", model, input),
     });
-    markModelLoaded(model);
+    if (isOllama) markModelLoaded(model);
 
     return validateGoalDecomposition(parseJsonText(result.text));
   }
@@ -800,24 +793,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, "epicReviewer", { ragIndexId: input.ragIndexId, db: input.db });
+    const toolContext = this.buildToolContext(input.cwd, "epicReviewer", { ragIndexId: input.ragIndexId, db: input.db }, undefined, input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("epicReviewer", model, toolContext));
 
-    const harness = new MediatedAgentHarness({
-      baseURL: this.ollamaBaseURL,
-      apiKey: "",
-      model,
-      braveApiKey: this.braveApiKey,
-      toolContext,
-    });
-
-    await ensureModelLoaded(model);
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("epicReviewer", input.prompt, {
       maxIterations: 80,
       timeoutMs: 900_000,
       toolMode: this.resolveToolMode(model),
       onEvent: this.buildHarnessEventHandler("epicReviewer", model, input),
     });
-    markModelLoaded(model);
+    if (isOllama) markModelLoaded(model);
 
     return validateGoalReview(parseJsonText(result.text));
   }
@@ -870,23 +857,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : []);
-    const harness = new MediatedAgentHarness({
-      baseURL: this.ollamaBaseURL,
-      apiKey: "",
-      model,
-      braveApiKey: this.braveApiKey,
-      toolContext,
-    });
+    const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : [], input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("explorer", model, toolContext));
 
-    await ensureModelLoaded(model);
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("explorer", input.prompt, {
       maxIterations: 20,
       timeoutMs: 900_000,
       toolMode: this.resolveToolMode(model),
       onEvent: this.buildHarnessEventHandler("explorer", model, input),
     });
-    markModelLoaded(model);
+    if (isOllama) markModelLoaded(model);
 
     return result.text;
   }
@@ -900,7 +882,6 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     skipExplorer?: boolean;
     onStream?: StreamHook;
   }): Promise<CoderRunResult> {
-    resetSessionTracking(input.cwd);
     const model = this.resolveHarnessModel("coder");
     const allowInstallCommand = promptExplicitlyRequestsDependencyInstall(input.prompt);
     input.onStream?.({
@@ -914,20 +895,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : []);
-    const harnessConfig: any = this.anthropicOverride
-      ? { ...this.anthropicOverride, braveApiKey: this.braveApiKey, toolContext }
-      : { baseURL: this.ollamaBaseURL, apiKey: "", model, braveApiKey: this.braveApiKey, toolContext, noThink: true };
-    const harness = new MediatedAgentHarness(harnessConfig);
+    const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : [], input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("coder", model, toolContext));
 
-    if (!this.anthropicOverride) await ensureModelLoaded(model);
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("coder", input.prompt, {
-      maxIterations: 50,
+      maxIterations: 80,
       timeoutMs: 600_000,
       toolMode: this.resolveToolMode(model),
       onEvent: this.buildHarnessEventHandler("coder", model, input),
     });
-    if (!this.anthropicOverride) markModelLoaded(model);
+    if (isOllama) markModelLoaded(model);
 
     return {
       text: result.text,
@@ -1045,25 +1024,19 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, "tester");
-
-    const harness = new MediatedAgentHarness({
-      baseURL: this.ollamaBaseURL,
-      apiKey: "",
-      model,
-      braveApiKey: this.braveApiKey,
-      toolContext,
-    });
+    const toolContext = this.buildToolContext(input.cwd, "tester", undefined, undefined, input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("tester", model, toolContext));
 
     // TIGHT LIMITS: Tester must decide within 50 iterations (prompt says 3 tool calls)
-    await ensureModelLoaded(model);
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("tester", input.prompt, {
       maxIterations: 80,
       timeoutMs: 300_000, // 5 minutes
       toolMode: this.resolveToolMode(model),
       onEvent: this.buildHarnessEventHandler("tester", model, input),
     });
-    markModelLoaded(model);
+    if (isOllama) markModelLoaded(model);
 
     const parsed = parseJsonText(result.text) as TesterResult;
     return {
@@ -1219,14 +1192,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     model: string,
     toolMode: "native" | "xml"
   ): Promise<OpenCodeBuilderResult> {
-    const toolContext = this.buildToolContext(input.cwd, "builder");
-    const harness = new MediatedAgentHarness({
-      baseURL: this.ollamaBaseURL,
-      apiKey: "",
-      model,
-      braveApiKey: this.braveApiKey,
-      toolContext,
-    });
+    const toolContext = this.buildToolContext(input.cwd, "builder", undefined, undefined, input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("builder", model, toolContext));
 
     const mediatedPrompt = [
       "MEDIATED HARNESS OVERRIDE:",
@@ -1237,14 +1204,15 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       toolMode === "xml" ? this.buildBuilderXmlPrompt(input.prompt) : input.prompt,
     ].join("\n");
 
-    await ensureModelLoaded(model);
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("builder", mediatedPrompt, {
       maxIterations: 100,
       timeoutMs: 1_800_000,
       toolMode,
       onEvent: this.buildHarnessEventHandler("builder", model, input),
     });
-    markModelLoaded(model);
+    if (isOllama) markModelLoaded(model);
 
     return {
       summary: result.text.slice(0, 500),
@@ -1253,11 +1221,38 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     };
   }
 
+  private buildHarnessConfig(role: AgentRole, model: string, toolContext: ToolExecutionContext): any {
+    const numCtx = role === "coder" || role === "reviewer" ? 65536 : undefined;
+    if (this.anthropicOverride) {
+      return { ...this.anthropicOverride, braveApiKey: this.braveApiKey, toolContext, ...(numCtx ? { numCtx } : {}) };
+    }
+    if (model.startsWith("openrouter:")) {
+      return {
+        baseURL: "https://openrouter.ai/api/v1",
+        apiKey: this.openrouterApiKey,
+        apiBackend: "openrouter",
+        model: model.slice("openrouter:".length),
+        braveApiKey: this.braveApiKey,
+        toolContext,
+        ...(numCtx ? { numCtx } : {}),
+      };
+    }
+    return {
+      baseURL: this.ollamaBaseURL,
+      apiKey: "",
+      model,
+      braveApiKey: this.braveApiKey,
+      toolContext,
+      ...(numCtx ? { numCtx } : {}),
+    };
+  }
+
   private buildToolContext(
     cwd: string,
     workspaceId: string,
     ragOptions?: { ragIndexId?: number; db?: any },
-    extraCommands?: string[]
+    extraCommands?: string[],
+    readTrackingKey?: string
   ): ToolExecutionContext {
     const config = loadConfig();
     const availableCommands = Array.from(new Set([
@@ -1267,6 +1262,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     return {
       cwd,
       workspaceId,
+      readTrackingKey,
       availableCommands,
       ragIndexId: ragOptions?.ragIndexId,
       db: ragOptions?.db,

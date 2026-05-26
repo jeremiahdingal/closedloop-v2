@@ -9,17 +9,23 @@ async function main() {
   async function runJob(job: { id: string; kind: string; payload: unknown; attempts: number }) {
     try {
       await recovery.processJob(job);
-      db.completeJob(job.id);
+      const liveJob = db.listJobRecords().find((entry: any) => entry.id === job.id);
+      if (liveJob?.status === "running") {
+        db.completeJob(job.id);
+      }
     } catch (error) {
-      db.failJob(job.id, (error as Error).message, false);
+      const liveJob = db.listJobRecords().find((entry: any) => entry.id === job.id);
+      if (liveJob?.status === "running") {
+        db.failJob(job.id, (error as Error).message, false);
+      }
       console.error(`Job ${job.id} failed:`, error);
     }
   }
 
   for (;;) {
     recovery.recoverExpiredLeases();
-    recovery.healQueueState();
     await recovery.rerunStaleRuns(config.staleRunAfterMs, config.staleRunMaxRecoveries);
+    recovery.healQueueState();
     await recovery.rescueQueuedTicketStalls();
     await bridge.cleanupArchivedWorkspaces();
 
@@ -41,7 +47,11 @@ async function main() {
       continue;
     }
 
-    await Promise.all(jobs.map(runJob));
+    for (const job of jobs) {
+      void runJob(job);
+    }
+
+    await sleep(config.workerPollMs);
   }
 }
 
@@ -51,7 +61,7 @@ async function ensureQueuedTicketsHaveJobs(db: any, recovery: any): Promise<void
     if (ticket.status !== "queued") continue;
     if (!ticket.epicId) continue;
     const epic = db.getEpic(ticket.epicId);
-    if (!epic || epic.status === "cancelled") continue;
+    if (!epic || epic.status === "cancelled" || epic.status === "paused") continue;
 
     // Gate: don't start tickets if the epic is scheduled for a future date
     if (epic.scheduledDate) {

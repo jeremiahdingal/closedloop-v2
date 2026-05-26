@@ -4,7 +4,7 @@
   "reviewer": "mediated:qwen3.5:9b",
   "tester": "skip",
   "explorer": "mediated:qwen3.5:4b",
-  "coder": "mediated:qwen3.5:9b",
+  "coder": "zai:glm-4.7",
   "epicReviewer": "zai:glm-5.1",
   "playWriter": "zai:glm-5.1",
   "playTester": "mediated:qwen3.5:9b",

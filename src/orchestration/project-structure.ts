@@ -166,7 +166,7 @@ async function generateAdaptiveProjectStructurePrefix(repoRoot: string, treeAndI
           temperature: 0.2,
           top_p: 0.9,
           top_k: 40,
-          num_ctx: 16384
+          num_ctx: 65536
         }
       })
     });

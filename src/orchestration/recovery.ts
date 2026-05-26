@@ -45,8 +45,31 @@ export class RecoveryService {
 
   healQueueState(): { recovered: number; failedDuplicates: number } {
     const jobs = this.db.listJobRecords();
-    const groups = new Map<string, Array<{ id: string; kind: string; status: string; payload: any }>>();
+    const staleThreshold = Date.now() - this.config.staleRunAfterMs;
+    const staleCoderThreshold = Date.now() - this.config.staleCoderRunAfterMs;
+
+    // First pass: requeue zombie running jobs (no heartbeat for a long time)
+    let recovered = 0;
+    let failedDuplicates = 0;
     for (const job of jobs) {
+      if (job.status !== "running") continue;
+      const payload = (job.payload ?? {}) as Record<string, unknown>;
+      const runId = String(payload.runId ?? "");
+      if (!runId) continue;
+      const run = this.db.getRun(runId);
+      if (!run) continue;
+      const heartbeat = run.heartbeatAt ? new Date(run.heartbeatAt).getTime() : 0;
+      const threshold = (run.currentNode ?? "").toLowerCase() === "coder" ? staleCoderThreshold : staleThreshold;
+      if (heartbeat > 0 && heartbeat < threshold) {
+        this.db.failJob(job.id, `Recovered zombie running job for stalled run ${runId}.`, true);
+        recovered += 1;
+      }
+    }
+
+    // Second pass: deduplicate active jobs per run
+    const groups = new Map<string, Array<{ id: string; kind: string; status: string; payload: any }>>();
+    const freshJobs = this.db.listJobRecords();
+    for (const job of freshJobs) {
       const payload = (job.payload ?? {}) as Record<string, unknown>;
       const runId = String(payload.runId ?? "");
       if (!runId) continue;
@@ -55,9 +78,6 @@ export class RecoveryService {
       bucket.push({ id: job.id, kind: job.kind, status: job.status, payload });
       groups.set(key, bucket);
     }
-
-    let recovered = 0;
-    let failedDuplicates = 0;
 
     for (const bucket of groups.values()) {
       const runId = String(bucket[0].payload.runId);
@@ -273,9 +293,12 @@ export class RecoveryService {
             || lower.includes("network");
         });
 
+        const isReviewerStall = node.includes("reviewer");
         const repeatedBlockers = streamTexts.some((text) => text.toLowerCase().includes("blocker"));
         const repeatedTestFailure = streamTexts.some((text) => text.toLowerCase().includes("tests failed"));
-        const doctor = deterministicDoctor({ repeatedBlockers, repeatedTestFailure, noDiff, infraFailure, isStall: true });
+        const doctor = isReviewerStall
+          ? { decision: "retry_same_node" as const, reason: "Reviewer stalled; restarting reviewer on existing diff." }
+          : deterministicDoctor({ repeatedBlockers, repeatedTestFailure, noDiff, infraFailure, isStall: true });
 
         const ticketLabel = run.ticketId ? `ticket ${run.ticketId}` : `run ${run.id}`;
         if (run.attempt >= maxRecoveries || doctor.decision === "escalate" || doctor.decision === "blocked") {
@@ -349,7 +372,11 @@ export class RecoveryService {
               lastMessage: requeueMessage
             });
           }
-          this.db.enqueueJob("run_ticket", { ticketId: run.ticketId, epicId: run.epicId, runId: run.id, recovery: true });
+          if (isReviewerStall) {
+            this.db.enqueueJob("run_ticket", { ticketId: run.ticketId, epicId: run.epicId, runId: run.id, recovery: true, recoveryNode: "reviewer" });
+          } else {
+            this.db.enqueueJob("run_ticket", { ticketId: run.ticketId, epicId: run.epicId, runId: run.id, recovery: true });
+          }
         } else if (run.epicId) {
           this.db.enqueueJob("run_epic", { epicId: run.epicId, runId: run.id });
         }

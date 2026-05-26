@@ -181,6 +181,31 @@ test("StreamParser handles arguments that are incomplete JSON", () => {
   assert.equal(args.path, "test.ts");
 });
 
+test("StreamParser salvages the first JSON object from concatenated tool arguments", () => {
+  const parser = new StreamParser();
+
+  const concatenatedArgs = '{"path":"api/src/services/variants/variant.route.ts"}{"path":"api/src/services/variants/variants.service.ts"}';
+  const ndjson = JSON.stringify({
+    model: "test",
+    created_at: "2026-01-01T00:00:00Z",
+    message: {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        function: { name: "read_file", arguments: concatenatedArgs },
+      }],
+    },
+    done: false,
+  });
+  parser.feed(ndjson);
+  parser.feed(makeDoneNDJSON());
+
+  const state = parser.drain();
+  assert.equal(state.toolCalls.length, 1);
+  const args = JSON.parse(state.toolCalls[0].arguments);
+  assert.deepEqual(args, { path: "api/src/services/variants/variant.route.ts" });
+});
+
 test("StreamParser captures usage from done line", () => {
   const parser = new StreamParser();
 

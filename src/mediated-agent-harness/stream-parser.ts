@@ -1,4 +1,5 @@
 import type {
+  ChatCompletionChunk,
   CompleteToolCall,
   OllamaChatResponse,
   StreamState,
@@ -22,6 +23,53 @@ export class StreamParser {
 
   constructor(onStreamingContent?: (text: string, isThinking: boolean) => void) {
     this.onStreamingContent = onStreamingContent;
+  }
+
+  feedOpenAI(chunk: ChatCompletionChunk): void {
+    if (chunk.usage) {
+      this.usage = chunk.usage;
+    }
+
+    const choice = chunk.choices?.[0];
+    if (!choice) return;
+
+    if (choice.finish_reason) {
+      this.done = true;
+    }
+
+    const delta = choice.delta;
+    if (!delta) return;
+
+    if (delta.content) {
+      this.accumulateContent(delta.content);
+    }
+
+    // Handle reasoning/thinking deltas (common in OpenRouter/DeepSeek/etc.)
+    const reasoning = (delta as any).reasoning_content || (delta as any).reasoning || (delta as any).thinking;
+    if (reasoning) {
+      this.thinking += reasoning;
+      this.onStreamingContent?.(reasoning, true);
+    }
+
+    if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const idx = tc.index;
+        let existing = this.toolCalls.get(idx);
+        
+        if (!existing) {
+          existing = { name: tc.function?.name ?? "", argsBuffer: "" };
+          this.toolCalls.set(idx, existing);
+        }
+
+        if (tc.function?.name && !existing.name) {
+          existing.name = tc.function.name;
+        }
+
+        if (tc.function?.arguments) {
+          existing.argsBuffer += tc.function.arguments;
+        }
+      }
+    }
   }
 
   feed(rawLine: string): void {
@@ -219,9 +267,60 @@ export class StreamParser {
       JSON.parse(repaired);
       return repaired;
     } catch {
+      const firstObject = this.extractFirstBalancedJsonObject(repaired);
+      if (firstObject) {
+        try {
+          JSON.parse(firstObject);
+          return firstObject;
+        } catch {
+          // Fall through to the wrapped raw payload.
+        }
+      }
+
       // If repair fails, return as-is wrapped in an object
       return JSON.stringify({ _raw: raw });
     }
+  }
+
+  private extractFirstBalancedJsonObject(raw: string): string | null {
+    let depth = 0;
+    let start = -1;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = 0; i < raw.length; i++) {
+      const ch = raw[i];
+
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === "\"") {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+
+      if (ch === "{") {
+        if (depth === 0) start = i;
+        depth++;
+        continue;
+      }
+
+      if (ch === "}") {
+        if (depth === 0) continue;
+        depth--;
+        if (depth === 0 && start >= 0) {
+          return raw.slice(start, i + 1);
+        }
+      }
+    }
+
+    return null;
   }
 }
 

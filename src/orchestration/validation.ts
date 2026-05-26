@@ -100,6 +100,134 @@ function normalizeBuilderPath(value: string): string {
     .trim();
 }
 
+function extractJsonCandidates(raw: string): string[] {
+  const candidates: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < raw.length; index += 1) {
+    const char = raw[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{" || char === "[") {
+      if (depth === 0) start = index;
+      depth += 1;
+      continue;
+    }
+
+    if ((char === "}" || char === "]") && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        candidates.push(raw.slice(start, index + 1));
+        start = -1;
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function repairLooseJsonText(raw: string): string {
+  let repaired = "";
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < raw.length; index += 1) {
+    const char = raw[index];
+
+    if (!inString) {
+      repaired += char;
+      if (char === "\"") inString = true;
+      continue;
+    }
+
+    if (escaped) {
+      repaired += char;
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      const next = raw[index + 1];
+      if (next && /["\\/bfnrtu]/.test(next)) {
+        repaired += char;
+        escaped = true;
+      } else {
+        repaired += "\\\\";
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      repaired += char;
+      inString = false;
+      continue;
+    }
+
+    if (char === "\n") {
+      repaired += "\\n";
+      continue;
+    }
+
+    if (char === "\r") {
+      repaired += "\\r";
+      continue;
+    }
+
+    if (char === "\t") {
+      repaired += "\\t";
+      continue;
+    }
+
+    const code = char.charCodeAt(0);
+    if (code < 0x20) {
+      repaired += `\\u${code.toString(16).padStart(4, "0")}`;
+      continue;
+    }
+
+    repaired += char;
+  }
+
+  return repaired;
+}
+
+function tryParseJsonCandidate(candidate: string): { ok: true; value: unknown } | { ok: false; error: Error } {
+  try {
+    return { ok: true, value: JSON.parse(candidate) };
+  } catch (error1) {
+    const repaired = repairLooseJsonText(candidate);
+    if (repaired !== candidate) {
+      try {
+        return { ok: true, value: JSON.parse(repaired) };
+      } catch (error2) {
+        return { ok: false, error: error2 as Error };
+      }
+    }
+    return { ok: false, error: error1 as Error };
+  }
+}
+
 export function validateGoalDecomposition(value: unknown): GoalDecomposition {
   if (!value || typeof value !== "object") throw new Error("Goal decomposition is not an object");
   const record = value as Record<string, unknown>;
@@ -138,6 +266,23 @@ export function validateBuilderPlan(value: unknown): BuilderPlan {
 export function validateReviewerVerdict(value: unknown): ReviewerVerdict {
   if (!value || typeof value !== "object") throw new Error("Reviewer verdict is not an object");
   const record = value as Record<string, unknown>;
+  if (
+    (record.verdict === "approved" || record.verdict === "rejected") &&
+    typeof record.summary === "string" &&
+    isStringArray(record.issues)
+  ) {
+    const issues = record.issues.filter((issue) => issue.trim().length > 0);
+    const approved = record.verdict === "approved";
+    const normalized = {
+      approved,
+      blockers: approved ? [] : issues.length ? issues : [record.summary],
+      suggestions: approved ? issues : [],
+      riskLevel: approved ? "low" : "high",
+    } satisfies ReviewerVerdict;
+    ensureReviewerTextLooksValid(normalized.blockers, "blockers");
+    ensureReviewerTextLooksValid(normalized.suggestions, "suggestions");
+    return normalized;
+  }
   if (
     typeof record.approved !== "boolean" ||
     !isStringArray(record.blockers) ||
@@ -220,45 +365,29 @@ export function validateFailureDecisionWithContext(value: unknown, context: Fail
 
 export function parseJsonText(text: string): unknown {
   const trimmed = text.trim();
+  const sources = new Set<string>();
 
-  // 1. Prefer content inside <FINAL_JSON> tags
   const tagged = trimmed.match(/<FINAL_JSON>([\s\S]*?)<\/FINAL_JSON>/i);
-  if (tagged) {
-    try { return JSON.parse(tagged[1].trim()); } catch {}
-  }
+  if (tagged?.[1]) sources.add(tagged[1].trim());
 
-  // 2. Fenced code block
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenced) {
-    try { return JSON.parse(fenced[1].trim()); } catch {}
+  if (fenced?.[1]) sources.add(fenced[1].trim());
+
+  for (const candidate of extractJsonCandidates(trimmed)) {
+    sources.add(candidate.trim());
   }
 
-  // 3. Brace-balanced extraction — find first { or [ and walk to matching close
-  const firstBrace = Math.min(
-    ...[trimmed.indexOf("{"), trimmed.indexOf("[")].filter((index) => index >= 0)
-  );
-  if (!Number.isFinite(firstBrace) || firstBrace < 0) return JSON.parse(trimmed);
+  sources.add(trimmed);
 
-  const openChar = trimmed[firstBrace];
-  const closeChar = openChar === "{" ? "}" : "]";
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = firstBrace; i < trimmed.length; i++) {
-    const c = trimmed[i];
-    if (inString) {
-      if (escaped) { escaped = false; continue; }
-      if (c === "\\") { escaped = true; continue; }
-      if (c === '"') inString = false;
-      continue;
-    }
-    if (c === '"') { inString = true; continue; }
-    if (c === openChar) depth++;
-    else if (c === closeChar && --depth === 0) return JSON.parse(trimmed.slice(firstBrace, i + 1));
+  let lastError: Error | null = null;
+  for (const source of sources) {
+    const parsed = tryParseJsonCandidate(source);
+    if (parsed.ok) return parsed.value;
+    lastError = parsed.error;
   }
 
-  // 4. Last resort: slice from first brace to end
-  return JSON.parse(trimmed.slice(firstBrace));
+  if (lastError) throw lastError;
+  throw new Error("JSON text could not be parsed");
 }
 
 function ensureReviewerTextLooksValid(items: string[], fieldName: "blockers" | "suggestions"): void {

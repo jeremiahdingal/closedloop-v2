@@ -16,6 +16,40 @@ export function createDuplicateRecoveryState(): DuplicateRecoveryState {
   };
 }
 
+const duplicateRecoverySessions = new Map<string, DuplicateRecoveryState>();
+
+export function loadDuplicateRecoveryState(sessionKey?: string): DuplicateRecoveryState {
+  if (!sessionKey) return createDuplicateRecoveryState();
+  const existing = duplicateRecoverySessions.get(sessionKey);
+  if (!existing) return createDuplicateRecoveryState();
+  return {
+    bannedSignatures: [...existing.bannedSignatures],
+    recoveryCount: existing.recoveryCount,
+    postRecoveryCallCount: existing.postRecoveryCallCount,
+    isInRecovery: existing.isInRecovery,
+    hasMadeProgress: existing.hasMadeProgress,
+  };
+}
+
+export function persistDuplicateRecoveryState(
+  sessionKey: string | undefined,
+  state: DuplicateRecoveryState,
+): void {
+  if (!sessionKey) return;
+  duplicateRecoverySessions.set(sessionKey, {
+    bannedSignatures: [...state.bannedSignatures],
+    recoveryCount: state.recoveryCount,
+    postRecoveryCallCount: state.postRecoveryCallCount,
+    isInRecovery: state.isInRecovery,
+    hasMadeProgress: state.hasMadeProgress,
+  });
+}
+
+export function clearDuplicateRecoveryState(sessionKey?: string): void {
+  if (!sessionKey) return;
+  duplicateRecoverySessions.delete(sessionKey);
+}
+
 // ─── Error classification ──────────────────────────────────────────────────
 
 function classifyError(error: string): string {
@@ -127,14 +161,15 @@ export async function performDuplicateRecovery(
     recentHistory: historyText.slice(0, 6000),
   };
 
-  // 2. Try compactor model
+  // 2. Try compactor model. If it cannot launch/respond in time, fall back to
+  // the deterministic prompt below so recovery still continues.
   let compactedJson: string | null = null;
 
   try {
     const response = await fetch(`${baseURL}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(Number(process.env.DUPLICATE_RECOVERY_COMPACTOR_TIMEOUT_MS ?? 60_000)),
       body: JSON.stringify({
         model: COMPACTION_MODEL,
         messages: [

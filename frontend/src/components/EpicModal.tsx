@@ -20,11 +20,14 @@ export function EpicModal(props: {
   epic: Epic;
   open: boolean;
   onClose: () => void;
+  onRedecode: () => void;
   onRetry: () => void;
   onReview: () => void;
   onPlayLoop: () => void;
   onMarkDone: () => void;
   onCancel: () => void;
+  onPause: () => void;
+  onResume: () => void;
   onDelete: () => void;
   actionBusy: boolean;
   epicEvents: AgentEvent[];
@@ -231,6 +234,9 @@ export function EpicModal(props: {
 
         {/* Footer */}
         <div className="modal-footer">
+          <button className="btn btn-modal-retry" onClick={props.onRedecode} disabled={props.actionBusy}>
+            Re-decode Epic
+          </button>
           {["failed", "escalated", "executing"].includes(props.epic.status) && (
             <button className="btn btn-modal-retry" onClick={props.onRetry} disabled={props.actionBusy}>
               ▶ Retry Epic
@@ -247,6 +253,15 @@ export function EpicModal(props: {
           <button className="btn" onClick={props.onPlayLoop} disabled={props.actionBusy}>
             🧪 Play Loop
           </button>
+          {props.epic.status === "paused" ? (
+            <button className="btn" onClick={props.onResume} disabled={props.actionBusy}>
+              ▶ Resume
+            </button>
+          ) : ["executing", "planning", "reviewing"].includes(props.epic.status) ? (
+            <button className="btn" onClick={props.onPause} disabled={props.actionBusy}>
+              ⏸ Pause
+            </button>
+          ) : null}
           <button
             className="btn btn-modal-cancel"
             onClick={props.onCancel}

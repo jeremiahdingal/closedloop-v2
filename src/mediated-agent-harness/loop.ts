@@ -17,7 +17,8 @@ import { CallHistory, validateAndRepair, stableStringify } from "./validator.ts"
 import { computeBudget, shouldCompact, summarizeMessages, estimateMessagesTokens } from "./context-budget.ts";
 import { classifyStall, computeStallLevel, getRecoveryAction, createStallState, recordStall, resetStallCounters, type StallState, type StallKind } from "./stall-recovery.ts";
 import {
-  createDuplicateRecoveryState,
+  loadDuplicateRecoveryState,
+  persistDuplicateRecoveryState,
   checkDuplicateCall,
   isCallBanned,
   performDuplicateRecovery,
@@ -50,7 +51,8 @@ export function resolveModelContextWindow(model: string): number {
   else if (model.startsWith("qwen3.5:9b")) result = 65536;
   else if (model.startsWith("qwen3.5:4b")) result = 65536;
   else if (model.startsWith("qwen3.5:27b")) result = 65536;
-  else if (model.includes("qwen3.6-27b")) result = 6144;
+  else if (model.includes("qwen3.6-35b")) result = 8192;
+  else if (model.includes("qwen3.6-27b")) result = 32768;
   else if (model.startsWith("ibm/granite4.1:30b-q3")) result = 8192;
   else if (model.startsWith("ibm/granite4.1")) result = 32768;
   else if (model.startsWith("qwen3:14b")) result = 65536;
@@ -76,7 +78,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
   const temperature = config.temperature ?? 1.0;
   const topP = config.topP ?? 0.95;
   const topK = config.topK ?? 64;
-  const numCtx = resolveModelContextWindow(config.model);
+  const numCtx = config.numCtx ?? resolveModelContextWindow(config.model);
   const emit = config.onEvent ?? (() => {});
 
   // Augment tool context with braveApiKey from config if not already set
@@ -109,7 +111,8 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
   const startTime = Date.now();
   let lastActivityTime = startTime;
   let stallState = createStallState();
-  let dupRecoveryState = createDuplicateRecoveryState();
+  const duplicateRecoverySessionKey = `${config.role ?? "unknown"}:${config.cwd}`;
+  let dupRecoveryState = loadDuplicateRecoveryState(duplicateRecoverySessionKey);
 
   emit({ kind: "text", text: `--- SYSTEM PROMPT ---\n${systemPrompt}\n\n--- USER PROMPT ---\n${userPrompt}\n-------------------` });
 
@@ -118,7 +121,8 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     const now = Date.now();
     const totalElapsed = now - startTime;
     const idleElapsed = now - lastActivityTime;
-    if (totalElapsed > timeoutMs && idleElapsed > 60_000) {
+    const idleThresholdMs = config.role === "coder" ? 600_000 : 60_000;
+    if (totalElapsed > timeoutMs && idleElapsed > idleThresholdMs) {
       throw new LoopTimeoutError(
         `Loop timed out after ${totalElapsed}ms (limit: ${timeoutMs}ms, idle: ${idleElapsed}ms)`,
         totalElapsed,
@@ -194,27 +198,12 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
 
 
-    // Coder: convergence at 60% — force to conclude
-    if (config.role === "coder" && iteration >= Math.floor(maxIterations * 0.6)) {
-      messages.push({
-        role: "user",
-        content: `[SYSTEM] You are at iteration ${iteration + 1} of ${maxIterations}. You have used 60% of your budget. STOP reading files. You MUST call the finish tool NOW with your edit plan as the result parameter (a JSON string). No more tool calls.`
-      });
-      emit({ kind: "text", text: `[convergence] Budget at 60%, forcing coder to conclude...` });
-    }
-
     // Context budget check — applies to ALL roles
     if (iteration > 3) {
       const budget = computeBudget(messages, numCtx);
       const compactLevel = shouldCompact(budget);
 
-      if (compactLevel === "force_finish") {
-        messages.push({
-          role: "user",
-          content: "[SYSTEM] Context window is nearly full (90%+). You MUST call the finish tool NOW. Pass your analysis as the result parameter (a JSON string). No more tool calls."
-        });
-        emit({ kind: "text", text: `[context] Budget at ${Math.round(budget.usedFraction * 100)}%, forcing finish...` });
-      } else if (compactLevel !== "none") {
+      if (compactLevel !== "none") {
         const passNum = stallState.compaction.passCount + 1;
         emit({ kind: "text", text: `[context] Budget at ${Math.round(budget.usedFraction * 100)}%, summarizing history (pass ${passNum})...` });
 
@@ -226,7 +215,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
           // on the COMPACTED HISTORY blob and produces empty responses.
           messages.push({
             role: "user",
-            content: "[SYSTEM] Context was compacted to free space. Continue working on your task. Pick up where you left off. Call a tool now."
+            content: buildPostCompactionResumePrompt(config.role)
           });
           stallState = {
             ...stallState,
@@ -248,6 +237,8 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     try {
       if (apiBackend === "anthropic") {
         response = await fetchAnthropic(baseURL, config.apiKey ?? "", config.model, messages, tools, effectiveToolMode, systemPrompt, numCtx);
+      } else if (apiBackend === "openrouter") {
+        response = await fetchOpenRouter(baseURL || "https://openrouter.ai/api/v1", config.apiKey ?? "", config.model, messages, tools, effectiveToolMode, temperature, topP, topK, numCtx);
       } else {
         response = await fetchOllama(baseURL, config.model, messages, tools, effectiveToolMode, temperature, topP, topK, numCtx, config.noThink);
       }
@@ -267,9 +258,20 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       );
     }
 
+    // Repetition spiral detection
+    let lastChunk = "";
+    let repeatCount = 0;
+    const SPIRAL_THRESHOLD = 5;
+    let spiralDetected = false;
+    const textSpiralGuard = createTextSpiralGuard();
+
     // Parse streaming response
     const parser = new StreamParser((text: string, isThinking: boolean) => {
       emit({ kind: isThinking ? "streaming_thinking" : "streaming_text", text });
+      if (!isThinking && textSpiralGuard.feed(text)) {
+        spiralDetected = true;
+        emit({ kind: "text", text: "[spiral-detected] Repeated assistant text detected. Aborting stream." });
+      }
     });
     const reader = response.body?.getReader();
     if (!reader) {
@@ -284,8 +286,26 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        if (spiralDetected) break;
 
-        buffer += decoder.decode(value, { stream: true });
+        const decoded = decoder.decode(value, { stream: true });
+        buffer += decoded;
+
+        // Repetition spiral detection: same chunk repeated N times
+        const trimmedChunk = decoded.trim();
+        if (trimmedChunk.length > 10) {
+          if (trimmedChunk === lastChunk) {
+            repeatCount++;
+            if (repeatCount >= SPIRAL_THRESHOLD) {
+              spiralDetected = true;
+              emit({ kind: "text", text: `[spiral-detected] Same chunk repeated ${repeatCount + 1} times. Aborting stream.` });
+              break;
+            }
+          } else {
+            lastChunk = trimmedChunk;
+            repeatCount = 0;
+          }
+        }
 
         if (apiBackend === "anthropic") {
           // Anthropic SSE: event:\ndata:{json}\n\n
@@ -313,6 +333,20 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
               }
             } catch { /* skip malformed */ }
           }
+        } else if (apiBackend === "openrouter") {
+          // OpenAI SSE: data: {json}
+          const events = buffer.split("\n\n");
+          buffer = events.pop() ?? "";
+          for (const event of events) {
+            const dataLine = event.split("\n").find(l => l.startsWith("data:"));
+            if (!dataLine) continue;
+            const jsonStr = dataLine.slice(5).trim();
+            if (!jsonStr || jsonStr === "[DONE]") continue;
+            try {
+              const chunk = JSON.parse(jsonStr);
+              parser.feedOpenAI(chunk);
+            } catch { /* skip */ }
+          }
         } else {
           // Ollama NDJSON: one JSON object per line
           const lines = buffer.split("\n");
@@ -339,12 +373,31 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
               }
             } catch { /* skip */ }
           }
+        } else if (apiBackend === "openrouter") {
+           const dataLine = buffer.split("\n").find(l => l.startsWith("data:"));
+           if (dataLine) {
+             const jsonStr = dataLine.slice(5).trim();
+             if (jsonStr && jsonStr !== "[DONE]") {
+               try {
+                 const chunk = JSON.parse(jsonStr);
+                 parser.feedOpenAI(chunk);
+               } catch { /* skip */ }
+             }
+           }
         } else {
           parser.feed(buffer.trim());
         }
       }
     } finally {
       reader.releaseLock();
+    }
+
+    if (spiralDetected) {
+      throw new StagnationError(
+        "Repeated assistant text detected during streaming",
+        iteration + 1,
+        "no_progress"
+      );
     }
 
     const state = parser.drain();
@@ -530,6 +583,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
             recoveryCount: dupRecoveryState.recoveryCount + 1,
             postRecoveryCallCount: 0, isInRecovery: true, hasMadeProgress: false,
           };
+          persistDuplicateRecoveryState(duplicateRecoverySessionKey, dupRecoveryState);
           messages.length = 0;
           messages.push({ role: "system", content: systemPrompt }, { role: "user", content: recoveryPrompt });
           stallState = createStallState();
@@ -652,6 +706,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
           isInRecovery: true,
           hasMadeProgress: false,
         };
+        persistDuplicateRecoveryState(duplicateRecoverySessionKey, dupRecoveryState);
 
         // Clear messages and inject recovery context
         messages.length = 0;
@@ -690,6 +745,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         if (!result.isError) {
           dupRecoveryState = { ...dupRecoveryState, hasMadeProgress: true };
         }
+        persistDuplicateRecoveryState(duplicateRecoverySessionKey, dupRecoveryState);
         if (shouldForceFinishAfterRecovery(dupRecoveryState)) {
           messages.push({
             role: "user",
@@ -757,7 +813,64 @@ function requiresExplicitFinish(role?: string): boolean {
     || role === "coder";
 }
 
+function buildPostCompactionResumePrompt(role?: string): string {
+  if (role === "coder") {
+    return [
+      "[SYSTEM] Context was compacted to free space. Resume from the compacted history and the live workspace state.",
+      "",
+      "Coder resume protocol:",
+      "1. Do not search for .orchestrator/context.json manually. If context is needed, call read_context_packet once; if it is missing, continue without it.",
+      "2. First call git_diff or git_status to recover the current progress already on disk.",
+      "3. Use the compacted history and diff to identify the smallest remaining change.",
+      "4. Read only the specific file you need next, then write or search_replace. Do not restart broad exploration.",
+      "5. If the diff already satisfies the ticket, call finish immediately with the final JSON result.",
+    ].join("\n");
+  }
+
+  return [
+    "[SYSTEM] Context was compacted to free space. Resume from the compacted history and live workspace state.",
+    "Do not search for orchestrator bookkeeping files manually. If you need the context packet, call read_context_packet once; if it is missing, continue with the prompt and compacted history.",
+    "Continue with the next concrete tool call needed for your role, or call finish if you already have enough information.",
+  ].join("\n");
+}
+
 // ─── JSON extraction from text ──────────────────────────────────────────────
+
+function createTextSpiralGuard(): { feed(text: string): boolean } {
+  let visibleText = "";
+  return {
+    feed(text: string): boolean {
+      visibleText = (visibleText + text).slice(-12_000);
+      const paragraphs = visibleText
+        .split(/\n\s*\n+/)
+        .map(normalizeSpiralText)
+        .filter((paragraph) => paragraph.length >= 80);
+
+      if (paragraphs.length < 4) return false;
+
+      for (let blockSize = 1; blockSize <= 4; blockSize++) {
+        if (paragraphs.length < blockSize * 4) continue;
+        const lastBlock = paragraphs.slice(-blockSize).join("\n");
+        let repeated = 1;
+        for (let end = paragraphs.length - blockSize; end >= blockSize; end -= blockSize) {
+          const candidate = paragraphs.slice(end - blockSize, end).join("\n");
+          if (candidate !== lastBlock) break;
+          repeated++;
+        }
+        if (repeated >= 4) return true;
+      }
+      return false;
+    },
+  };
+}
+
+function normalizeSpiralText(text: string): string {
+  return text
+    .replace(/\s+/g, " ")
+    .replace(/\[[^\]]+\]\s*/g, "")
+    .trim()
+    .toLowerCase();
+}
 
 function extractJson(text: string): unknown | null {
   // Try direct parse
@@ -1143,7 +1256,6 @@ async function fetchOllama(
   return fetch(`${baseURL}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    signal: AbortSignal.timeout(900_000),
     body: JSON.stringify({
       model,
       messages: messages.map(convertToOllamaMessage),
@@ -1188,7 +1300,6 @@ async function fetchAnthropic(
       "anthropic-version": "2023-06-01",
       "content-type": "application/json",
     },
-    signal: AbortSignal.timeout(900_000),
     body: JSON.stringify({
       model,
       max_tokens: 16384,
@@ -1197,5 +1308,36 @@ async function fetchAnthropic(
       messages: anthropicMessages,
       ...(anthropicTools?.length ? { tools: anthropicTools } : {}),
     }),
+  });
+}
+
+async function fetchOpenRouter(
+  baseURL: string,
+  apiKey: string,
+  model: string,
+  messages: ChatMessage[],
+  tools: any[],
+  toolMode: string,
+  temperature: number,
+  topP: number,
+  _topK: number,
+  _numCtx: number,
+): Promise<Response> {
+  const url = "https://openrouter.ai/api/v1/chat/completions";
+  const body = {
+    model,
+    messages: [{ role: "user", content: "Hello" }],
+    stream: true
+  };
+
+  return fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://github.com/google/gemini-cli",
+      "X-Title": "Gemini CLI Integration Test"
+    },
+    body: JSON.stringify(body),
   });
 }

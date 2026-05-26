@@ -554,3 +554,44 @@ test("loop rejects non-JSON text response", async () => {
     await rm(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("loop aborts repeated assistant text spirals", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
+  const repeated =
+    "The diff has a critical syntax error in AppQueryClientWithListener.tsx:\n\n" +
+    "-  return (\n+  return (n (\n\n" +
+    "The line return (n ( is invalid JSX/TypeScript syntax. It will cause a compilation error. This must be return (.";
+
+  const ndjsonLines = [
+    makeTextChunk(`${repeated}\n\n`),
+    makeTextChunk(`${repeated}\n\n`),
+    makeTextChunk(`${repeated}\n\n`),
+    makeTextChunk(`${repeated}\n\n`),
+    DONE_LINE,
+  ];
+  const { server, port } = await createMockServer(ndjsonLines);
+
+  try {
+    await assert.rejects(
+      () =>
+        runMediatedLoop({
+          systemPrompt: "Test",
+          userPrompt: "Review this diff.",
+          config: {
+            baseURL: `http://localhost:${port}`,
+            apiKey: "",
+            model: "test-model",
+            cwd: tmpDir,
+            temperature: 0,
+            maxIterations: 5,
+            role: "reviewer",
+          },
+          toolContext: createMockContext(tmpDir),
+        }),
+      (err: any) => err.name === "StagnationError" && /Repeated assistant text/.test(err.message)
+    );
+  } finally {
+    server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
