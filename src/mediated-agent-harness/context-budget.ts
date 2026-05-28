@@ -61,7 +61,7 @@ export function computeBudget(
 }
 
 export function shouldCompact(budget: ContextBudget): CompactionLevel {
-  if (budget.usedFraction >= 0.95) return "summarize";
+  if (budget.usedFraction >= 0.75) return "summarize";
   return "none";
 }
 
@@ -144,7 +144,17 @@ function enforceTokenBudget(messages: ChatMessage[], targetTokens: number): Chat
   return result;
 }
 
-export const COMPACTION_MODEL = process.env.COMPACTION_MODEL || "qwen3.5:2b";
+export const DEFAULT_COMPACTION_MODEL = process.env.COMPACTION_MODEL || "qwen3.5:2b";
+
+export function resolveCompactionModel(primaryModel: string): string {
+  if (process.env.COMPACTION_MODEL?.trim()) {
+    return process.env.COMPACTION_MODEL.trim();
+  }
+  if (primaryModel.startsWith("glm-4.7")) {
+    return primaryModel;
+  }
+  return DEFAULT_COMPACTION_MODEL;
+}
 
 export async function summarizeMessages(
   messages: ChatMessage[],
@@ -172,8 +182,7 @@ export async function summarizeMessages(
   // Build summarization prompt
   const historyText = formatMessagesForSummary(oldHistory);
 
-  // Use a small fast model for compaction — the main agent model is too slow for summarization
-  const compactionModel = COMPACTION_MODEL;
+  const compactionModel = resolveCompactionModel(model);
 
   // Call the model to summarize via Ollama native /api/chat, with retry
   let summaryResponse: Response | null = null;

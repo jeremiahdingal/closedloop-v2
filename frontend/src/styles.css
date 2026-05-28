@@ -1898,6 +1898,37 @@ body::after {
   white-space: nowrap;
 }
 
+.model-bar-override {
+  color: #7a3e00;
+  border-color: #7a3e00;
+}
+
+.model-bar-details {
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  font-size: 0.68rem;
+  color: #333;
+  text-align: right;
+}
+
+.model-bar-details code {
+  background: #fff;
+  padding: 0 0.2rem;
+  border: 1px solid var(--win-gray-dark);
+  border-radius: 2px;
+}
+
+.model-bar-note {
+  margin-top: 0.35rem;
+  font-size: 0.72rem;
+  color: #5c3400;
+  background: #fff9e6;
+  border: 1px solid #d1a54b;
+  padding: 0.35rem 0.5rem;
+}
+
 .modal-stream-list {
   overflow-y: auto;
   overflow-x: hidden;

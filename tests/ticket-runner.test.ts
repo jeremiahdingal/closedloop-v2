@@ -72,6 +72,93 @@ test("ticket runner completes a successful build-review-test loop", async () => 
   }
 });
 
+test("ticket approval supersedes other active runs and jobs for the same ticket", async () => {
+  const repoRoot = await makeTempDir("repo-");
+  const dataDir = await makeTempDir("data-");
+  await initGitRepo(repoRoot);
+
+  const services = await bootstrapForTest({
+    REPO_ROOT: repoRoot,
+    DATA_DIR: dataDir,
+    TEST_COMMAND: "node --eval \"process.exit(0)\"",
+    LINT_COMMAND: "node --eval \"process.exit(0)\"",
+    TYPECHECK_COMMAND: "node --eval \"process.exit(0)\""
+  }, { dryRun: true });
+
+  try {
+    const epic = GoalRunner.createEpic(services.db, {
+      id: "epic_supersede",
+      title: "Supersede duplicate runs",
+      goalText: "Only one approved run should survive.",
+      targetDir: repoRoot
+    });
+    services.db.createTicket({
+      id: "ticket_supersede",
+      epicId: epic.id,
+      title: "Update README once",
+      description: "Approve one run and cancel the duplicates.",
+      acceptanceCriteria: ["README updated"],
+      dependencies: [],
+      allowedPaths: ["README.md"],
+      priority: "high",
+      status: "queued",
+      metadata: { maxBuildAttempts: 2 }
+    });
+
+    const gateway = new MockGateway({
+      builderPlans: [
+        {
+          summary: "Append line to README",
+          intendedFiles: ["README.md"],
+          operations: [{ kind: "append_file", path: "README.md", content: "\nBuilt by supersede test\n" }]
+        }
+      ],
+      reviewerVerdicts: [
+        {
+          approved: true,
+          blockers: [],
+          suggestions: [],
+          riskLevel: "low"
+        }
+      ]
+    });
+    const runner = new TicketRunner(services.db, services.bridge, gateway, services.lifecycle);
+    const winningRunId = await runner.start("ticket_supersede", epic.id);
+
+    services.db.createRun({
+      id: "run_duplicate_active",
+      kind: "ticket",
+      epicId: epic.id,
+      ticketId: "ticket_supersede",
+      status: "running",
+      currentNode: "coder",
+      attempt: 0,
+      heartbeatAt: null,
+      lastMessage: "Duplicate active run.",
+      errorText: null
+    });
+    services.db.enqueueJob("run_ticket", {
+      ticketId: "ticket_supersede",
+      epicId: epic.id,
+      runId: "run_duplicate_active"
+    });
+
+    const result = await runner.runExisting(winningRunId);
+
+    assert.equal(result.status, "approved");
+    assert.equal(services.db.getTicket("ticket_supersede")?.currentRunId, winningRunId);
+    assert.equal(services.db.getRun("run_duplicate_active")?.status, "cancelled");
+    assert.equal(
+      services.db.listJobRecords().find((job) => String((job.payload as any).runId ?? "") === "run_duplicate_active")?.status,
+      "failed"
+    );
+    const supersedeEvent = services.db.listEvents(50).find((event) => String(event.kind ?? "") === "ticket_runs_superseded");
+    assert.ok(supersedeEvent);
+  } finally {
+    services.restore();
+  }
+});
+
 test("config defaults reviewer to direct qwen3:14b", () => {
   const models = readModelsFile();
   assert.equal(models.reviewer, "qwen3:14b");

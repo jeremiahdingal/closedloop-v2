@@ -39,8 +39,20 @@ export type AppConfig = {
   toolRagIncludeRepairHintsOnFirstAttempt: boolean;
 };
 
+export type WorkspaceConfig = {
+  targetDir?: string;
+  role?: string;
+  modelId?: string;
+  remoteOverrideEnabled?: boolean;
+  [key: string]: unknown;
+};
+
 export function getModelsFilePath(): string {
   return path.resolve(process.cwd(), "config", "agent-models.json");
+}
+
+export function getWorkspaceConfigPath(): string {
+  return path.resolve(process.cwd(), "config", "workspace.json");
 }
 
 export function readModelsFile(): Record<AgentRole, string> {
@@ -50,6 +62,25 @@ export function readModelsFile(): Record<AgentRole, string> {
 
 export function writeModelsFile(models: Record<AgentRole, string>): void {
   writeFileSync(getModelsFilePath(), `${JSON.stringify(models, null, 2)}\n`, "utf8");
+}
+
+export function readWorkspaceConfig(): WorkspaceConfig {
+  const filePath = getWorkspaceConfigPath();
+  try {
+    return JSON.parse(readFileSync(filePath, "utf8")) as WorkspaceConfig;
+  } catch {
+    return {};
+  }
+}
+
+export function writeWorkspaceConfig(config: WorkspaceConfig): WorkspaceConfig {
+  writeFileSync(getWorkspaceConfigPath(), `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  return config;
+}
+
+export function updateWorkspaceConfig(patch: Partial<WorkspaceConfig>): WorkspaceConfig {
+  const next = { ...readWorkspaceConfig(), ...patch };
+  return writeWorkspaceConfig(next);
 }
 
 export function updateAgentModel(role: AgentRole, model: string): Record<AgentRole, string> {

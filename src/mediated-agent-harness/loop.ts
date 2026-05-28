@@ -47,7 +47,7 @@ export interface LoopInput {
 
 export function resolveModelContextWindow(model: string): number {
   let result = 65536;
-  if (model.startsWith("glm-4.7-flash")) result = 65536;
+  if (model.startsWith("glm-4.7")) result = 200000;
   else if (model.startsWith("qwen3.5:9b")) result = 65536;
   else if (model.startsWith("qwen3.5:4b")) result = 65536;
   else if (model.startsWith("qwen3.5:27b")) result = 65536;
@@ -576,7 +576,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
             recoveryCount: dupRecoveryState.recoveryCount + 1,
           });
           const recoveryPrompt = await performDuplicateRecovery(
-            messages, systemPrompt, dupCheck.bannedSignature, numCtx, baseURL,
+            messages, systemPrompt, dupCheck.bannedSignature, numCtx, baseURL, config.model,
           );
           dupRecoveryState = {
             bannedSignatures: [...dupRecoveryState.bannedSignatures, dupCheck.bannedSignature],
@@ -696,7 +696,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         });
 
         const recoveryPrompt = await performDuplicateRecovery(
-          messages, systemPrompt, dupCheck.bannedSignature, numCtx, baseURL,
+          messages, systemPrompt, dupCheck.bannedSignature, numCtx, baseURL, config.model,
         );
 
         dupRecoveryState = {
@@ -1232,13 +1232,71 @@ function parseArgsToObject(argsStr: string): Record<string, unknown> {
 
 // ─── Backend fetch helpers ────────────────────────────────────────────────────
 
-function convertToAnthropicMessages(messages: ChatMessage[]): { role: string; content: string }[] {
-  return messages.map(m => {
-    if (m.role === "tool") {
-      return { role: "user", content: `Tool result: ${m.content ?? ""}` };
+type AnthropicContentBlock =
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
+  | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean };
+
+type AnthropicMessage = {
+  role: "user" | "assistant";
+  content: AnthropicContentBlock[];
+};
+
+function appendAnthropicBlocks(
+  messages: AnthropicMessage[],
+  role: "user" | "assistant",
+  blocks: AnthropicContentBlock[],
+): void {
+  if (blocks.length === 0) return;
+  const last = messages[messages.length - 1];
+  if (last?.role === role) {
+    last.content.push(...blocks);
+    return;
+  }
+  messages.push({ role, content: [...blocks] });
+}
+
+function convertToAnthropicMessages(messages: ChatMessage[]): AnthropicMessage[] {
+  const anthropicMessages: AnthropicMessage[] = [];
+
+  for (const msg of messages) {
+    if (msg.role === "system") continue;
+
+    if (msg.role === "assistant") {
+      const blocks: AnthropicContentBlock[] = [];
+      if (msg.content) {
+        blocks.push({ type: "text", text: msg.content });
+      }
+      if (msg.tool_calls?.length) {
+        for (const tc of msg.tool_calls) {
+          blocks.push({
+            type: "tool_use",
+            id: tc.id,
+            name: tc.function.name,
+            input: parseArgsToObject(tc.function.arguments),
+          });
+        }
+      }
+      appendAnthropicBlocks(anthropicMessages, "assistant", blocks);
+      continue;
     }
-    return { role: m.role === "assistant" ? "assistant" : "user", content: m.content ?? "" };
-  }).filter(m => m.role === "user" || m.role === "assistant");
+
+    if (msg.role === "tool") {
+      appendAnthropicBlocks(anthropicMessages, "user", [{
+        type: "tool_result",
+        tool_use_id: msg.tool_call_id ?? "tool_call_unknown",
+        content: msg.content ?? "",
+        ...(msg.content?.startsWith("Error:") ? { is_error: true } : {}),
+      }]);
+      continue;
+    }
+
+    if (msg.content) {
+      appendAnthropicBlocks(anthropicMessages, "user", [{ type: "text", text: msg.content }]);
+    }
+  }
+
+  return anthropicMessages;
 }
 
 async function fetchOllama(

@@ -12,6 +12,8 @@ import { ensureProjectStructureFile } from "./project-structure.ts";
 import { buildContextForQuery } from "../rag/context-builder.ts";
 import { git } from "../bridge/git.ts";
 import { parseJsonText, validateGoalDecomposition } from "./validation.ts";
+import { readWorkspaceConfig } from "../config.ts";
+import { resolveRuntimeProfile } from "../runtime-profile.ts";
 
 export interface PlanRunInput {
   cwd: string;
@@ -43,6 +45,7 @@ export function planNeedsClarification(plan: GoalDecomposition | null | undefine
  * and never creates runs, tickets, or epics.
  */
 export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult> {
+  const runtimeProfile = resolveRuntimeProfile(input.gateway.models, readWorkspaceConfig());
   const emit = (content: string) =>
     input.onStream?.({
       agentRole: "epicDecoder",
@@ -77,7 +80,7 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
     input.userMessages,
     projectStructure,
     ragCtx,
-    input.gateway.models.coder
+    runtimeProfile.effectiveModels.coder
   );
 
   const { gateway } = input;
@@ -88,15 +91,16 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
   // to avoid sending qwen-cli/codex-cli as model IDs to OpenCode.
 
   // qwen-cli / codex-cli / gemini-cli — runs via QwenRunner / CodexRunner / GeminiRunner
-  if (
-    gateway.runEpicDecoderInWorkspace &&
-    (
-      configuredModel === "codex-cli" ||
-      configuredModel === "qwen-cli" ||
-      configuredModel === "gemini-cli" ||
-      configuredModel.startsWith("zai:")
-    )
-  ) {
+    if (
+      gateway.runEpicDecoderInWorkspace &&
+      (
+        configuredModel === "codex-cli" ||
+        configuredModel === "qwen-cli" ||
+        configuredModel === "gemini-cli" ||
+        configuredModel.startsWith("zai:") ||
+        configuredModel.startsWith("anthropic-mediated:")
+      )
+    ) {
     try {
       const result = await gateway.runEpicDecoderInWorkspace({
         cwd: input.cwd,
@@ -127,8 +131,8 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
     }
   }
 
-  // mediated:<model> — runs via MediatedAgentHarness
-  if (gateway.runEpicDecoderInWorkspace && configuredModel.startsWith("mediated:")) {
+  // mediated:<model> / anthropic-mediated:<model> — runs via MediatedAgentHarness
+  if (gateway.runEpicDecoderInWorkspace && (configuredModel.startsWith("mediated:") || configuredModel.startsWith("anthropic-mediated:"))) {
     try {
       const result = await gateway.runEpicDecoderInWorkspace({
         cwd: input.cwd,

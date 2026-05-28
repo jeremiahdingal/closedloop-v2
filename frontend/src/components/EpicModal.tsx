@@ -1,7 +1,7 @@
 import React, { useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AgentEvent, Epic, Ticket } from "../types.ts";
+import { AgentEvent, Epic, EpicMergeStatus, Ticket } from "../types.ts";
 import { headingSlug, nodeText } from "../utils.ts";
 
 const mdComponents = {
@@ -24,12 +24,15 @@ export function EpicModal(props: {
   onRetry: () => void;
   onReview: () => void;
   onPlayLoop: () => void;
+  onMergeToMain: () => void;
   onMarkDone: () => void;
   onCancel: () => void;
   onPause: () => void;
   onResume: () => void;
   onDelete: () => void;
   actionBusy: boolean;
+  mergeStatus: EpicMergeStatus | null;
+  mergeStatusLoading: boolean;
   epicEvents: AgentEvent[];
   epicTickets: Ticket[];
 }) {
@@ -39,12 +42,11 @@ export function EpicModal(props: {
       if (
         !event.payload ||
         (event.payload.streamKind !== "assistant" && event.payload.streamKind !== "thinking")
-      )
-        continue;
+      ) continue;
       const clean = (event.payload.content || "").replace(/<FINAL_JSON>[\s\S]*?<\/FINAL_JSON>/g, "");
-      for (const m of clean.matchAll(/^(#{1,3})\s+(.+)$/gm)) {
-        const text = m[2].trim();
-        result.push({ id: headingSlug(text), text, level: m[1].length });
+      for (const match of clean.matchAll(/^(#{1,3})\s+(.+)$/gm)) {
+        const text = match[2].trim();
+        result.push({ id: headingSlug(text), text, level: match[1].length });
       }
     }
     return result;
@@ -64,10 +66,9 @@ export function EpicModal(props: {
   return (
     <div className="modal-backdrop" onClick={props.onClose}>
       <div className="modal epic-modal" onClick={(e) => e.stopPropagation()}>
-        {/* Header */}
         <div className="modal-header">
           <div className="modal-header-left">
-            <span>📂</span>
+            <span>[Epic]</span>
             <div className="modal-header-title-wrap">
               <h2>{props.epic.title}</h2>
               <span className={`pill pill-${props.epic.status}`}>{props.epic.status}</span>
@@ -75,26 +76,24 @@ export function EpicModal(props: {
           </div>
           <div className="win-titlebar-buttons">
             <button className="win-btn-box" onClick={props.onClose}>
-              ×
+              X
             </button>
           </div>
         </div>
 
-        {/* Two-column body — reuses planning-modal layout classes */}
         <div className="planning-modal-body">
-          {/* Sidebar */}
           <div className="planning-modal-sidebar">
             {headings.length > 0 && (
               <div className="plan-nav-group">
                 <div className="plan-nav-group-label">Contents</div>
-                {headings.map((h) => (
+                {headings.map((heading) => (
                   <button
-                    key={h.id + h.text}
-                    className={`plan-nav-item plan-nav-h${h.level}`}
-                    onClick={() => scrollToSection(h.id)}
-                    title={h.text}
+                    key={heading.id + heading.text}
+                    className={`plan-nav-item plan-nav-h${heading.level}`}
+                    onClick={() => scrollToSection(heading.id)}
+                    title={heading.text}
                   >
-                    {h.text}
+                    {heading.text}
                   </button>
                 ))}
               </div>
@@ -102,16 +101,16 @@ export function EpicModal(props: {
             {props.epicTickets.length > 0 && (
               <div className="plan-nav-group">
                 <div className="plan-nav-group-label">Tickets · {props.epicTickets.length}</div>
-                {props.epicTickets.map((t, i) => (
-                  <div className="plan-nav-ticket" key={t.id}>
-                    <span className="plan-nav-ticket-num">{i + 1}</span>
+                {props.epicTickets.map((ticket, index) => (
+                  <div className="plan-nav-ticket" key={ticket.id}>
+                    <span className="plan-nav-ticket-num">{index + 1}</span>
                     <div className="plan-nav-ticket-body">
-                      <div className="plan-nav-ticket-title">{t.title}</div>
+                      <div className="plan-nav-ticket-title">{ticket.title}</div>
                       <span
-                        className={`pill pill-${t.status} plan-nav-ticket-priority`}
+                        className={`pill pill-${ticket.status} plan-nav-ticket-priority`}
                         style={{ fontSize: "0.65rem" }}
                       >
-                        {t.status}
+                        {ticket.status}
                       </span>
                     </div>
                   </div>
@@ -124,7 +123,7 @@ export function EpicModal(props: {
                 {[
                   ["ID", props.epic.id],
                   ["Dir", props.epic.targetDir],
-                  ["Branch", props.epic.targetBranch || "—"],
+                  ["Branch", props.epic.targetBranch || "-"],
                   ["Created", new Date(props.epic.createdAt).toLocaleString()],
                   ["Updated", new Date(props.epic.updatedAt).toLocaleString()],
                 ].map(([label, value]) => (
@@ -135,12 +134,27 @@ export function EpicModal(props: {
                 ))}
               </div>
             </div>
+            {props.epic.status === "done" && (
+              <div className="plan-nav-group">
+                <div className="plan-nav-group-label">Merge to Main</div>
+                <div className="epic-sidebar-meta">
+                  <div className="epic-meta-row">
+                    <span className="epic-meta-label">Status</span>
+                    <span className="epic-meta-value">
+                      {props.mergeStatusLoading
+                        ? "Checking..."
+                        : props.mergeStatus?.canMerge
+                        ? "Ready"
+                        : props.mergeStatus?.message || "Unavailable"}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
-          {/* Main content */}
           <div className="planning-modal-main">
             <div className="modal-stream-list">
-              {/* Description */}
               <div className="epic-main-section">
                 <div className="epic-main-section-label">Description</div>
                 <div className="plan-md-content">
@@ -148,27 +162,21 @@ export function EpicModal(props: {
                 </div>
               </div>
 
-              {/* Plan Analysis (from Plan Mode) */}
               {planEvents.length > 0 && (
                 <div className="epic-main-section">
                   <div className="epic-main-section-label">Plan Analysis</div>
                   {planEvents.map((event) => (
                     <div
-                      className={`modal-stream-item plan-stream-item plan-stream-${
-                        event.payload?.streamKind || "raw"
-                      }`}
+                      className={`modal-stream-item plan-stream-item plan-stream-${event.payload?.streamKind || "raw"}`}
                       key={event.id}
                     >
                       <div className="modal-stream-meta">
                         <span className={`pill pill-${event.payload?.streamKind || "raw"}`}>
                           {event.payload?.streamKind || "raw"}
                         </span>
-                        <span className="modal-stream-time">
-                          {event.payload?.source || "planner"}
-                        </span>
+                        <span className="modal-stream-time">{event.payload?.source || "planner"}</span>
                       </div>
-                      {event.payload?.streamKind === "assistant" ||
-                      event.payload?.streamKind === "thinking" ? (
+                      {event.payload?.streamKind === "assistant" || event.payload?.streamKind === "thinking" ? (
                         <div className="plan-md-content">
                           <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
                             {(event.payload.content || "")
@@ -184,15 +192,12 @@ export function EpicModal(props: {
                 </div>
               )}
 
-              {/* Epic-level Activity */}
               {activityEvents.length > 0 && (
                 <div className="epic-main-section">
                   <div className="epic-main-section-label">Epic Activity</div>
                   {activityEvents.map((event) => (
                     <div
-                      className={`modal-stream-item plan-stream-item plan-stream-${
-                        event.payload?.streamKind || "raw"
-                      }`}
+                      className={`modal-stream-item plan-stream-item plan-stream-${event.payload?.streamKind || "raw"}`}
                       key={event.id}
                     >
                       <div className="modal-stream-meta">
@@ -206,8 +211,7 @@ export function EpicModal(props: {
                           {new Date(event.created_at).toLocaleTimeString()}
                         </span>
                       </div>
-                      {event.payload?.streamKind === "assistant" ||
-                      event.payload?.streamKind === "thinking" ? (
+                      {event.payload?.streamKind === "assistant" || event.payload?.streamKind === "thinking" ? (
                         <div className="plan-md-content">
                           <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
                             {(event.payload.content || "")
@@ -232,52 +236,48 @@ export function EpicModal(props: {
           </div>
         </div>
 
-        {/* Footer */}
         <div className="modal-footer">
           <button className="btn btn-modal-retry" onClick={props.onRedecode} disabled={props.actionBusy}>
             Re-decode Epic
           </button>
           {["failed", "escalated", "executing"].includes(props.epic.status) && (
             <button className="btn btn-modal-retry" onClick={props.onRetry} disabled={props.actionBusy}>
-              ▶ Retry Epic
+              Retry Epic
             </button>
           )}
           <button className="btn btn-modal-review" onClick={props.onReview} disabled={props.actionBusy}>
-            🔍 Review
+            Review
           </button>
+          {props.epic.status === "done" && props.mergeStatus?.canMerge && (
+            <button className="btn btn-modal-review" onClick={props.onMergeToMain} disabled={props.actionBusy || props.mergeStatusLoading}>
+              Merge to main
+            </button>
+          )}
           {props.epic.status !== "done" && (
             <button className="btn btn-modal-rescue" onClick={props.onMarkDone} disabled={props.actionBusy}>
-              ✅ Force Done
+              Force Done
             </button>
           )}
           <button className="btn" onClick={props.onPlayLoop} disabled={props.actionBusy}>
-            🧪 Play Loop
+            Play Loop
           </button>
           {props.epic.status === "paused" ? (
             <button className="btn" onClick={props.onResume} disabled={props.actionBusy}>
-              ▶ Resume
+              Resume
             </button>
           ) : ["executing", "planning", "reviewing"].includes(props.epic.status) ? (
             <button className="btn" onClick={props.onPause} disabled={props.actionBusy}>
-              ⏸ Pause
+              Pause
             </button>
           ) : null}
-          <button
-            className="btn btn-modal-cancel"
-            onClick={props.onCancel}
-            disabled={props.actionBusy}
-          >
-            ⏹ Cancel
+          <button className="btn btn-modal-cancel" onClick={props.onCancel} disabled={props.actionBusy}>
+            Cancel
           </button>
-          <button
-            className="btn btn-modal-delete"
-            onClick={props.onDelete}
-            disabled={props.actionBusy}
-          >
-            🗑 Delete
+          <button className="btn btn-modal-delete" onClick={props.onDelete} disabled={props.actionBusy}>
+            Delete
           </button>
           <button className="btn btn-modal-ok" onClick={props.onClose}>
-            ✓ Close
+            Close
           </button>
         </div>
       </div>

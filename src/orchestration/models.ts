@@ -27,6 +27,8 @@ import { ZaiRunner } from "./zai.ts";
 import { MediatedAgentHarness } from "../mediated-agent-harness/index.ts";
 import type { ToolExecutionContext } from "../mediated-agent-harness/types.ts";
 import { ensureModelLoaded, markModelLoaded, unloadCurrentModel } from "./ollama-memory-manager.ts";
+import { readWorkspaceConfig } from "../config.ts";
+import { REMOTE_OVERRIDE_DECODER_MODEL, REMOTE_OVERRIDE_MEDIATED_MODEL, resolveRuntimeProfile } from "../runtime-profile.ts";
 
 export type StreamHook = (event: AgentStreamPayload) => void;
 
@@ -50,12 +52,16 @@ export interface ModelGateway {
   runEpicReviewerCodex?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview>;
 }
 
+interface GatewayOptions {
+  applyRemoteOverride?: boolean;
+}
+
 const DEFAULT_TEMPERATURE = 1.0;
 const DEFAULT_TOP_P = 0.95;
 const DEFAULT_TOP_K = 64;
 
 function resolveOllamaContextWindow(model: string): number {
-  if (model.startsWith("glm-4.7-flash")) return 65536;
+  if (model.startsWith("glm-4.7")) return 200000;
   if (model.startsWith("qwen3.5:9b")) return 65536;
   if (model.startsWith("qwen3.5:27b")) return 65536;
   if (model.includes("qwen3.6-35b")) return 8192;
@@ -607,8 +613,9 @@ export class MockGateway implements ModelGateway {
 
 export class MediatedAgentHarnessGateway implements ModelGateway {
   private readonly _models?: Record<AgentRole, string>;
+  private readonly applyRemoteOverride: boolean;
   get models(): Record<AgentRole, string> {
-    return this._models || loadConfig().models;
+    return this.getEffectiveModels();
   }
 
   private readonly ollama: OllamaGateway;
@@ -622,8 +629,9 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
   private readonly openrouterApiKey: string | undefined;
   private readonly anthropicOverride?: { baseURL: string; apiKey: string; apiBackend: "anthropic"; model: string };
 
-  constructor(ollamaBaseURL?: string, models?: Record<AgentRole, string>, anthropicOverride?: { baseURL: string; apiKey: string; apiBackend: "anthropic"; model: string }) {
+  constructor(ollamaBaseURL?: string, models?: Record<AgentRole, string>, anthropicOverride?: { baseURL: string; apiKey: string; apiBackend: "anthropic"; model: string }, options?: GatewayOptions) {
     this._models = models;
+    this.applyRemoteOverride = options?.applyRemoteOverride ?? true;
     this.ollamaBaseURL = ollamaBaseURL || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
     this.ollama = new OllamaGateway(this.ollamaBaseURL);
     this.opencode = new OpenCodeRunner();
@@ -636,10 +644,28 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     this.anthropicOverride = anthropicOverride;
   }
 
+  private getBaseModels(): Record<AgentRole, string> {
+    return this._models || loadConfig().models;
+  }
+
+  private getEffectiveModels(): Record<AgentRole, string> {
+    const baseModels = this.getBaseModels();
+    if (!this.applyRemoteOverride) return baseModels;
+    const profile = resolveRuntimeProfile(baseModels, readWorkspaceConfig());
+    return profile.effectiveModels;
+  }
+
+  private getRuntimeProfile() {
+    return resolveRuntimeProfile(this.getBaseModels(), readWorkspaceConfig());
+  }
+
   rawPrompt(role: AgentRole, prompt: string): Promise<string> {
     const model = this.resolveHarnessModel(role);
     if (model.startsWith("zai:")) {
       return this.zai.rawPrompt(role, prompt, this.zai.resolveModel(model));
+    }
+    if (model.startsWith("anthropic-mediated:")) {
+      return this.zai.rawPrompt(role, prompt, this.resolveAnthropicMediatedModel(model));
     }
     return this.ollama.rawPrompt(role, prompt);
   }
@@ -680,7 +706,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const toolContext = this.buildToolContext(input.cwd, "reviewer", undefined, undefined, input.runId ?? undefined);
     const harness = new MediatedAgentHarness(this.buildHarnessConfig("reviewer", model, toolContext));
 
-    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
     if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("reviewer", input.prompt, {
       maxIterations: 80,
@@ -724,6 +750,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     if (configuredModel.startsWith("zai:")) {
       return this.zai.runEpicDecoder({ role: "epicDecoder", ...input });
     }
+    if (configuredModel.startsWith("anthropic-mediated:")) {
+      const model = this.resolveHarnessModel("epicDecoder");
+      const toolContext = this.buildToolContext(input.cwd, "epicDecoder", { ragIndexId: input.ragIndexId, db: input.db }, undefined, input.runId ?? undefined);
+      const harness = new MediatedAgentHarness(this.buildHarnessConfig("epicDecoder", model, toolContext));
+      const result = await harness.run("epicDecoder", input.prompt, {
+        maxIterations: 80,
+        timeoutMs: 900_000,
+        toolMode: this.resolveToolMode(model),
+        onEvent: this.buildHarnessEventHandler("epicDecoder", model, input),
+      });
+      return validateGoalDecomposition(parseJsonText(result.text));
+    }
     if (configuredModel.startsWith("opencode:")) {
       const parsed = await this.opencode.runEpicDecoder({ role: "epicDecoder", ...input });
       return validateGoalDecomposition(parsed);
@@ -743,7 +781,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const toolContext = this.buildToolContext(input.cwd, "epicDecoder", { ragIndexId: input.ragIndexId, db: input.db }, undefined, input.runId ?? undefined);
     const harness = new MediatedAgentHarness(this.buildHarnessConfig("epicDecoder", model, toolContext));
 
-    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
     if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("epicDecoder", input.prompt, {
       maxIterations: 80,
@@ -778,6 +816,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     if (configuredModel.startsWith("zai:")) {
       return this.zai.runEpicReviewer({ role: "epicReviewer", ...input });
     }
+    if (configuredModel.startsWith("anthropic-mediated:")) {
+      const model = this.resolveHarnessModel("epicReviewer");
+      const toolContext = this.buildToolContext(input.cwd, "epicReviewer", { ragIndexId: input.ragIndexId, db: input.db }, undefined, input.runId ?? undefined);
+      const harness = new MediatedAgentHarness(this.buildHarnessConfig("epicReviewer", model, toolContext));
+      const result = await harness.run("epicReviewer", input.prompt, {
+        maxIterations: 80,
+        timeoutMs: 900_000,
+        toolMode: this.resolveToolMode(model),
+        onEvent: this.buildHarnessEventHandler("epicReviewer", model, input),
+      });
+      return validateGoalReview(parseJsonText(result.text));
+    }
     if (configuredModel.startsWith("opencode:")) {
       return this.opencode.runEpicReviewer({ role: "epicReviewer", ...input });
     }
@@ -796,7 +846,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const toolContext = this.buildToolContext(input.cwd, "epicReviewer", { ragIndexId: input.ragIndexId, db: input.db }, undefined, input.runId ?? undefined);
     const harness = new MediatedAgentHarness(this.buildHarnessConfig("epicReviewer", model, toolContext));
 
-    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
     if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("epicReviewer", input.prompt, {
       maxIterations: 80,
@@ -860,7 +910,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : [], input.runId ?? undefined);
     const harness = new MediatedAgentHarness(this.buildHarnessConfig("explorer", model, toolContext));
 
-    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
     if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("explorer", input.prompt, {
       maxIterations: 20,
@@ -898,7 +948,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : [], input.runId ?? undefined);
     const harness = new MediatedAgentHarness(this.buildHarnessConfig("coder", model, toolContext));
 
-    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
     if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("coder", input.prompt, {
       maxIterations: 80,
@@ -1057,6 +1107,10 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     if (raw.startsWith("mediated:")) return raw.slice("mediated:".length);
     if (raw.startsWith("zai:")) return raw.slice("zai:".length);
     return raw;
+  }
+
+  private resolveAnthropicMediatedModel(model: string): string {
+    return model.startsWith("anthropic-mediated:") ? model.slice("anthropic-mediated:".length) : model;
   }
 
   private resolveToolMode(_model: string): "native" | "xml" {
@@ -1222,9 +1276,23 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
   }
 
   private buildHarnessConfig(role: AgentRole, model: string, toolContext: ToolExecutionContext): any {
-    const numCtx = role === "coder" || role === "reviewer" ? 65536 : undefined;
+    const numCtx = role === "coder" || role === "reviewer"
+      ? resolveOllamaContextWindow(this.resolveAnthropicMediatedModel(model))
+      : undefined;
     if (this.anthropicOverride) {
       return { ...this.anthropicOverride, braveApiKey: this.braveApiKey, toolContext, ...(numCtx ? { numCtx } : {}) };
+    }
+    if (model.startsWith("anthropic-mediated:")) {
+      const anthropicModel = this.resolveAnthropicMediatedModel(model);
+      return {
+        baseURL: process.env.ZAI_BASE_URL || process.env.ANTHROPIC_BASE_URL || "https://api.z.ai/api/anthropic",
+        apiKey: process.env.ZAI_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || "",
+        apiBackend: "anthropic" as const,
+        model: anthropicModel,
+        braveApiKey: this.braveApiKey,
+        toolContext,
+        ...(numCtx ? { numCtx } : {}),
+      };
     }
     if (model.startsWith("openrouter:")) {
       return {
@@ -1337,13 +1405,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 }
 
 export function createGateway(modelsOverride?: Record<AgentRole, string>): ModelGateway {
-  const models = modelsOverride || loadConfig().models;
-  // If any role uses mediated: prefix, use the mediated harness gateway
-  const hasMediated = Object.values(models).some(m => m.startsWith("mediated:"));
-  if (hasMediated) {
-    return new MediatedAgentHarnessGateway(undefined, modelsOverride);
-  }
-  return new OpenCodeHybridGateway(modelsOverride);
+  return new MediatedAgentHarnessGateway(undefined, modelsOverride);
 }
 
 export function createAnthropicHarnessGateway(): MediatedAgentHarnessGateway {

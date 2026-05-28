@@ -56,34 +56,52 @@ export function AgentModal(props: {
           </div>
         </div>
         {info && safeAdapters.length > 0 && (
-          <div className="modal-model-bar">
-            <label className="model-bar-label">
-              <span className="model-bar-icon">⚙️</span>
-              Model:
-            </label>
-            <select
-              className={`model-bar-select ${!info.switchable ? "disabled" : ""}`}
-              value={info.currentModel}
-              disabled={!info.switchable}
-              onChange={(e) => props.onModelChange?.(e.target.value)}
-            >
-              {safeAdapters.map((adapter) => (
-                <option key={adapter.id} value={adapter.id}>
-                  {adapter.label}
-                </option>
-              ))}
-            </select>
-            {!info.switchable && (
-              <span className="model-bar-lock" title="Model is fixed for this agent">
-                🔒
+          <>
+            <div className="modal-model-bar">
+              <label className="model-bar-label">
+                <span className="model-bar-icon">⚙️</span>
+                Model:
+              </label>
+              <select
+                className={`model-bar-select ${!info.switchable ? "disabled" : ""}`}
+                value={info.currentModel}
+                disabled={!info.switchable}
+                onChange={(e) => props.onModelChange?.(e.target.value)}
+              >
+                {safeAdapters.map((adapter) => (
+                  <option key={adapter.id} value={adapter.id}>
+                    {adapter.label}
+                  </option>
+                ))}
+              </select>
+              {!info.switchable && (
+                <span className="model-bar-lock" title="Model is fixed for this agent">
+                  🔒
+                </span>
+              )}
+              {info.switchable && hasMultipleAdapters && (
+                <span className="model-bar-hint" title={currentDesc}>
+                  {info.currentModel === "codex-cli" ? "📡 workspace-aware" : "🧠 pure LLM"}
+                </span>
+              )}
+              {info.overriddenByProfile && (
+                <span className="model-bar-hint model-bar-override" title={info.overrideReason}>
+                  Remote Override active
+                </span>
+              )}
+            </div>
+            <div className="model-bar-details">
+              <span>
+                Configured: <code>{info.configuredModel}</code>
               </span>
-            )}
-            {info.switchable && hasMultipleAdapters && (
-              <span className="model-bar-hint" title={currentDesc}>
-                {info.currentModel === "codex-cli" ? "📡 workspace-aware" : "🧠 pure LLM"}
+              <span>
+                Effective: <code>{info.effectiveModel}</code>
               </span>
+            </div>
+            {info.overriddenByProfile && info.overrideReason && (
+              <p className="model-bar-note">{info.overrideReason}</p>
             )}
-          </div>
+          </>
         )}
         {cliMode ? (
           <CliTerminal events={mergedItems} status={props.status} />

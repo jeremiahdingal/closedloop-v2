@@ -38,6 +38,8 @@ import { loadReviewContract, runReviewGuard, type ReviewerMode, type ReviewContr
 import { ensureProjectStructureFile } from "./project-structure.ts";
 import { createHash } from "node:crypto";
 import { AgentStreamSessionRegistry } from "./agent-stream-session.ts";
+import { readWorkspaceConfig } from "../config.ts";
+import { resolveRuntimeProfile } from "../runtime-profile.ts";
 
 type TicketLoopResult = {
   runId: string;
@@ -116,6 +118,91 @@ export class TicketRunner {
     this.bridge = bridge;
     this.gateway = gateway;
     this.lifecycle = lifecycle;
+  }
+
+  private async finalizeApprovedRun(params: {
+    runId: string;
+    ticket: TicketRecord;
+    workspaceId: string;
+    diffFiles: { path: string; additions: number; deletions: number }[];
+    prUrl: string | null;
+  }): Promise<void> {
+    const { runId, ticket, workspaceId, diffFiles, prUrl } = params;
+    const timestamp = nowIso();
+    this.db.updateRun({
+      runId,
+      status: "succeeded",
+      currentNode: "complete",
+      heartbeatAt: timestamp,
+      lastMessage: "Ticket approved.",
+      errorText: null
+    });
+    this.db.updateTicketRunState({
+      ticketId: ticket.id,
+      status: "approved",
+      currentRunId: runId,
+      currentNode: "complete",
+      lastHeartbeatAt: timestamp,
+      lastMessage: "Ticket approved.",
+      diffFiles,
+      prUrl
+    });
+    await this.supersedeOtherActiveTicketRuns(ticket, runId);
+    await this.bridge.archiveWorkspace(workspaceId);
+  }
+
+  private async supersedeOtherActiveTicketRuns(ticket: TicketRecord, approvedRunId: string): Promise<void> {
+    const activeRunStatuses = new Set(["queued", "running", "waiting"]);
+    const timestamp = nowIso();
+    const reason = `Superseded after ${approvedRunId} approved ticket.`;
+    const supersededRunIds: string[] = [];
+    const supersededJobIds: string[] = [];
+
+    for (const run of this.db.listRunsForTicket(ticket.id)) {
+      if (run.id === approvedRunId || !activeRunStatuses.has(run.status)) continue;
+      this.db.updateRun({
+        runId: run.id,
+        status: "cancelled",
+        currentNode: "superseded",
+        heartbeatAt: timestamp,
+        lastMessage: reason,
+        errorText: null
+      });
+      supersededRunIds.push(run.id);
+
+      const workspace = this.db.findWorkspaceByRun(run.id);
+      if (workspace && workspace.status === "active") {
+        await this.bridge.archiveWorkspace(workspace.id).catch(() => undefined);
+      }
+    }
+
+    for (const job of this.db.listJobRecords()) {
+      const payload = (job.payload ?? {}) as Record<string, unknown>;
+      if (job.kind !== "run_ticket") continue;
+      if (job.status !== "queued" && job.status !== "running") continue;
+      const payloadTicketId = typeof payload.ticketId === "string" ? payload.ticketId : null;
+      const payloadRunId = typeof payload.runId === "string" ? payload.runId : null;
+      if (payloadRunId === approvedRunId) continue;
+      if (payloadTicketId !== ticket.id && !supersededRunIds.includes(String(payloadRunId ?? ""))) continue;
+      this.db.failJob(job.id, reason, false);
+      supersededJobIds.push(job.id);
+    }
+
+    if (supersededRunIds.length === 0 && supersededJobIds.length === 0) return;
+
+    this.db.recordEvent({
+      aggregateType: "ticket",
+      aggregateId: ticket.id,
+      runId: approvedRunId,
+      ticketId: ticket.id,
+      kind: "ticket_runs_superseded",
+      message: "Approved run superseded duplicate active runs.",
+      payload: {
+        approvedRunId,
+        supersededRunIds,
+        supersededJobIds
+      }
+    });
   }
 
   private shouldSkipTester(): boolean {
@@ -214,9 +301,10 @@ export class TicketRunner {
     const ticket = this.db.getTicket(run.ticketId);
     if (!ticket) throw new Error(`Ticket not found: ${run.ticketId}`);
     this.assertNotCancelled(ticket.id, ticket.epicId);
+    const runtimeProfile = resolveRuntimeProfile(this.gateway.models, readWorkspaceConfig());
 
     // Read skipExplorer from job payload for this run
-    const skipExplorer = options?.skipExplorer === true || this.db.listJobRecords().some(
+    const skipExplorer = runtimeProfile.skipExplorer || options?.skipExplorer === true || this.db.listJobRecords().some(
       (job: any) => job.kind === "run_ticket"
         && (job.payload as any)?.runId === runId
         && (job.payload as any)?.skipExplorer === true
@@ -1251,7 +1339,6 @@ export class TicketRunner {
 
     const finalizeSuccess = async (state: TicketGraphState) => {
       this.assertNotCancelled(ticket.id, ticket.epicId);
-      this.db.updateRun({ runId, status: "succeeded", currentNode: "complete", heartbeatAt: nowIso(), lastMessage: "Ticket approved." });
 
       // Capture diff stats — first try staged, then fall back to diff against merge-base
       let diffStats = await this.bridge.getDiffStats(state.workspaceId);
@@ -1307,16 +1394,13 @@ export class TicketRunner {
         }
       }
 
-      this.db.updateTicketRunState({ 
-        ticketId: ticket.id, 
-        status: "approved", 
-        currentNode: "complete", 
-        lastHeartbeatAt: nowIso(), 
-        lastMessage: "Ticket approved.",
+      await this.finalizeApprovedRun({
+        runId,
+        ticket,
+        workspaceId: state.workspaceId,
         diffFiles: diffStats,
         prUrl
       });
-      await this.bridge.archiveWorkspace(state.workspaceId);
       return { status: "approved", lastMessage: "Ticket approved." } satisfies Partial<TicketGraphState>;
     };
 
@@ -1687,18 +1771,14 @@ export class TicketRunner {
             } as any
           });
           this.assertNotCancelled(ticket.id, ticket.epicId);
-          this.db.updateRun({ runId, status: "succeeded", currentNode: "complete", heartbeatAt: nowIso(), lastMessage: "Ticket approved." });
           const diffStats = await this.bridge.getDiffStats(workspace.id);
-          this.db.updateTicketRunState({
-            ticketId: ticket.id,
-            status: "approved",
-            currentNode: "complete",
-            lastHeartbeatAt: nowIso(),
-            lastMessage: "Ticket approved.",
+          await this.finalizeApprovedRun({
+            runId,
+            ticket,
+            workspaceId: workspace.id,
             diffFiles: diffStats,
             prUrl: null
           });
-          await this.bridge.archiveWorkspace(workspace.id);
           return { runId, workspaceId: workspace.id, status: "approved", lastDiff, reviewVerdict, testSummary };
         }
         
@@ -1745,7 +1825,6 @@ export class TicketRunner {
           
           if (testerResult.testResults === "PASS" || testerResult.testResults === "SKIPPED") {
             this.assertNotCancelled(ticket.id, ticket.epicId);
-            this.db.updateRun({ runId, status: "succeeded", currentNode: "complete", heartbeatAt: nowIso(), lastMessage: "Ticket approved." });
           
             const diffStats = await this.bridge.getDiffStats(workspace.id);
             const commitResult = await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] automated ticket completion` });
@@ -1785,16 +1864,13 @@ export class TicketRunner {
               }
             }
 
-            this.db.updateTicketRunState({
-              ticketId: ticket.id,
-              status: "approved",
-              currentNode: "complete",
-              lastHeartbeatAt: nowIso(),
-              lastMessage: "Ticket approved.",
+            await this.finalizeApprovedRun({
+              runId,
+              ticket,
+              workspaceId: workspace.id,
               diffFiles: diffStats,
               prUrl
             });
-            await this.bridge.archiveWorkspace(workspace.id);
             return { runId, workspaceId: workspace.id, status: "approved", lastDiff, reviewVerdict, testSummary };
           }
           
@@ -1834,7 +1910,6 @@ export class TicketRunner {
 
           if (result.exitCode === 0) {
             this.assertNotCancelled(ticket.id, ticket.epicId);
-            this.db.updateRun({ runId, status: "succeeded", currentNode: "complete", heartbeatAt: nowIso(), lastMessage: "Ticket approved." });
           
             const diffStats = await this.bridge.getDiffStats(workspace.id);
             const commitResult = await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] automated ticket completion` });
@@ -1874,16 +1949,13 @@ export class TicketRunner {
               }
             }
 
-            this.db.updateTicketRunState({
-              ticketId: ticket.id,
-              status: "approved",
-              currentNode: "complete",
-              lastHeartbeatAt: nowIso(),
-              lastMessage: "Ticket approved.",
+            await this.finalizeApprovedRun({
+              runId,
+              ticket,
+              workspaceId: workspace.id,
               diffFiles: diffStats,
               prUrl
             });
-            await this.bridge.archiveWorkspace(workspace.id);
             return { runId, workspaceId: workspace.id, status: "approved", lastDiff, reviewVerdict, testSummary };
           }
           
@@ -3062,6 +3134,8 @@ export class TicketRunner {
     if (!ticket) {
       throw new Error(`Ticket ${ticketId} not found for retry`);
     }
+    const runtimeProfile = resolveRuntimeProfile(this.gateway.models, readWorkspaceConfig());
+    const skipExplorer = runtimeProfile.skipExplorer || options?.skipExplorer === true;
 
     const newRunId = randomId("run");
     this.db.createRun({
@@ -3073,7 +3147,7 @@ export class TicketRunner {
       currentNode: "preparing",
       attempt: 0,
       heartbeatAt: nowIso(),
-      lastMessage: options?.skipExplorer ? "Auto-retry from fresh (skip explorer)." : "Auto-retry from fresh.",
+      lastMessage: skipExplorer ? "Auto-retry from fresh (skip explorer)." : "Auto-retry from fresh.",
       errorText: null
     });
     this.db.updateTicketRunState({
@@ -3082,10 +3156,10 @@ export class TicketRunner {
       currentRunId: newRunId,
       currentNode: "preparing",
       lastHeartbeatAt: nowIso(),
-      lastMessage: options?.skipExplorer ? "Auto-retry starting fresh (skip explorer)." : "Auto-retry starting fresh."
+      lastMessage: skipExplorer ? "Auto-retry starting fresh (skip explorer)." : "Auto-retry starting fresh."
     });
 
-    return await this.runExisting(newRunId, { skipExplorer: options?.skipExplorer === true });
+    return await this.runExisting(newRunId, { skipExplorer });
   }
 
   private assertNotCancelled(ticketId: string, epicId: string | null): void {

@@ -22,6 +22,7 @@ export { runMediatedLoop } from "./loop.ts";
 export interface MediatedAgentHarnessOptions {
   baseURL?: string;
   apiKey?: string;
+  apiBackend?: "ollama" | "anthropic" | "openrouter";
   model: string;
   braveApiKey?: string;
   toolContext: ToolExecutionContext;
@@ -30,6 +31,7 @@ export interface MediatedAgentHarnessOptions {
 export class MediatedAgentHarness {
   private readonly baseURL: string;
   private readonly apiKey: string;
+  private readonly apiBackend: "ollama" | "anthropic" | "openrouter";
   private readonly model: string;
   private readonly braveApiKey: string | undefined;
   private readonly toolContext: ToolExecutionContext;
@@ -37,6 +39,7 @@ export class MediatedAgentHarness {
   constructor(options: MediatedAgentHarnessOptions) {
     this.baseURL = options.baseURL ?? "http://localhost:11434";
     this.apiKey = options.apiKey ?? "";
+    this.apiBackend = options.apiBackend ?? "ollama";
     this.model = options.model;
     this.braveApiKey = options.braveApiKey;
     this.toolContext = options.toolContext;
@@ -57,6 +60,7 @@ export class MediatedAgentHarness {
       config: {
         baseURL: options?.baseURL ?? this.baseURL,
         apiKey: options?.apiKey ?? this.apiKey,
+        apiBackend: options?.apiBackend ?? this.apiBackend,
         model: options?.model ?? this.model,
         cwd: this.toolContext.cwd,
         role: role,
@@ -85,6 +89,7 @@ export class MediatedAgentHarness {
       config: {
         baseURL: options?.baseURL ?? this.baseURL,
         apiKey: options?.apiKey ?? this.apiKey,
+        apiBackend: options?.apiBackend ?? this.apiBackend,
         model: options?.model ?? this.model,
         cwd: this.toolContext.cwd,
         toolMode: options?.toolMode,

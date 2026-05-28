@@ -86,6 +86,27 @@ test("epicDecoderToolingPrompt includes toolContext if present", () => {
   assert.ok(prompt.includes("\"allowedPaths\":[\"string\"]"));
 });
 
+test("epicDecoderToolingPrompt uses capable remote executor guidance for anthropic-mediated glm-4.7", () => {
+  const epic: EpicRecord = {
+    id: "E2",
+    title: "Epic",
+    goalText: "Goal",
+    targetDir: "dir",
+    targetBranch: null,
+    status: "planning",
+    pausedFromStatus: null,
+    scheduledDate: null,
+    assetPaths: [],
+    createdAt: "",
+    updatedAt: ""
+  };
+
+  const prompt = epicDecoderToolingPrompt(epic, null, null, "anthropic-mediated:glm-4.7");
+  assert.ok(prompt.includes("capable remote model with strong reasoning and tool use"));
+  assert.ok(!prompt.includes("small (<14B) model"));
+  assert.ok(!prompt.includes("12-16 tiny tickets"));
+});
+
 test("coderPrompt includes retrieved context when explorer is skipped", () => {
   const ticket: TicketRecord = {
     id: "T2",

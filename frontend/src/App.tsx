@@ -10,6 +10,7 @@ import {
   AgentStreamStatus,
   Dashboard,
   Epic,
+  EpicMergeStatus,
   OllamaPsSnapshot,
   Run,
   Ticket,
@@ -46,6 +47,7 @@ export function App() {
   const [modelsConfig, setModelsConfig] = useState<AgentModelsConfig>({});
   const [ollamaPs, setOllamaPs] = useState<OllamaPsSnapshot>({ ok: false, status: "idle", models: [] });
   const [modelOverrides, setModelOverrides] = useState<Record<string, string>>({});
+  const [remoteOverrideEnabled, setRemoteOverrideEnabled] = useState(false);
   const [title, setTitle] = useState("");
   const [goalText, setGoalText] = useState("");
   const [targetDir, setTargetDir] = useState("");
@@ -75,6 +77,8 @@ export function App() {
   const [isTamagotchiOpen, setIsTamagotchiOpen] = useState(false);
   const [selectedEpic, setSelectedEpic] = useState<string | null>(null);
   const [selectedEpicDetails, setSelectedEpicDetails] = useState<Epic | null>(null);
+  const [selectedEpicMergeStatus, setSelectedEpicMergeStatus] = useState<EpicMergeStatus | null>(null);
+  const [selectedEpicMergeStatusLoading, setSelectedEpicMergeStatusLoading] = useState(false);
   const [selectedTicket, setSelectedTicket] = useState<Ticket | null>(null);
   const [selectedTicketEvents, setSelectedTicketEvents] = useState<AgentEvent[]>([]);
   const selectedTicketRef = useRef<Ticket | null>(null);
@@ -96,6 +100,7 @@ export function App() {
         if (typeof cfg.targetDir === "string") setTargetDir(cfg.targetDir);
         if (typeof cfg.currentBranch === "string" && cfg.currentBranch)
           setTargetBranch(cfg.currentBranch);
+        if (typeof cfg.remoteOverrideEnabled === "boolean") setRemoteOverrideEnabled(cfg.remoteOverrideEnabled);
         if (cfg.models && typeof cfg.models === "object" && !Array.isArray(cfg.models)) {
           setModelsConfig(cfg.models as AgentModelsConfig);
         }
@@ -249,6 +254,29 @@ export function App() {
       cancelled = true;
     };
   }, [selectedTicket?.id, selectedTicket?.currentRunId]);
+
+  useEffect(() => {
+    if (!selectedEpicDetails) {
+      setSelectedEpicMergeStatus(null);
+      setSelectedEpicMergeStatusLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setSelectedEpicMergeStatusLoading(true);
+    void fetchJson<EpicMergeStatus>(`/api/epics/${encodeURIComponent(selectedEpicDetails.id)}/merge-status`)
+      .then((status) => {
+        if (!cancelled) setSelectedEpicMergeStatus(status);
+      })
+      .catch(() => {
+        if (!cancelled) setSelectedEpicMergeStatus(null);
+      })
+      .finally(() => {
+        if (!cancelled) setSelectedEpicMergeStatusLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedEpicDetails?.id, selectedEpicDetails?.updatedAt]);
 
   const isAgentActive = useMemo(() => {
     const now = Date.now();
@@ -800,6 +828,53 @@ export function App() {
     }
   }
 
+  async function mergeEpicToMain(epicId: string) {
+    const confirmed = await confirmToast({
+      title: "Merge epic to main?",
+      description: "This will merge the epic branch into local main if the repo is clean and conflict-free.",
+      confirmLabel: "Merge to Main",
+    });
+    if (!confirmed) return;
+    const toastId = toast.loading("Merging epic branch into main...");
+    try {
+      setActionBusy(`merge-epic-${epicId}`);
+      const result = await fetchJson<{ ok: true; sourceBranch: string; targetBranch: string; mergedCommit: string }>(
+        `/api/epics/${encodeURIComponent(epicId)}/merge-main`,
+        { method: "POST" }
+      );
+      toast.success(`Merged ${result.sourceBranch} into ${result.targetBranch}.`, { id: toastId });
+      if (selectedEpicDetails?.id === epicId) {
+        const status = await fetchJson<EpicMergeStatus>(`/api/epics/${encodeURIComponent(epicId)}/merge-status`);
+        setSelectedEpicMergeStatus(status);
+      }
+      await refresh();
+    } catch (err) {
+      toast.error(`Failed to merge epic: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function updateRemoteOverride(next: boolean) {
+    const toastId = toast.loading(next ? "Enabling Remote Override..." : "Disabling Remote Override...");
+    try {
+      const response = await fetchJson<{ remoteOverrideEnabled?: boolean }>("/api/config", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ remoteOverrideEnabled: next }),
+      });
+      if (typeof response.remoteOverrideEnabled === "boolean") {
+        setRemoteOverrideEnabled(response.remoteOverrideEnabled);
+      } else {
+        setRemoteOverrideEnabled(next);
+      }
+      toast.success(next ? "Remote Override enabled." : "Remote Override disabled.", { id: toastId });
+      void refreshModels();
+    } catch (err) {
+      toast.error(`Failed to update Remote Override: ${(err as Error).message}`, { id: toastId });
+    }
+  }
+
   return (
     <div className="shell">
       {/* Topbar Panel */}
@@ -907,6 +982,14 @@ export function App() {
                 onChange={(e) => setAutoRefresh(e.target.checked)}
               />
               Auto-refresh
+            </label>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={remoteOverrideEnabled}
+                onChange={(e) => void updateRemoteOverride(e.target.checked)}
+              />
+              Remote Override
             </label>
           </div>
         </div>
@@ -1802,12 +1885,15 @@ export function App() {
           onRetry={() => void retryEpic(selectedEpicDetails.id)}
           onReview={() => void reviewEpic(selectedEpicDetails.id)}
           onPlayLoop={() => void playLoopEpic(selectedEpicDetails.id)}
+          onMergeToMain={() => void mergeEpicToMain(selectedEpicDetails.id)}
           onMarkDone={() => void markEpicDone(selectedEpicDetails.id)}
           onCancel={() => void cancelEpic(selectedEpicDetails.id)}
           onPause={() => void pauseEpic(selectedEpicDetails.id)}
           onResume={() => void resumeEpic(selectedEpicDetails.id)}
           onDelete={() => void deleteEpic(selectedEpicDetails.id)}
           actionBusy={actionBusy !== null}
+          mergeStatus={selectedEpicMergeStatus}
+          mergeStatusLoading={selectedEpicMergeStatusLoading}
           epicEvents={data.agentEvents.filter((e) => e.payload?.epicId === selectedEpicDetails.id)}
           epicTickets={data.tickets.filter((t) => t.epicId === selectedEpicDetails.id)}
         />

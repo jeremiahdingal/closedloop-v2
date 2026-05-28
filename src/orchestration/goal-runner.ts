@@ -8,6 +8,7 @@ import type { ModelGateway } from "./models.ts";
 import type { AgentStreamPayload, EpicRecord, GoalDecomposition, GoalReview, GoalTicketPlan, TicketEpicReviewPacket, TicketRecord } from "../types.ts";
 import { TicketRunner } from "./ticket-runner.ts";
 import { loadConfig } from "../config.ts";
+import { readWorkspaceConfig } from "../config.ts";
 import { loadLangGraphRuntime, type LangGraphRuntime } from "./langgraph-loader.ts";
 import { formatOpenCodeFailure } from "./opencode.ts";
 import { formatCodexFailure } from "./codex.ts";
@@ -18,6 +19,7 @@ import { buildContextForQuery, type BuiltContext } from "../rag/context-builder.
 import { git } from "../bridge/git.ts";
 import { ensureProjectStructureFile } from "./project-structure.ts";
 import { PlayLoopService } from "./play-loop.ts";
+import { resolveRuntimeProfile } from "../runtime-profile.ts";
 
 type GoalGraphState = {
   runId: string;
@@ -28,6 +30,7 @@ type GoalGraphState = {
   reviewVerdict: "approved" | "needs_followups" | "failed";
   reviewSummary: string;
   playLoopSuccess: boolean | null;
+  skipEpicReview: boolean;
   status: "pending" | "executing" | "reviewing" | "done" | "failed";
 };
 
@@ -186,6 +189,23 @@ export class GoalRunner {
       executeTickets: this.executeTickets.bind(this),
       runEpicReview: this.runEpicReview.bind(this)
     }, this.epicReviewTimeoutMs, this.heartbeatIntervalMs);
+  }
+
+  private buildOverrideFinalization(tickets: TicketRecord[]): {
+    reviewVerdict: "approved" | "failed";
+    reviewSummary: string;
+  } {
+    const allApproved = tickets.length > 0 && tickets.every((ticket) => ticket.status === "approved");
+    if (allApproved) {
+      return {
+        reviewVerdict: "approved",
+        reviewSummary: "Remote Override complete: all tickets approved."
+      };
+    }
+    return {
+      reviewVerdict: "failed",
+      reviewSummary: `Remote Override complete, but not all tickets were approved: ${tickets.map((ticket) => `${ticket.id}:${ticket.status}`).join(", ")}`
+    };
   }
 
   private async executeTickets(epic: EpicRecord, tickets: TicketRecord[], runId: string): Promise<void> {
@@ -353,6 +373,7 @@ export class GoalRunner {
     if (!run || !run.epicId) throw new Error(`Epic run not found: ${runId}`);
     const epic = this.db.getEpic(run.epicId);
     if (!epic) throw new Error(`Epic not found: ${run.epicId}`);
+    const runtimeProfile = resolveRuntimeProfile(this.gateway.models, readWorkspaceConfig());
     this.assertNotCancelled(epic.id);
     this.assertNotPaused(epic.id);
 
@@ -368,6 +389,7 @@ export class GoalRunner {
       reviewVerdict: z.enum(["approved", "needs_followups", "failed"]).default("approved"),
       reviewSummary: z.string().default(""),
       playLoopSuccess: z.boolean().nullable().default(null),
+      skipEpicReview: z.boolean().default(false),
       status: z.enum(["pending", "executing", "reviewing", "done", "failed"]).default("pending")
     });
 
@@ -392,7 +414,8 @@ export class GoalRunner {
         });
         return {
           ticketIds: preApprovedTickets.map((t) => t.id),
-          decompositionSummary: "Pre-approved plan from Plan Mode."
+          decompositionSummary: "Pre-approved plan from Plan Mode.",
+          skipEpicReview: runtimeProfile.skipEpicReview
         } satisfies Partial<GoalGraphState>;
       }
 
@@ -440,7 +463,8 @@ export class GoalRunner {
       }
       return {
         ticketIds: materialized.ticketIds,
-        decompositionSummary: plan.summary
+        decompositionSummary: plan.summary,
+        skipEpicReview: runtimeProfile.skipEpicReview
       } satisfies Partial<GoalGraphState>;
     };
 
@@ -511,7 +535,19 @@ export class GoalRunner {
             }
           }
         }
-        return { ticketSummaries: summaries, status: "reviewing" } satisfies Partial<GoalGraphState>;
+        const finalTickets = state.ticketIds
+          .map((ticketId) => this.db.getTicket(ticketId))
+          .filter((ticket): ticket is TicketRecord => ticket !== null);
+        const overrideFinalization = state.skipEpicReview
+          ? this.buildOverrideFinalization(finalTickets)
+          : null;
+      return {
+        ticketSummaries: summaries,
+        reviewVerdict: overrideFinalization?.reviewVerdict ?? "approved",
+        reviewSummary: overrideFinalization?.reviewSummary ?? "",
+        status: overrideFinalization ? (overrideFinalization.reviewVerdict === "approved" ? "done" : "failed") : "reviewing",
+        skipEpicReview: state.skipEpicReview
+      } satisfies Partial<GoalGraphState>;
       });
     };
 
@@ -522,6 +558,15 @@ export class GoalRunner {
       this.db.updateRun({ runId, status: "running", currentNode: "goal_review", heartbeatAt: nowIso(), lastMessage: "Reviewing epic." });
       this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Starting goal review with ${state.ticketIds.length} tickets`, runId, epicId: epic.id, sequence: 0 });
       await this.drainActiveTickets(epic.id);
+      if (state.skipEpicReview) {
+        const summary = "Epic review skipped by Remote Override.";
+        this.recordAgentStream({ agentRole: "epicReviewer", source: "orchestrator", streamKind: "assistant", content: summary, runId, epicId: epic.id, sequence: 1, done: true });
+        return {
+          reviewVerdict: "approved",
+          reviewSummary: summary,
+          status: "done"
+        } satisfies Partial<GoalGraphState>;
+      }
       const tickets = this.db.listTickets(epic.id);
       const incompleteTickets = tickets.filter((ticket) => {
         const isTerminal = ["approved", "failed", "escalated"].includes(ticket.status);
@@ -599,9 +644,9 @@ export class GoalRunner {
       .addNode("finalize_goal", finalizeGoal)
       .addEdge(START, "decompose_goal")
       .addEdge("decompose_goal", "execute_tickets")
-      .addEdge("execute_tickets", "goal_review")
+      .addConditionalEdges("execute_tickets", (state: GoalGraphState) => state.skipEpicReview ? "finalize_goal" : "goal_review", ["goal_review", "finalize_goal"])
       .addConditionalEdges("goal_review", (state: GoalGraphState) => {
-        if (state.reviewVerdict === "approved" || state.reviewVerdict === "needs_followups") return "play_loop";
+        if ((state.reviewVerdict === "approved" || state.reviewVerdict === "needs_followups") && runtimeProfile.autoPlayLoopEnabled) return "play_loop";
         return "finalize_goal";
       }, ["play_loop", "finalize_goal"])
       .addEdge("play_loop", "finalize_goal")
@@ -609,7 +654,7 @@ export class GoalRunner {
 
     const graph = graphBuilder.compile();
     try {
-      await graph.invoke({ runId, epicId: epic.id });
+      await graph.invoke({ runId, epicId: epic.id, skipEpicReview: runtimeProfile.skipEpicReview });
     } catch (error) {
       if (error instanceof EpicCancelledError) return;
       if (error instanceof EpicPausedError) return;
@@ -625,6 +670,7 @@ export class GoalRunner {
     if (!run || !run.epicId) throw new Error(`Epic run not found: ${runId}`);
     const epic = this.db.getEpic(run.epicId);
     if (!epic) throw new Error(`Epic not found: ${run.epicId}`);
+    const runtimeProfile = resolveRuntimeProfile(this.gateway.models, readWorkspaceConfig());
     this.assertNotCancelled(epic.id);
     this.assertNotPaused(epic.id);
 
@@ -661,7 +707,9 @@ export class GoalRunner {
         this.db.updateRun({ runId, status: "failed", currentNode: "complete", heartbeatAt: nowIso(), lastMessage: summary, errorText: summary });
         return;
       }
-      const review = await this.withEpicHeartbeat(runId, epic.id, "goal_review", "Reviewing epic.", () => this.runEpicReview(epic, finalTickets, runId));
+      const review = runtimeProfile.skipEpicReview
+        ? { verdict: this.buildOverrideFinalization(finalTickets).reviewVerdict, summary: this.buildOverrideFinalization(finalTickets).reviewSummary, followupTickets: [] }
+        : await this.withEpicHeartbeat(runId, epic.id, "goal_review", "Reviewing epic.", () => this.runEpicReview(epic, finalTickets, runId));
       legacyFinalized = true;
       const approved = review.verdict === "approved";
       const failForward = review.verdict === "needs_followups";
@@ -702,6 +750,7 @@ export class GoalRunner {
   }
 
   private async runEpicDecoder(epic: EpicRecord, runId: string, compact = false, retryNote?: string | null): Promise<GoalDecomposition> {
+    const runtimeProfile = resolveRuntimeProfile(this.gateway.models, readWorkspaceConfig());
     const ragCtx = compact ? null : await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`);
     const projectStructure = compact ? null : await ensureProjectStructureFile(epic.targetDir).catch(() => null);
 
@@ -713,9 +762,9 @@ export class GoalRunner {
 
     let prompt: string;
     if (compact) {
-      prompt = epicDecoderCompactPrompt(epic, this.gateway.models.coder, retryNote ?? undefined) + assetContext;
+      prompt = epicDecoderCompactPrompt(epic, runtimeProfile.effectiveModels.coder, retryNote ?? undefined) + assetContext;
     } else {
-      prompt = epicDecoderToolingPrompt(epic, ragCtx, projectStructure, this.gateway.models.coder, retryNote ?? undefined) + assetContext;
+      prompt = epicDecoderToolingPrompt(epic, ragCtx, projectStructure, runtimeProfile.effectiveModels.coder, retryNote ?? undefined) + assetContext;
     }
 
     const configuredModel = this.gateway.models.epicDecoder;
@@ -726,6 +775,7 @@ export class GoalRunner {
         configuredModel === "qwen-cli" ||
         configuredModel === "gemini-cli" ||
         configuredModel.startsWith("zai:") ||
+        configuredModel.startsWith("anthropic-mediated:") ||
         configuredModel.startsWith("mediated:")
       )
     ) {
@@ -949,6 +999,19 @@ export class GoalRunner {
   }
 
   async enqueueManualReview(epicId: string): Promise<string> {
+    const runtimeProfile = resolveRuntimeProfile(this.gateway.models, readWorkspaceConfig());
+    if (runtimeProfile.skipEpicReview) {
+      const reason = "Epic review is disabled while Remote Override is on.";
+      this.db.recordEvent({
+        aggregateType: "epic",
+        aggregateId: epicId,
+        runId: null,
+        kind: "epic_review_skipped",
+        message: reason,
+        payload: { epicId, reason, remoteOverrideEnabled: true }
+      });
+      return "";
+    }
     const runId = randomId("run");
     this.db.createRun({
       id: runId,
@@ -1003,6 +1066,7 @@ export class GoalRunner {
     if (!run || !run.epicId) throw new Error(`Review run not found: ${runId}`);
     const epic = this.db.getEpic(run.epicId);
     if (!epic) throw new Error(`Epic not found: ${run.epicId}`);
+    const runtimeProfile = resolveRuntimeProfile(this.gateway.models, readWorkspaceConfig());
     this.assertNotCancelled(epic.id);
     this.assertNotPaused(epic.id);
 
@@ -1037,7 +1101,7 @@ export class GoalRunner {
       this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Epic review ${approved ? "approved" : failForward ? "approved with followups" : "rejected"}: ${review.summary}`, runId, epicId: epic.id, sequence: 3, done: true });
 
       // Auto-trigger play loop on approval
-      if (approved || failForward) {
+      if ((approved || failForward) && runtimeProfile.autoPlayLoopEnabled) {
         try {
           this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: "Auto-triggering Playwright e2e test loop...", runId, epicId: epic.id, sequence: 4 });
           const tickets = this.db.listTickets(epic.id);

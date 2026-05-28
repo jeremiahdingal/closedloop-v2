@@ -11,6 +11,26 @@ export type Epic = {
   updatedAt: string;
 };
 
+export type EpicMergeStatus = {
+  epicId: string;
+  sourceBranch: string | null;
+  targetBranch: "main";
+  canMerge: boolean;
+  conflicts: boolean;
+  workingTreeClean: boolean;
+  alreadyMerged: boolean;
+  reason:
+    | "epic_not_done"
+    | "missing_source_branch"
+    | "missing_main_branch"
+    | "dirty_worktree"
+    | "already_merged"
+    | "merge_conflicts"
+    | "git_error"
+    | null;
+  message: string;
+};
+
 export type Ticket = {
   id: string;
   epicId: string;
@@ -63,9 +83,13 @@ export type ModelAdapterOption = {
 };
 
 export type AgentModelInfo = {
+  configuredModel: string;
   currentModel: string;
+  effectiveModel: string;
   adapters: ModelAdapterOption[];
   switchable: boolean;
+  overriddenByProfile: boolean;
+  overrideReason?: string;
 };
 
 export type AgentModelsConfig = Record<string, AgentModelInfo>;

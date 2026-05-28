@@ -2,7 +2,7 @@ import type { ChatMessage } from "./types.ts";
 import type { BannedCallSignature, DuplicateRecoveryState } from "./types.ts";
 import type { CallHistory } from "./validator.ts";
 import { stableStringify } from "./validator.ts";
-import { formatMessagesForSummary, COMPACTION_MODEL } from "./context-budget.ts";
+import { formatMessagesForSummary, resolveCompactionModel } from "./context-budget.ts";
 
 // ─── Recovery state factory ────────────────────────────────────────────────
 
@@ -147,6 +147,7 @@ export async function performDuplicateRecovery(
   bannedSig: BannedCallSignature,
   numCtx: number,
   baseURL: string,
+  model: string,
 ): Promise<string> {
   // 1. Build raw recovery packet
   const historyText = formatMessagesForSummary(messages);
@@ -171,7 +172,7 @@ export async function performDuplicateRecovery(
       headers: { "Content-Type": "application/json" },
       signal: AbortSignal.timeout(Number(process.env.DUPLICATE_RECOVERY_COMPACTOR_TIMEOUT_MS ?? 60_000)),
       body: JSON.stringify({
-        model: COMPACTION_MODEL,
+        model: resolveCompactionModel(model),
         messages: [
           { role: "system", content: RECOVERY_SYSTEM_PROMPT },
           {

@@ -1,5 +1,4 @@
 {
-  "targetDir": "C:\\Users\\dinga\\Projects\\shop-diary-apps",
-  "role": "epicReviewer",
-  "modelId": "mediated:qwen3.5:27b"
+  "targetDir": "C:\\Users\\dinga\\AppData\\Local\\Temp\\repo-7appLB",
+  "remoteOverrideEnabled": true
 }

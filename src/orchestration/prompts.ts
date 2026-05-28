@@ -17,10 +17,17 @@ import type { BuiltContext } from "../rag/context-builder.ts";
 
 function executorConstraint(coderModel?: string): string {
   const m = (coderModel ?? "").toLowerCase();
-  // Large cloud models — can handle more complex tickets
-  if (m.startsWith("zai:")) {
+  // Large cloud / remote mediated models — can handle more complex tickets
+  if (m.startsWith("zai:") || m.startsWith("anthropic-mediated:glm-4.7") || m.startsWith("anthropic-mediated:glm-5.1")) {
     return [
-      "EXECUTOR CONSTRAINT: Tickets will be executed by a cloud-based model with strong reasoning.",
+      "EXECUTOR CONSTRAINT: Tickets will be executed by a capable remote model with strong reasoning and tool use.",
+      "Tickets should be well-scoped and clear, but can be moderately complex — up to 5 files per ticket is fine.",
+      "Prefer splitting large features into smaller tickets for parallelism and easier review, not because the executor is weak.",
+    ].join("\n");
+  }
+  if (m.startsWith("anthropic-mediated:") || m.startsWith("mediated:glm-4.7") || m.startsWith("mediated:glm-5.1")) {
+    return [
+      "EXECUTOR CONSTRAINT: Tickets will be executed by a remote or mediated model with solid reasoning and tool use.",
       "Tickets should be well-scoped and clear, but can be moderately complex — up to 5 files per ticket is fine.",
       "Still prefer splitting large features into smaller tickets for parallelism and easier review.",
     ].join("\n");

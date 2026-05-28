@@ -5,7 +5,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { bootstrap } from "./bootstrap.ts";
-import { loadConfig, updateAgentModel } from "../config.ts";
+import { loadConfig, readWorkspaceConfig, updateAgentModel, updateWorkspaceConfig } from "../config.ts";
 import type { 
   AgentRole, 
   AgentStreamPayload, 
@@ -22,6 +22,8 @@ import { getAvailableToolsList } from "../mediated-agent-harness/tools.ts";
 import { EventEmitter } from "node:events";
 import type { ChatMessage } from "../mediated-agent-harness/types.ts";
 import { getOllamaPsSnapshot } from "./ollama-ps.ts";
+import { resolveAgentModelInfo } from "../runtime-profile.ts";
+import { getEpicMergeStatus, mergeEpicToMain } from "./epic-merge.ts";
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
@@ -470,9 +472,13 @@ type ModelAdapterOption = {
 };
 
 type AgentModelInfo = {
+  configuredModel: string;
   currentModel: string;
+  effectiveModel: string;
   adapters: ModelAdapterOption[];
   switchable: boolean;
+  overriddenByProfile: boolean;
+  overrideReason?: string;
 };
 
 const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
@@ -629,6 +635,7 @@ function parseAdapter(raw: string): { adapter: string; model: string } {
 
 function getAgentModelsConfig(): Record<string, AgentModelInfo> {
   const models = loadConfig().models;
+  const workspaceConfig = readWorkspaceConfig();
   const result: Record<string, AgentModelInfo> = {};
   for (const [role, rawModel] of Object.entries(models)) {
     const { adapter, model } = parseAdapter(rawModel);
@@ -648,10 +655,15 @@ function getAgentModelsConfig(): Record<string, AgentModelInfo> {
         description: "Configured model"
       });
     }
+    const effectiveInfo = resolveAgentModelInfo(role as any, models as any, workspaceConfig);
     result[role] = {
-      currentModel: rawModel,
+      configuredModel: rawModel,
+      currentModel: effectiveInfo.currentModel,
+      effectiveModel: effectiveInfo.effectiveModel,
       adapters,
-      switchable: Boolean(switchableOptions)
+      switchable: Boolean(switchableOptions),
+      overriddenByProfile: effectiveInfo.overriddenByProfile,
+      overrideReason: effectiveInfo.overrideReason,
     };
   }
   return result;
@@ -927,11 +939,52 @@ async function main() {
         const id = decodeURIComponent(doneEpicMatch[1]);
         db.updateEpicStatus(id, "done");
         return json(res, 200, { ok: true });
-      }      const reviewEpicMatch = /^\/api\/epics\/([^/]+)\/review$/.exec(url.pathname);
+      }
+      const epicMergeStatusMatch = /^\/api\/epics\/([^/]+)\/merge-status$/.exec(url.pathname);
+      if (epicMergeStatusMatch && req.method === "GET") {
+        const epicId = decodeURIComponent(epicMergeStatusMatch[1]);
+        const epic = db.getEpic(epicId);
+        if (!epic) return json(res, 404, { error: "epic_not_found" });
+        const status = await getEpicMergeStatus(epic);
+        return json(res, 200, status);
+      }
+      const mergeEpicMainMatch = /^\/api\/epics\/([^/]+)\/merge-main$/.exec(url.pathname);
+      if (mergeEpicMainMatch && req.method === "POST") {
+        const epicId = decodeURIComponent(mergeEpicMainMatch[1]);
+        const epic = db.getEpic(epicId);
+        if (!epic) return json(res, 404, { error: "epic_not_found" });
+        try {
+          const result = await mergeEpicToMain(epic);
+          db.recordEvent({
+            aggregateType: "epic",
+            aggregateId: epicId,
+            runId: null,
+            ticketId: null,
+            kind: "epic_merged_main",
+            message: `Merged '${result.sourceBranch}' into main.`,
+            payload: result
+          });
+          return json(res, 200, { ok: true, ...result });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return json(res, 409, { error: "merge_failed", message });
+        }
+      }
+      const reviewEpicMatch = /^\/api\/epics\/([^/]+)\/review$/.exec(url.pathname);
       if (reviewEpicMatch && req.method === "POST") {
         const epicId = decodeURIComponent(reviewEpicMatch[1]);
         const epic = db.getEpic(epicId);
         if (!epic) return json(res, 404, { error: "epic_not_found" });
+        const workspaceConfig = readWorkspaceConfig();
+        if (workspaceConfig.remoteOverrideEnabled) {
+          return json(res, 200, {
+            ok: true,
+            epicId,
+            skipped: true,
+            reason: "remote_override_enabled",
+            message: "Epic review is disabled while Remote Override is on."
+          });
+        }
 
         // If epic is already approved/completed, do not queue another review run.
         if (epic.status === "done") {
@@ -970,6 +1023,15 @@ async function main() {
         }
 
         const runId = await goalRunner.enqueueManualReview(epicId);
+        if (!runId) {
+          return json(res, 200, {
+            ok: true,
+            epicId,
+            skipped: true,
+            reason: "remote_override_enabled",
+            message: "Epic review is disabled while Remote Override is on."
+          });
+        }
         return json(res, 200, { ok: true, epicId, runId });
       }
       const playLoopEpicMatch = /^\/api\/epics\/([^/]+)\/play-loop$/.exec(url.pathname);
@@ -1371,8 +1433,7 @@ async function main() {
         return json(res, 200, { ok: true, started, count: started.length });
       }
       if (url.pathname === "/api/config" && req.method === "GET") {
-        const configPath = path.join(process.cwd(), "config", "workspace.json");
-        const wsConfig = existsSync(configPath) ? JSON.parse(await readFile(configPath, "utf8")) : {};
+        const wsConfig = readWorkspaceConfig();
         const repoRoot = typeof wsConfig.targetDir === "string" ? wsConfig.targetDir : process.cwd();
         const currentBranch = await git(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
           .then(r => r.stdout.trim())
@@ -1401,10 +1462,7 @@ async function main() {
       }
       if (url.pathname === "/api/config" && req.method === "PUT") {
         const body = await readBody(req);
-        const configPath = path.join(process.cwd(), "config", "workspace.json");
-        const content = existsSync(configPath) ? JSON.parse(await readFile(configPath, "utf8")) : {};
-        Object.assign(content, body);
-        await writeFile(configPath, JSON.stringify(content, null, 2));
+        const content = updateWorkspaceConfig(body);
         return json(res, 200, content);
       }
 
