@@ -14,12 +14,14 @@ export type AppConfig = {
   workerPollMs: number;
   workerConcurrency: number;
   staleRunAfterMs: number;
+  staleCoderRunAfterMs: number;
   staleRunMaxRecoveries: number;
   leaseTtlMs: number;
   workspaceRetentionHours: number;
   localOnly: boolean;
   dryRun: boolean;
   useLangGraph: boolean;
+  useExplorerCoderPipeline: boolean;
   commandCatalog: CommandCatalog;
   models: Record<AgentRole, string>;
   playwrightDevServerCommand: string;
@@ -37,8 +39,20 @@ export type AppConfig = {
   toolRagIncludeRepairHintsOnFirstAttempt: boolean;
 };
 
+export type WorkspaceConfig = {
+  targetDir?: string;
+  role?: string;
+  modelId?: string;
+  remoteOverrideEnabled?: boolean;
+  [key: string]: unknown;
+};
+
 export function getModelsFilePath(): string {
   return path.resolve(process.cwd(), "config", "agent-models.json");
+}
+
+export function getWorkspaceConfigPath(): string {
+  return path.resolve(process.cwd(), "config", "workspace.json");
 }
 
 export function readModelsFile(): Record<AgentRole, string> {
@@ -48,6 +62,25 @@ export function readModelsFile(): Record<AgentRole, string> {
 
 export function writeModelsFile(models: Record<AgentRole, string>): void {
   writeFileSync(getModelsFilePath(), `${JSON.stringify(models, null, 2)}\n`, "utf8");
+}
+
+export function readWorkspaceConfig(): WorkspaceConfig {
+  const filePath = getWorkspaceConfigPath();
+  try {
+    return JSON.parse(readFileSync(filePath, "utf8")) as WorkspaceConfig;
+  } catch {
+    return {};
+  }
+}
+
+export function writeWorkspaceConfig(config: WorkspaceConfig): WorkspaceConfig {
+  writeFileSync(getWorkspaceConfigPath(), `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  return config;
+}
+
+export function updateWorkspaceConfig(patch: Partial<WorkspaceConfig>): WorkspaceConfig {
+  const next = { ...readWorkspaceConfig(), ...patch };
+  return writeWorkspaceConfig(next);
 }
 
 export function updateAgentModel(role: AgentRole, model: string): Record<AgentRole, string> {
@@ -74,16 +107,18 @@ export function loadConfig(): AppConfig {
     apiPort: Number(process.env.API_PORT || 4010),
     workerPollMs: Number(process.env.WORKER_POLL_MS || 1000),
     workerConcurrency: Number(process.env.WORKER_CONCURRENCY || 1),
-    staleRunAfterMs: Number(process.env.STALE_RUN_AFTER_MS || 180_000),
-    staleRunMaxRecoveries: Number(process.env.STALE_RUN_MAX_RECOVERIES || 3),
+    staleRunAfterMs: Number(process.env.STALE_RUN_AFTER_MS || 60_000),
+    staleCoderRunAfterMs: Number(process.env.STALE_CODER_RUN_AFTER_MS || 180_000),
+    staleRunMaxRecoveries: Number(process.env.STALE_RUN_MAX_RECOVERIES || 30),
     leaseTtlMs: Number(process.env.LEASE_TTL_MS || 60_000),
     workspaceRetentionHours: Number(process.env.WORKSPACE_RETENTION_HOURS || 48),
     localOnly: process.env.LOCAL_ONLY === "1",
     dryRun: process.env.DRY_RUN === "1",
     useLangGraph: process.env.USE_LANGGRAPH !== "0",
+    useExplorerCoderPipeline: true,
     commandCatalog: {
       status: process.env.STATUS_COMMAND || "git status --short",
-      test: process.env.TEST_COMMAND || "npm test -- --runInBand",
+      test: process.env.TEST_COMMAND || "npm test",
       lint: process.env.LINT_COMMAND || "npm run lint",
       typecheck: process.env.TYPECHECK_COMMAND || "npm run typecheck",
       build: process.env.BUILD_COMMAND || "npm run build"
@@ -96,9 +131,9 @@ export function loadConfig(): AppConfig {
       || process.env.REVIEWER_MODE === "mediated-deep"
       || process.env.REVIEWER_MODE === "direct-fast")
       ? process.env.REVIEWER_MODE
-      : "direct-fast",
+      : "mediated-deep",
     reviewGuardEnabled: process.env.REVIEW_GUARD_ENABLED !== "0",
-    reviewFastTimeoutMs: Number(process.env.REVIEW_FAST_TIMEOUT_MS || process.env.REVIEWER_TIMEOUT_MS || 180_000),
+    reviewFastTimeoutMs: Number(process.env.REVIEW_FAST_TIMEOUT_MS || process.env.REVIEWER_TIMEOUT_MS || 300_000),
     reviewDeepTimeoutMs: Number(process.env.REVIEW_DEEP_TIMEOUT_MS || process.env.REVIEWER_TIMEOUT_MS || 420_000),
     reviewContractPath: process.env.REVIEW_CONTRACT_PATH || ".closedloop/PROJECT_STRUCTURE.md",
     toolRagEnabled: process.env.TOOL_RAG_ENABLED !== "0",

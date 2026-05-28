@@ -1,6 +1,17 @@
-import React from "react";
+import React, { useEffect, useRef, useMemo } from "react";
 import { AgentEvent, AgentModelInfo, AgentStreamStatus } from "../types.ts";
-import { formatTime } from "../utils.ts";
+import { getMergedEventKey, mergeStreamingEvents } from "../utils.ts";
+import { AgentEventCard } from "./AgentEventCard.tsx";
+import { CliTerminal } from "./CliTerminal.tsx";
+
+function isCliSourced(items: AgentEvent[]): boolean {
+  return items.some(
+    (item) =>
+      item.payload?.source === "orchestrator" &&
+      (typeof item.payload?.metadata?.cliEvent === "string" ||
+        item.payload?.metadata?.command === "claude")
+  );
+}
 
 export function AgentModal(props: {
   role: string;
@@ -13,14 +24,21 @@ export function AgentModal(props: {
 }) {
   if (!props.open) return null;
   const info = props.modelInfo;
+  const mergedItems = mergeStreamingEvents(props.items);
   const safeAdapters = info?.adapters ?? [];
   const hasMultipleAdapters = safeAdapters.length > 1;
   const currentDesc =
     safeAdapters.find((a) => a.id === (info?.currentModel ?? ""))?.description ?? "";
+  const feedEndRef = useRef<HTMLDivElement>(null);
+  const cliMode = useMemo(() => isCliSourced(mergedItems), [mergedItems]);
+
+  useEffect(() => {
+    feedEndRef.current?.scrollIntoView({ behavior: "instant" });
+  }, [mergedItems.length]);
 
   return (
     <div className="modal-backdrop" onClick={props.onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal agent-stream-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <div className="modal-header-left">
             <span>📁</span>
@@ -38,52 +56,65 @@ export function AgentModal(props: {
           </div>
         </div>
         {info && safeAdapters.length > 0 && (
-          <div className="modal-model-bar">
-            <label className="model-bar-label">
-              <span className="model-bar-icon">⚙️</span>
-              Model:
-            </label>
-            <select
-              className={`model-bar-select ${!info.switchable ? "disabled" : ""}`}
-              value={info.currentModel}
-              disabled={!info.switchable}
-              onChange={(e) => props.onModelChange?.(e.target.value)}
-            >
-              {safeAdapters.map((adapter) => (
-                <option key={adapter.id} value={adapter.id}>
-                  {adapter.label}
-                </option>
-              ))}
-            </select>
-            {!info.switchable && (
-              <span className="model-bar-lock" title="Model is fixed for this agent">
-                🔒
+          <>
+            <div className="modal-model-bar">
+              <label className="model-bar-label">
+                <span className="model-bar-icon">⚙️</span>
+                Model:
+              </label>
+              <select
+                className={`model-bar-select ${!info.switchable ? "disabled" : ""}`}
+                value={info.currentModel}
+                disabled={!info.switchable}
+                onChange={(e) => props.onModelChange?.(e.target.value)}
+              >
+                {safeAdapters.map((adapter) => (
+                  <option key={adapter.id} value={adapter.id}>
+                    {adapter.label}
+                  </option>
+                ))}
+              </select>
+              {!info.switchable && (
+                <span className="model-bar-lock" title="Model is fixed for this agent">
+                  🔒
+                </span>
+              )}
+              {info.switchable && hasMultipleAdapters && (
+                <span className="model-bar-hint" title={currentDesc}>
+                  {info.currentModel === "codex-cli" ? "📡 workspace-aware" : "🧠 pure LLM"}
+                </span>
+              )}
+              {info.overriddenByProfile && (
+                <span className="model-bar-hint model-bar-override" title={info.overrideReason}>
+                  Remote Override active
+                </span>
+              )}
+            </div>
+            <div className="model-bar-details">
+              <span>
+                Configured: <code>{info.configuredModel}</code>
               </span>
-            )}
-            {info.switchable && hasMultipleAdapters && (
-              <span className="model-bar-hint" title={currentDesc}>
-                {info.currentModel === "codex-cli" ? "📡 workspace-aware" : "🧠 pure LLM"}
+              <span>
+                Effective: <code>{info.effectiveModel}</code>
               </span>
+            </div>
+            {info.overriddenByProfile && info.overrideReason && (
+              <p className="model-bar-note">{info.overrideReason}</p>
             )}
+          </>
+        )}
+        {cliMode ? (
+          <CliTerminal events={mergedItems} status={props.status} />
+        ) : (
+          <div className="modal-stream-list">
+            {mergedItems.length ? (
+              mergedItems.map((item) => <AgentEventCard key={getMergedEventKey(item)} event={item} />)
+            ) : (
+              <p className="modal-empty">No stream output yet.</p>
+            )}
+            <div ref={feedEndRef} />
           </div>
         )}
-        <div className="modal-stream-list">
-          {props.items.length ? (
-            props.items.map((item) => (
-              <div className="modal-stream-item" key={item.id}>
-                <div className="modal-stream-meta">
-                  <span className={`pill pill-${item.payload?.streamKind || "raw"}`}>
-                    {item.payload?.streamKind || "raw"}
-                  </span>
-                  <span className="modal-stream-time">{formatTime(item.created_at)}</span>
-                </div>
-                <pre>{item.payload?.content || item.message}</pre>
-              </div>
-            ))
-          ) : (
-            <p className="modal-empty">No stream output yet.</p>
-          )}
-        </div>
         <div className="modal-footer">
           <button className="btn" onClick={props.onClose}>
             OK

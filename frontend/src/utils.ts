@@ -11,16 +11,87 @@ export function normalizeAgentRole(role: string | null | undefined): string {
   return role || "unknown";
 }
 
+/**
+ * Merge streaming_text/streaming_thinking chunks into single assistant/thinking cards.
+ * Also collapses consecutive streaming chunks into one card that grows in place.
+ */
+export function mergeStreamingEvents(events: AgentEvent[]): AgentEvent[] {
+  const result: AgentEvent[] = [];
+  for (const event of events) {
+    const sk = event.payload?.streamKind;
+    const isStream = sk === "streaming_text" || sk === "streaming_thinking";
+    if (isStream) {
+      const targetKind = sk === "streaming_thinking" ? "thinking" : "assistant";
+      const last = result[result.length - 1];
+      if (last?.payload && last.payload.streamKind === targetKind && last.payload.agentRole === event.payload?.agentRole) {
+        // Append content to existing merged card
+        const stableKey = (last.payload.metadata as Record<string, unknown> | undefined)?.mergeKey ?? last.id;
+        last.payload = {
+          ...last.payload,
+          content: last.payload.content + (event.payload?.content ?? ""),
+          metadata: {
+            ...(last.payload.metadata ?? {}),
+            mergeKey: stableKey,
+          },
+        };
+        last.id = event.id;
+        last.created_at = event.created_at;
+      } else {
+        // Start a new merged card
+        result.push({
+          ...event,
+          payload: {
+            ...event.payload!,
+            streamKind: targetKind,
+            metadata: {
+              ...(event.payload?.metadata ?? {}),
+              mergeKey: event.id,
+            },
+          },
+        });
+      }
+    } else if ((sk === "assistant" || sk === "thinking") && result.length > 0) {
+      // Final non-streaming event: replace the preceding merged card
+      const last = result[result.length - 1];
+      if (last?.payload && last.payload.streamKind === sk && last.payload.agentRole === event.payload?.agentRole) {
+        const stableKey = (last.payload.metadata as Record<string, unknown> | undefined)?.mergeKey ?? last.id;
+        result[result.length - 1] = {
+          ...event,
+          payload: {
+            ...event.payload!,
+            metadata: {
+              ...(event.payload?.metadata ?? {}),
+              mergeKey: stableKey,
+            },
+          },
+        };
+      } else {
+        result.push(event);
+      }
+    } else {
+      result.push(event);
+    }
+  }
+  return result;
+}
+
+export function getMergedEventKey(event: AgentEvent): string {
+  const mergeKey = event.payload?.metadata?.mergeKey;
+  return typeof mergeKey === "string" || typeof mergeKey === "number" ? String(mergeKey) : String(event.id);
+}
+
 export function isRunActiveForRole(role: string, run: Run): boolean {
   if (run.status !== "running") return false;
   const node = (run.currentNode || "").toLowerCase();
   if (role === "system") return true;
   if (role === "builder") return run.kind === "ticket" && (node === "builder" || node.includes("build"));
+  if (role === "explorer") return run.kind === "ticket" && (node === "explorer" || node.includes("explore"));
+  if (role === "coder") return run.kind === "ticket" && (node === "coder" || node.includes("code"));
   if (role === "reviewer") return run.kind === "ticket" && (node === "reviewer" || node.includes("review"));
   if (role === "tester") return run.kind === "ticket" && (node === "tester" || node.includes("test"));
   if (role === "doctor") return run.kind === "ticket" && (node === "doctor" || node.includes("classify") || node === "error");
   if (role === "epicDecoder") return run.kind === "epic" && node.includes("decompose");
-  if (role === "epicReviewer") return run.kind === "epic" && (node.includes("goal_review") || node.includes("review"));
+  if (role === "epicReviewer") return (run.kind === "epic" || run.kind === "epic_review") && (node.includes("goal_review") || node.includes("review"));
   return false;
 }
 
@@ -134,6 +205,8 @@ export function confirmToast(input: {
 export const AGENT_GLYPHS: Record<string, string> = {
   system: "🖥️",
   builder: "🔨",
+  explorer: "🧭",
+  coder: "💻",
   reviewer: "🔍",
   tester: "🧪",
   epicDecoder: "🧬",
@@ -146,6 +219,12 @@ export const AGENT_GLYPHS: Record<string, string> = {
 };
 
 export const truncateId = (id: string) => id.slice(0, 14) + "…";
+
+export function normalizeDisplayedTicketId(id: string): string {
+  return id
+    .replace(/__ANA-(\d+)$/i, "__T-$1")
+    .replace(/__RSUB(\d+)$/i, "__FIX-$1");
+}
 
 export const formatTime = (dateStr: string | null) => {
   if (!dateStr) return "—";

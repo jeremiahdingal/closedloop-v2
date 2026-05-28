@@ -26,7 +26,8 @@ export async function loadLangGraphRuntime(): Promise<LangGraphRuntime | null> {
           END: (langgraphPkg as any).END ?? "__end__",
           z
         } satisfies LangGraphRuntime;
-      } catch {
+      } catch (e: any) {
+        console.error("[LangGraph Loader] Failed:", e?.message);
         return null;
       }
     })();

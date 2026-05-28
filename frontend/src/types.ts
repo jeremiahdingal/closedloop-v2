@@ -5,8 +5,30 @@ export type Epic = {
   targetDir: string;
   targetBranch: string | null;
   status: string;
+  scheduledDate: string | null;
+  assetPaths: string[];
   createdAt: string;
   updatedAt: string;
+};
+
+export type EpicMergeStatus = {
+  epicId: string;
+  sourceBranch: string | null;
+  targetBranch: "main";
+  canMerge: boolean;
+  conflicts: boolean;
+  workingTreeClean: boolean;
+  alreadyMerged: boolean;
+  reason:
+    | "epic_not_done"
+    | "missing_source_branch"
+    | "missing_main_branch"
+    | "dirty_worktree"
+    | "already_merged"
+    | "merge_conflicts"
+    | "git_error"
+    | null;
+  message: string;
 };
 
 export type Ticket = {
@@ -61,12 +83,32 @@ export type ModelAdapterOption = {
 };
 
 export type AgentModelInfo = {
+  configuredModel: string;
   currentModel: string;
+  effectiveModel: string;
   adapters: ModelAdapterOption[];
   switchable: boolean;
+  overriddenByProfile: boolean;
+  overrideReason?: string;
 };
 
 export type AgentModelsConfig = Record<string, AgentModelInfo>;
+
+export type OllamaPsModel = {
+  name: string;
+  id: string;
+  size: string;
+  processor: string;
+  context: string;
+  until: string;
+};
+
+export type OllamaPsSnapshot = {
+  ok: boolean;
+  status: "ready" | "idle" | "error";
+  models: OllamaPsModel[];
+  error?: string;
+};
 
 export type TicketDiffResponse = {
   ticketId: string;
@@ -94,17 +136,39 @@ export type Dashboard = {
   agentEvents: AgentEvent[];
 };
 
+export type DirectChatSessionRecord = {
+  id: string;
+  title: string;
+  targetDir: string;
+  branchName: string;
+  model: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type DirectChatMessageRecord = {
+  id: number;
+  sessionId: string;
+  role: "user" | "assistant" | "system" | "tool";
+  content: string;
+  toolCallsJson: string | null;
+  toolResultsJson: string | null;
+  createdAt: string;
+};
+
 export type AgentStreamStatus = "idle" | "running" | "stalled" | "completed";
 
 export type GoalDecomposition = {
   summary: string;
+  clarificationQuestions?: string[];
   tickets: Array<{
     id: string;
     title: string;
     description: string;
     acceptanceCriteria: string[];
     dependencies: string[];
-    allowedPaths: string[];
+    allowedPaths?: string[];
     priority: string;
+    testSpecs?: string[];
   }>;
 };

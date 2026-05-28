@@ -6,7 +6,7 @@ import type { AgentRole, AgentStreamPayload, GoalDecomposition, GoalReview } fro
 import { parseJsonText, validateGoalDecomposition, validateGoalReview } from "./validation.ts";
 
 export type QwenTaskInput = {
-  role: Extract<AgentRole, "epicDecoder" | "epicReviewer">;
+  role: Extract<AgentRole, "epicDecoder" | "epicReviewer" | "builder">;
   cwd: string;
   prompt: string;
   runId?: string | null;
@@ -268,6 +268,15 @@ export class QwenRunner {
     }
   }
 
+  async runBuilder(input: QwenTaskInput): Promise<import("../types.ts").OpenCodeBuilderResult> {
+    const raw = await this.runRaw(input);
+    return {
+      summary: "Qwen CLI build completed",
+      sessionId: null,
+      rawOutput: raw.combined
+    };
+  }
+
   private async runRaw(input: QwenTaskInput): Promise<{ combined: string; launchInfo: QwenLaunchInfo }> {
     const launch = await this.resolveLaunch({ cwd: input.cwd, prompt: input.prompt });
     const chunks: string[] = [];
@@ -288,6 +297,8 @@ export class QwenRunner {
         metadata: { cwd: input.cwd, command: launch.command, promptLength: launch.info.promptLength }
       });
     };
+
+    emit("system", `--- PROMPT ---\n${input.prompt}\n--------------`);
 
     await new Promise<void>((resolve, reject) => {
       const child = this.spawnImpl(launch.command, launch.args, {

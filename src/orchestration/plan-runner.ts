@@ -12,6 +12,8 @@ import { ensureProjectStructureFile } from "./project-structure.ts";
 import { buildContextForQuery } from "../rag/context-builder.ts";
 import { git } from "../bridge/git.ts";
 import { parseJsonText, validateGoalDecomposition } from "./validation.ts";
+import { readWorkspaceConfig } from "../config.ts";
+import { resolveRuntimeProfile } from "../runtime-profile.ts";
 
 export interface PlanRunInput {
   cwd: string;
@@ -29,6 +31,10 @@ export interface PlanRunResult {
   rawText: string;
 }
 
+export function planNeedsClarification(plan: GoalDecomposition | null | undefined): boolean {
+  return Boolean(plan?.clarificationQuestions?.some((question) => question.trim().length > 0));
+}
+
 /**
  * Run the epic decoder in plan mode and return the resulting GoalDecomposition.
  * Uses the mediated/qwen/codex/opencode path depending on the configured epicDecoder model.
@@ -39,6 +45,7 @@ export interface PlanRunResult {
  * and never creates runs, tickets, or epics.
  */
 export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult> {
+  const runtimeProfile = resolveRuntimeProfile(input.gateway.models, readWorkspaceConfig());
   const emit = (content: string) =>
     input.onStream?.({
       agentRole: "epicDecoder",
@@ -72,7 +79,8 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
     input.epicDescription,
     input.userMessages,
     projectStructure,
-    ragCtx
+    ragCtx,
+    runtimeProfile.effectiveModels.coder
   );
 
   const { gateway } = input;
@@ -82,11 +90,17 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
   // Mirror the same routing logic as GoalRunner.runEpicDecoder
   // to avoid sending qwen-cli/codex-cli as model IDs to OpenCode.
 
-  // qwen-cli / codex-cli — runs via QwenRunner / CodexRunner
-  if (
-    gateway.runEpicDecoderInWorkspace &&
-    (configuredModel === "codex-cli" || configuredModel === "qwen-cli")
-  ) {
+  // qwen-cli / codex-cli / gemini-cli — runs via QwenRunner / CodexRunner / GeminiRunner
+    if (
+      gateway.runEpicDecoderInWorkspace &&
+      (
+        configuredModel === "codex-cli" ||
+        configuredModel === "qwen-cli" ||
+        configuredModel === "gemini-cli" ||
+        configuredModel.startsWith("zai:") ||
+        configuredModel.startsWith("anthropic-mediated:")
+      )
+    ) {
     try {
       const result = await gateway.runEpicDecoderInWorkspace({
         cwd: input.cwd,
@@ -117,8 +131,8 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
     }
   }
 
-  // mediated:<model> — runs via MediatedAgentHarness
-  if (gateway.runEpicDecoderInWorkspace && configuredModel.startsWith("mediated:")) {
+  // mediated:<model> / anthropic-mediated:<model> — runs via MediatedAgentHarness
+  if (gateway.runEpicDecoderInWorkspace && (configuredModel.startsWith("mediated:") || configuredModel.startsWith("anthropic-mediated:"))) {
     try {
       const result = await gateway.runEpicDecoderInWorkspace({
         cwd: input.cwd,
@@ -146,10 +160,13 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
  */
 export function extractPlanFromStream(chunks: string[]): GoalDecomposition | null {
   const combined = chunks.join("");
-  const match = combined.match(/<FINAL_JSON>([\s\S]*?)<\/FINAL_JSON>/);
-  if (!match) return null;
+  const tagged = combined.match(/<FINAL_JSON>([\s\S]*?)<\/FINAL_JSON>/i);
+  const fenced = combined.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const rawJson = (tagged?.[1] ?? fenced?.[1])?.trim();
+  
+  if (!rawJson) return null;
   try {
-    return validateGoalDecomposition(JSON.parse(match[1].trim()));
+    return validateGoalDecomposition(parseJsonText(rawJson));
   } catch {
     return null;
   }

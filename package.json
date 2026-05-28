@@ -18,7 +18,7 @@
     "build:ui": "vite build",
     "preview:ui": "vite preview",
     "typecheck": "tsc --noEmit",
-    "ollama-server": "ollama serve",
+    "ollama-server": "cross-env OLLAMA_KV_CACHE_TYPE=q4_0 ollama serve",
     "dev": "concurrently \"npm run api\" \"npm run worker\" \"npm run ui\" \"npm run ollama-server\""
   },
   "engines": {
@@ -30,18 +30,22 @@
     "@langchain/ollama": "^1.2.6",
     "opencode-ai": "^1.1.1",
     "react": "^19.1.0",
+    "react-calendar": "^6.0.1",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
     "sonner": "^2.0.7",
+    "undici": "^8.1.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.15.30",
     "@types/react": "^19.1.2",
+    "@types/react-calendar": "^3.9.0",
     "@types/react-dom": "^19.1.2",
     "@vitejs/plugin-react": "^4.5.1",
     "concurrently": "^9.1.2",
+    "cross-env": "^10.1.0",
     "nodemon": "^3.1.9",
     "playwright": "^1.59.1",
     "typescript": "^5.8.3",

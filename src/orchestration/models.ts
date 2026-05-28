@@ -3,6 +3,7 @@ import type {
   AgentRole,
   AgentStreamPayload,
   BuilderPlan,
+  CoderRunResult,
   FailureDecision,
   GoalDecomposition,
   GoalReview,
@@ -21,8 +22,13 @@ import {
 import { OpenCodeRunner } from "./opencode.ts";
 import { CodexRunner } from "./codex.ts";
 import { QwenRunner } from "./qwen.ts";
+import { GeminiRunner } from "./gemini.ts";
+import { ZaiRunner } from "./zai.ts";
 import { MediatedAgentHarness } from "../mediated-agent-harness/index.ts";
 import type { ToolExecutionContext } from "../mediated-agent-harness/types.ts";
+import { ensureModelLoaded, markModelLoaded, unloadCurrentModel } from "./ollama-memory-manager.ts";
+import { readWorkspaceConfig } from "../config.ts";
+import { REMOTE_OVERRIDE_DECODER_MODEL, REMOTE_OVERRIDE_MEDIATED_MODEL, resolveRuntimeProfile } from "../runtime-profile.ts";
 
 export type StreamHook = (event: AgentStreamPayload) => void;
 
@@ -35,12 +41,19 @@ export interface ModelGateway {
   getGoalReview(prompt: string): Promise<GoalReview>;
   getFailureDecision(prompt: string): Promise<FailureDecision>;
   runBuilderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<OpenCodeBuilderResult>;
-  runReviewerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ReviewerVerdict>;
+  runReviewerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; timeoutMs?: number; onStream?: StreamHook }): Promise<ReviewerVerdict>;
   runTesterInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<TesterResult>;
+  runExplorerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string>;
+  runCoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; skipExplorer?: boolean; onStream?: StreamHook }): Promise<CoderRunResult>;
+  runCoderDirect?(input: { prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string>;
   runGoalReviewInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any }): Promise<GoalReview>;
   runEpicDecoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any }): Promise<GoalDecomposition>;
   runEpicDecoderOpenCode?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition>;
   runEpicReviewerCodex?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview>;
+}
+
+interface GatewayOptions {
+  applyRemoteOverride?: boolean;
 }
 
 const DEFAULT_TEMPERATURE = 1.0;
@@ -48,12 +61,20 @@ const DEFAULT_TOP_P = 0.95;
 const DEFAULT_TOP_K = 64;
 
 function resolveOllamaContextWindow(model: string): number {
-  if (model.startsWith("glm-4.7-flash")) return 4096;
-  if (model.startsWith("qwen3.5:9b")) return 16384;
-  if (model.startsWith("qwen3.5:27b")) return 4096;
+  if (model.startsWith("glm-4.7")) return 200000;
+  if (model.startsWith("qwen3.5:9b")) return 65536;
+  if (model.startsWith("qwen3.5:27b")) return 65536;
+  if (model.includes("qwen3.6-35b")) return 8192;
+  if (model.includes("qwen3.6-27b")) return 32768;
+  if (model.startsWith("ibm/granite4.1:30b-q3")) return 8192;
+  if (model.startsWith("ibm/granite4.1")) return 32768;
   if (model.startsWith("devstral-small-2:24b")) return 393216;
   if (model.startsWith("qwen2.5-coder:14b")) return 65536;
-  return 32768;
+  return 65536;
+}
+
+function promptExplicitlyRequestsDependencyInstall(prompt: string): boolean {
+  return /\bnpm\s+install\b|\binstall(?: the| a| an)?\s+(?:dependency|dependencies|package|packages|library|libraries|runtime dependency|runtime dependencies|chart library|chart libraries)\b|\badd(?: any missing| the)?\s+(?:dependency|dependencies|package|packages|library|libraries|runtime dependency|runtime dependencies)\b/i.test(prompt);
 }
 
 function buildZodSchemas(z: any) {
@@ -63,8 +84,9 @@ function buildZodSchemas(z: any) {
     description: z.string(),
     acceptanceCriteria: z.array(z.string()),
     dependencies: z.array(z.string()),
-    allowedPaths: z.array(z.string()),
-    priority: z.enum(["high", "medium", "low"])
+    allowedPaths: z.array(z.string()).optional(),
+    priority: z.enum(["high", "medium", "low"]),
+    testSpecs: z.array(z.string()).optional(),
   });
 
   return {
@@ -85,7 +107,7 @@ function buildZodSchemas(z: any) {
       approved: z.boolean(),
       blockers: z.array(z.string()),
       suggestions: z.array(z.string()),
-      riskLevel: z.enum(["low", "medium", "high"])
+riskLevel: z.enum(["low", "medium", "high"])
     }),
     goalReview: z.object({
       verdict: z.enum(["approved", "needs_followups", "failed"]),
@@ -93,14 +115,24 @@ function buildZodSchemas(z: any) {
       followupTickets: z.array(GoalTicketPlanSchema)
     }),
     failureDecision: z.object({
-      decision: z.enum(["retry_same_node", "retry_builder", "blocked", "todo", "escalate"]),
+      decision: z.enum(["retry_same_node", "retry_builder", "blocked", "todo", "escalate", "review_existing"]),
       reason: z.string()
+    }),
+    ticketResult: z.object({
+      summary: z.string(),
+      filesChanged: z.array(z.string()),
+      testFiles: z.array(z.string()).optional()
     })
   };
 }
 
 function resolveOllamaModel(role: AgentRole, models: Record<AgentRole, string>): string {
   const raw = models[role];
+  if (role === "explorer" && !raw) return "qwen3.5:9b";
+  if (role === "coder" && !raw) return "qwen3.5:27b";
+  if (!raw) return process.env.OLLAMA_FALLBACK_MODEL || models.doctor || "qwen3:8b";
+
+  if (raw.startsWith("zai:")) return raw;
   if (raw.startsWith("opencode:")) return raw.slice("opencode:".length);
   if (raw.startsWith("mediated:")) return raw.slice("mediated:".length);
   if (raw === "ollama") return process.env.OLLAMA_FALLBACK_MODEL || models.doctor || "qwen3:8b";
@@ -126,12 +158,24 @@ export class OllamaGateway implements ModelGateway {
     this.baseUrl = baseUrl;
   }
 
-  async rawPrompt(role: AgentRole, prompt: string): Promise<string> {
+  async rawPrompt(role: AgentRole, prompt: string, onStream?: StreamHook): Promise<string> {
     const model = resolveOllamaModel(role, this.models);
     const numCtx = resolveOllamaContextWindow(model);
+
+    onStream?.({
+      agentRole: role,
+      source: "orchestrator",
+      streamKind: "system",
+      content: `--- PROMPT ---\n${prompt}\n--------------`,
+      sequence: 0,
+    });
+
+    // Memory management: unload previous model before loading this one
+    await ensureModelLoaded(model);
     const response = await fetch(`${this.baseUrl}/api/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
+      signal: AbortSignal.timeout(900_000),
       body: JSON.stringify({
         model,
         prompt,
@@ -148,6 +192,7 @@ export class OllamaGateway implements ModelGateway {
       throw new Error(`Ollama request failed for ${role}: ${response.status} ${await response.text()}`);
     }
     const payload = await response.json() as { response: string };
+    markModelLoaded(model);
     return payload.response;
   }
 
@@ -167,7 +212,7 @@ export class OllamaGateway implements ModelGateway {
         topP: DEFAULT_TOP_P,
         topK: DEFAULT_TOP_K,
         baseUrl: this.baseUrl,
-        numCtx
+        numCtx,
       });
       const structured = model.withStructuredOutput((schemas as any)[schemaName]);
       return await structured.invoke(prompt) as T;
@@ -195,22 +240,64 @@ export class OllamaGateway implements ModelGateway {
   async getFailureDecision(prompt: string): Promise<FailureDecision> {
     return this.invokeStructured("doctor", prompt, validateFailureDecision, "failureDecision");
   }
+
+  runExplorerInWorkspace(_input: { cwd: string; prompt: string }): Promise<string> {
+    throw new Error("Explorer requires mediated harness (MediatedAgentHarnessGateway)");
+  }
+
+  runCoderInWorkspace(_input: { cwd: string; prompt: string }): Promise<CoderRunResult> {
+    throw new Error("Coder requires mediated harness (MediatedAgentHarnessGateway)");
+  }
+
+  async runCoderDirect(input: { prompt: string; onStream?: StreamHook }): Promise<string> {
+    const model = resolveOllamaModel("coder", this.models);
+    input.onStream?.({
+      agentRole: "coder",
+      source: "orchestrator",
+      streamKind: "system",
+      content: `--- PROMPT ---\n${input.prompt}\n--------------`,
+      sequence: 0,
+    });
+    input.onStream?.({
+      agentRole: "coder",
+      source: "orchestrator",
+      streamKind: "status",
+      content: `Coding via direct model call (${model})...`,
+      sequence: 1,
+    });
+    const response = await this.rawPrompt("coder", input.prompt);
+    input.onStream?.({
+      agentRole: "coder",
+      source: "orchestrator",
+      streamKind: "assistant",
+      content: response,
+      sequence: 2,
+      metadata: { model },
+    });
+    return response;
+  }
 }
 
 export class OpenCodeHybridGateway implements ModelGateway {
+  private readonly _models?: Record<AgentRole, string>;
   get models(): Record<AgentRole, string> {
-    return loadConfig().models;
+    return this._models || loadConfig().models;
   }
   private readonly ollama: OllamaGateway;
   private readonly opencode: OpenCodeRunner;
   private readonly codex: CodexRunner;
   private readonly qwen: QwenRunner;
+  private readonly gemini: GeminiRunner;
+  private readonly zai: ZaiRunner;
 
-  constructor() {
+  constructor(models?: Record<AgentRole, string>) {
+    this._models = models;
     this.ollama = new OllamaGateway();
     this.opencode = new OpenCodeRunner();
     this.codex = new CodexRunner();
     this.qwen = new QwenRunner();
+    this.gemini = new GeminiRunner();
+    this.zai = new ZaiRunner();
   }
 
   rawPrompt(role: AgentRole, prompt: string): Promise<string> {
@@ -238,16 +325,83 @@ export class OpenCodeHybridGateway implements ModelGateway {
   }
 
   runBuilderInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<OpenCodeBuilderResult> {
+    if (this.models.builder === "gemini-cli") {
+      return this.gemini.runBuilder({ role: "builder", ...input });
+    }
+    if (this.models.builder === "qwen-cli") {
+      return this.qwen.runBuilder({ role: "builder", ...input });
+    }
+    if (this.models.builder === "codex-cli") {
+      return this.codex.runBuilder({ role: "builder", ...input });
+    }
     return this.opencode.runBuilder({ role: "builder", ...input });
   }
 
+  runTesterInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<TesterResult> {
+    return this.opencode.runTester({ role: "tester", ...input });
+  }
+
+  runExplorerInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string> {
+    // OpenCodeRunner doesn't have runExplorer, but we can reuse runBuilder-like logic or just fail if not mediated.
+    // The requirement says only explorer should remain mediated.
+    throw new Error("Explorer role requires MediatedAgentHarnessGateway");
+  }
+
+  async runCoderDirect(input: { prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string> {
+    const model = resolveOllamaModel("coder", this.models);
+    input.onStream?.({
+      agentRole: "coder",
+      source: "orchestrator",
+      streamKind: "status",
+      content: `Coding via direct model call (${model})...`,
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+    });
+
+    const response = await this.rawPrompt("coder", input.prompt);
+
+    input.onStream?.({
+      agentRole: "coder",
+      source: "orchestrator",
+      streamKind: "assistant",
+      content: response,
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 1,
+      metadata: { model },
+    });
+
+    return response;
+  }
+
   runGoalReviewInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview> {
+    if (this.models.epicReviewer === "gemini-cli") {
+      return this.gemini.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (this.models.epicReviewer === "qwen-cli") {
+      return this.qwen.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (this.models.epicReviewer.startsWith("zai:")) {
+      return this.zai.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (this.models.epicReviewer === "codex-cli") {
+      return this.codex.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
     return this.opencode.runEpicReviewer({ role: "epicReviewer", ...input });
   }
 
   runEpicDecoderInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition> {
+    if (this.models.epicDecoder === "gemini-cli") {
+      return this.gemini.runEpicDecoder({ role: "epicDecoder", ...input });
+    }
     if (this.models.epicDecoder === "qwen-cli") {
       return this.qwen.runEpicDecoder({ role: "epicDecoder", ...input });
+    }
+    if (this.models.epicDecoder.startsWith("zai:")) {
+      return this.zai.runEpicDecoder({ role: "epicDecoder", ...input });
     }
     return this.codex.runEpicDecoder({ role: "epicDecoder", ...input });
   }
@@ -258,8 +412,14 @@ export class OpenCodeHybridGateway implements ModelGateway {
   }
 
   runEpicReviewerCodex(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview> {
+    if (this.models.epicReviewer === "gemini-cli") {
+      return this.gemini.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
     if (this.models.epicReviewer === "qwen-cli") {
       return this.qwen.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (this.models.epicReviewer.startsWith("zai:")) {
+      return this.zai.runEpicReviewer({ role: "epicReviewer", ...input });
     }
     return this.codex.runEpicReviewer({ role: "epicReviewer", ...input });
   }
@@ -362,6 +522,17 @@ export class DryRunGateway implements ModelGateway {
     input.onStream?.({ agentRole: "builder", source: "orchestrator", streamKind: "status", content: "[dry-run] Builder completed", runId: input.runId, ticketId: input.ticketId, epicId: input.epicId, sequence: 2, done: true });
     return { summary: plan.summary, sessionId: null, rawOutput: plan.summary };
   }
+
+  async runCoderDirect(input: { prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string> {
+    const content = "Dry run coder output";
+    input.onStream?.({ agentRole: "coder", source: "orchestrator", streamKind: "assistant", content, runId: input.runId, ticketId: input.ticketId, epicId: input.epicId, sequence: 0, done: true });
+    return content;
+  }
+
+  async runCoderInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; skipExplorer?: boolean; onStream?: StreamHook }): Promise<CoderRunResult> {
+    const text = await this.runCoderDirect(input);
+    return { text, toolCalls: [], iterations: 1 };
+  }
 }
 
 export class MockGateway implements ModelGateway {
@@ -416,30 +587,86 @@ export class MockGateway implements ModelGateway {
     if (!decision) throw new Error("Missing mock failure decision");
     return decision;
   }
+
+  async runExplorerInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string> {
+    input.onStream?.({ agentRole: "explorer", source: "orchestrator", streamKind: "status", content: "[mock] Explorer started", runId: input.runId, ticketId: input.ticketId, epicId: input.epicId, sequence: 0, done: false });
+    const result = JSON.stringify({
+      relevantFiles: ["README.md"],
+      relevantSymbols: [],
+      likelyEditRegions: [],
+      summary: "Mock exploration result",
+      risks: [],
+      missingContext: [],
+      recommendedFilesForCoding: ["README.md"]
+    });
+    input.onStream?.({ agentRole: "explorer", source: "orchestrator", streamKind: "assistant", content: result, runId: input.runId, ticketId: input.ticketId, epicId: input.epicId, sequence: 1, done: true });
+    return result;
+  }
+
+  async runCoderDirect(input: { prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string> {
+    const plan = this.responses.builderPlans?.[0]; // Use first plan if available as coder output
+    const content = plan ? JSON.stringify(plan) : "Mock coder output";
+    input.onStream?.({ agentRole: "coder", source: "orchestrator", streamKind: "assistant", content, runId: input.runId, ticketId: input.ticketId, epicId: input.epicId, sequence: 0, done: true });
+    return content;
+  }
 }
 
 export class MediatedAgentHarnessGateway implements ModelGateway {
+  private readonly _models?: Record<AgentRole, string>;
+  private readonly applyRemoteOverride: boolean;
   get models(): Record<AgentRole, string> {
-    return loadConfig().models;
+    return this.getEffectiveModels();
   }
 
   private readonly ollama: OllamaGateway;
   private readonly opencode: OpenCodeRunner;
   private readonly codex: CodexRunner;
   private readonly qwen: QwenRunner;
+  private readonly gemini: GeminiRunner;
+  private readonly zai: ZaiRunner;
   private readonly ollamaBaseURL: string;
   private readonly braveApiKey: string | undefined;
+  private readonly openrouterApiKey: string | undefined;
+  private readonly anthropicOverride?: { baseURL: string; apiKey: string; apiBackend: "anthropic"; model: string };
 
-  constructor(ollamaBaseURL?: string) {
+  constructor(ollamaBaseURL?: string, models?: Record<AgentRole, string>, anthropicOverride?: { baseURL: string; apiKey: string; apiBackend: "anthropic"; model: string }, options?: GatewayOptions) {
+    this._models = models;
+    this.applyRemoteOverride = options?.applyRemoteOverride ?? true;
     this.ollamaBaseURL = ollamaBaseURL || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
     this.ollama = new OllamaGateway(this.ollamaBaseURL);
     this.opencode = new OpenCodeRunner();
     this.codex = new CodexRunner();
     this.qwen = new QwenRunner();
+    this.gemini = new GeminiRunner();
+    this.zai = new ZaiRunner();
     this.braveApiKey = process.env.BRAVE_API_KEY;
+    this.openrouterApiKey = process.env.OPENROUTER_API_KEY;
+    this.anthropicOverride = anthropicOverride;
+  }
+
+  private getBaseModels(): Record<AgentRole, string> {
+    return this._models || loadConfig().models;
+  }
+
+  private getEffectiveModels(): Record<AgentRole, string> {
+    const baseModels = this.getBaseModels();
+    if (!this.applyRemoteOverride) return baseModels;
+    const profile = resolveRuntimeProfile(baseModels, readWorkspaceConfig());
+    return profile.effectiveModels;
+  }
+
+  private getRuntimeProfile() {
+    return resolveRuntimeProfile(this.getBaseModels(), readWorkspaceConfig());
   }
 
   rawPrompt(role: AgentRole, prompt: string): Promise<string> {
+    const model = this.resolveHarnessModel(role);
+    if (model.startsWith("zai:")) {
+      return this.zai.rawPrompt(role, prompt, this.zai.resolveModel(model));
+    }
+    if (model.startsWith("anthropic-mediated:")) {
+      return this.zai.rawPrompt(role, prompt, this.resolveAnthropicMediatedModel(model));
+    }
     return this.ollama.rawPrompt(role, prompt);
   }
 
@@ -461,6 +688,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     runId?: string | null;
     ticketId?: string | null;
     epicId?: string | null;
+    timeoutMs?: number;
     onStream?: StreamHook;
   }): Promise<ReviewerVerdict> {
     const model = this.resolveHarnessModel("reviewer");
@@ -475,74 +703,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, "reviewer");
-    const harness = new MediatedAgentHarness({
-      baseURL: `${this.ollamaBaseURL}/v1`,
-      apiKey: "ollama",
-      model,
-      braveApiKey: this.braveApiKey,
-      toolContext,
-    });
+    const toolContext = this.buildToolContext(input.cwd, "reviewer", undefined, undefined, input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("reviewer", model, toolContext));
 
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
+    if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("reviewer", input.prompt, {
-      maxIterations: 10,
-      timeoutMs: 300_000,
-      onEvent: (event) => {
-        if (event.kind === "text" || event.kind === "thinking") {
-          input.onStream?.({
-            agentRole: "reviewer",
-            source: "mediated-harness",
-            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
-            content: event.text,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "tool_call") {
-          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
-          input.onStream?.({
-            agentRole: "reviewer",
-            source: "mediated-harness",
-            streamKind: "tool_call",
-            content: `${event.call.name}(${argsPreview})`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
-          });
-        }
-        if (event.kind === "tool_error") {
-          input.onStream?.({
-            agentRole: "reviewer",
-            source: "mediated-harness",
-            streamKind: "stderr",
-            content: `Tool error: ${event.error}`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "complete") {
-          input.onStream?.({
-            agentRole: "reviewer",
-            source: "mediated-harness",
-            streamKind: "status",
-            content: `Completed in ${event.iterations} iterations`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-      },
+      maxIterations: 80,
+      timeoutMs: input.timeoutMs ?? 300_000,
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("reviewer", model, input),
     });
+    if (isOllama) markModelLoaded(model);
 
     return validateReviewerVerdict(parseJsonText(result.text));
   }
@@ -566,11 +738,29 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
   }): Promise<GoalDecomposition> {
     const configuredModel = this.models.epicDecoder;
 
+    if (configuredModel === "gemini-cli") {
+      return this.gemini.runEpicDecoder({ role: "epicDecoder", ...input });
+    }
     if (configuredModel === "codex-cli") {
       return this.codex.runEpicDecoder({ role: "epicDecoder", ...input });
     }
     if (configuredModel === "qwen-cli") {
       return this.qwen.runEpicDecoder({ role: "epicDecoder", ...input });
+    }
+    if (configuredModel.startsWith("zai:")) {
+      return this.zai.runEpicDecoder({ role: "epicDecoder", ...input });
+    }
+    if (configuredModel.startsWith("anthropic-mediated:")) {
+      const model = this.resolveHarnessModel("epicDecoder");
+      const toolContext = this.buildToolContext(input.cwd, "epicDecoder", { ragIndexId: input.ragIndexId, db: input.db }, undefined, input.runId ?? undefined);
+      const harness = new MediatedAgentHarness(this.buildHarnessConfig("epicDecoder", model, toolContext));
+      const result = await harness.run("epicDecoder", input.prompt, {
+        maxIterations: 80,
+        timeoutMs: 900_000,
+        toolMode: this.resolveToolMode(model),
+        onEvent: this.buildHarnessEventHandler("epicDecoder", model, input),
+      });
+      return validateGoalDecomposition(parseJsonText(result.text));
     }
     if (configuredModel.startsWith("opencode:")) {
       const parsed = await this.opencode.runEpicDecoder({ role: "epicDecoder", ...input });
@@ -588,59 +778,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, "epicDecoder", { ragIndexId: input.ragIndexId, db: input.db });
+    const toolContext = this.buildToolContext(input.cwd, "epicDecoder", { ragIndexId: input.ragIndexId, db: input.db }, undefined, input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("epicDecoder", model, toolContext));
 
-    const harness = new MediatedAgentHarness({
-      baseURL: `${this.ollamaBaseURL}/v1`,
-      apiKey: "ollama",
-      model,
-      braveApiKey: this.braveApiKey,
-      toolContext,
-    });
-
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
+    if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("epicDecoder", input.prompt, {
-      maxIterations: 25,
-      timeoutMs: 600_000,
-      onEvent: (event) => {
-        if (event.kind === "text" || event.kind === "thinking") {
-          input.onStream?.({
-            agentRole: "epicDecoder",
-            source: "mediated-harness",
-            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
-            content: event.text,
-            runId: input.runId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "tool_call") {
-          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
-          input.onStream?.({
-            agentRole: "epicDecoder",
-            source: "mediated-harness",
-            streamKind: "tool_call",
-            content: `${event.call.name}(${argsPreview})`,
-            runId: input.runId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
-          });
-        }
-        if (event.kind === "complete") {
-          input.onStream?.({
-            agentRole: "epicDecoder",
-            source: "mediated-harness",
-            streamKind: "status",
-            content: `Completed in ${event.iterations} iterations`,
-            runId: input.runId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-      },
+      maxIterations: 80,
+      timeoutMs: 900_000,
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("epicDecoder", model, input),
     });
+    if (isOllama) markModelLoaded(model);
 
     return validateGoalDecomposition(parseJsonText(result.text));
   }
@@ -655,8 +804,29 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     db?: any;
   }): Promise<GoalReview> {
     const configuredModel = this.models.epicReviewer;
+    if (configuredModel === "gemini-cli") {
+      return this.gemini.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
     if (configuredModel === "qwen-cli") {
       return this.qwen.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (configuredModel === "codex-cli") {
+      return this.codex.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (configuredModel.startsWith("zai:")) {
+      return this.zai.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
+    if (configuredModel.startsWith("anthropic-mediated:")) {
+      const model = this.resolveHarnessModel("epicReviewer");
+      const toolContext = this.buildToolContext(input.cwd, "epicReviewer", { ragIndexId: input.ragIndexId, db: input.db }, undefined, input.runId ?? undefined);
+      const harness = new MediatedAgentHarness(this.buildHarnessConfig("epicReviewer", model, toolContext));
+      const result = await harness.run("epicReviewer", input.prompt, {
+        maxIterations: 80,
+        timeoutMs: 900_000,
+        toolMode: this.resolveToolMode(model),
+        onEvent: this.buildHarnessEventHandler("epicReviewer", model, input),
+      });
+      return validateGoalReview(parseJsonText(result.text));
     }
     if (configuredModel.startsWith("opencode:")) {
       return this.opencode.runEpicReviewer({ role: "epicReviewer", ...input });
@@ -673,59 +843,18 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, "epicReviewer", { ragIndexId: input.ragIndexId, db: input.db });
+    const toolContext = this.buildToolContext(input.cwd, "epicReviewer", { ragIndexId: input.ragIndexId, db: input.db }, undefined, input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("epicReviewer", model, toolContext));
 
-    const harness = new MediatedAgentHarness({
-      baseURL: `${this.ollamaBaseURL}/v1`,
-      apiKey: "ollama",
-      model,
-      braveApiKey: this.braveApiKey,
-      toolContext,
-    });
-
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
+    if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("epicReviewer", input.prompt, {
-      maxIterations: 25,
-      timeoutMs: 600_000,
-      onEvent: (event) => {
-        if (event.kind === "text" || event.kind === "thinking") {
-          input.onStream?.({
-            agentRole: "epicReviewer",
-            source: "mediated-harness",
-            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
-            content: event.text,
-            runId: input.runId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "tool_call") {
-          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
-          input.onStream?.({
-            agentRole: "epicReviewer",
-            source: "mediated-harness",
-            streamKind: "tool_call",
-            content: `${event.call.name}(${argsPreview})`,
-            runId: input.runId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
-          });
-        }
-        if (event.kind === "complete") {
-          input.onStream?.({
-            agentRole: "epicReviewer",
-            source: "mediated-harness",
-            streamKind: "status",
-            content: `Completed in ${event.iterations} iterations`,
-            runId: input.runId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-      },
+      maxIterations: 80,
+      timeoutMs: 900_000,
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("epicReviewer", model, input),
     });
+    if (isOllama) markModelLoaded(model);
 
     return validateGoalReview(parseJsonText(result.text));
   }
@@ -748,10 +877,129 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     epicId?: string | null;
     onStream?: StreamHook;
   }): Promise<GoalReview> {
+    if (this.models.epicReviewer === "gemini-cli") {
+      return this.gemini.runEpicReviewer({ role: "epicReviewer", ...input });
+    }
     if (this.models.epicReviewer === "qwen-cli") {
       return this.qwen.runEpicReviewer({ role: "epicReviewer", ...input });
     }
     return this.codex.runEpicReviewer({ role: "epicReviewer", ...input });
+  }
+
+  async runExplorerInWorkspace(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    ticketId?: string | null;
+    epicId?: string | null;
+    onStream?: StreamHook;
+  }): Promise<string> {
+    const model = this.resolveHarnessModel("explorer");
+    const allowInstallCommand = promptExplicitlyRequestsDependencyInstall(input.prompt);
+    input.onStream?.({
+      agentRole: "explorer",
+      source: "orchestrator",
+      streamKind: "status",
+      content: "Exploring via mediated agent harness...",
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+    });
+
+    const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : [], input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("explorer", model, toolContext));
+
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
+    if (isOllama) await ensureModelLoaded(model);
+    const result = await harness.run("explorer", input.prompt, {
+      maxIterations: 20,
+      timeoutMs: 900_000,
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("explorer", model, input),
+    });
+    if (isOllama) markModelLoaded(model);
+
+    return result.text;
+  }
+
+  async runCoderInWorkspace(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    ticketId?: string | null;
+    epicId?: string | null;
+    skipExplorer?: boolean;
+    onStream?: StreamHook;
+  }): Promise<CoderRunResult> {
+    const model = this.resolveHarnessModel("coder");
+    const allowInstallCommand = promptExplicitlyRequestsDependencyInstall(input.prompt);
+    input.onStream?.({
+      agentRole: "coder",
+      source: "orchestrator",
+      streamKind: "status",
+      content: "Coding via mediated agent harness...",
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+    });
+
+    const toolContext = this.buildToolContext(input.cwd, input.ticketId || "unknown", undefined, allowInstallCommand ? ["install"] : [], input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("coder", model, toolContext));
+
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
+    if (isOllama) await ensureModelLoaded(model);
+    const result = await harness.run("coder", input.prompt, {
+      maxIterations: 80,
+      timeoutMs: 600_000,
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("coder", model, input),
+    });
+    if (isOllama) markModelLoaded(model);
+
+    return {
+      text: result.text,
+      toolCalls: result.toolCalls.map(tc => ({ name: tc.name, args: tc.args as Record<string, unknown> })),
+      iterations: result.iterations,
+    };
+  }
+
+  async runCoderDirect(input: {
+    prompt: string;
+    runId?: string | null;
+    ticketId?: string | null;
+    epicId?: string | null;
+    onStream?: StreamHook;
+  }): Promise<string> {
+    const model = resolveOllamaModel("coder", this.models);
+    input.onStream?.({
+      agentRole: "coder",
+      source: "orchestrator",
+      streamKind: "status",
+      content: `Coding via direct model call (${model})...`,
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+    });
+
+    // Use rawPrompt for direct call
+    const response = await this.rawPrompt("coder", input.prompt);
+    
+    input.onStream?.({
+      agentRole: "coder",
+      source: "orchestrator",
+      streamKind: "assistant",
+      content: response,
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 1,
+      metadata: { model },
+    });
+
+    return response;
   }
 
   async runBuilderInWorkspace(input: {
@@ -762,6 +1010,16 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     epicId?: string | null;
     onStream?: StreamHook;
   }): Promise<OpenCodeBuilderResult> {
+    if (this.models.builder === "gemini-cli") {
+      return this.gemini.runBuilder({ role: "builder", ...input });
+    }
+    if (this.models.builder === "qwen-cli") {
+      return this.qwen.runBuilder({ role: "builder", ...input });
+    }
+    if (this.models.builder === "codex-cli") {
+      return this.codex.runBuilder({ role: "builder", ...input });
+    }
+
     const model = this.resolveHarnessModel("builder");
     input.onStream?.({
       agentRole: "builder",
@@ -774,6 +1032,10 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
+    const builderToolMode = this.resolveToolMode(model);
+    if (builderToolMode === "xml") {
+      return await this.runBuilderAttempt(input, model, "xml");
+    }
     try {
       return await this.runBuilderAttempt(input, model, "native");
     } catch (nativeError) {
@@ -812,63 +1074,19 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       sequence: 0,
     });
 
-    const toolContext = this.buildToolContext(input.cwd, "tester");
+    const toolContext = this.buildToolContext(input.cwd, "tester", undefined, undefined, input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("tester", model, toolContext));
 
-    const harness = new MediatedAgentHarness({
-      baseURL: `${this.ollamaBaseURL}/v1`,
-      apiKey: "ollama",
-      model,
-      braveApiKey: this.braveApiKey,
-      toolContext,
-    });
-
-    // TIGHT LIMITS: Tester must decide within 10 iterations (prompt says 3 tool calls)
+    // TIGHT LIMITS: Tester must decide within 50 iterations (prompt says 3 tool calls)
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    if (isOllama) await ensureModelLoaded(model);
     const result = await harness.run("tester", input.prompt, {
-      maxIterations: 10,
+      maxIterations: 80,
       timeoutMs: 300_000, // 5 minutes
-      onEvent: (event) => {
-        if (event.kind === "text" || event.kind === "thinking") {
-          input.onStream?.({
-            agentRole: "tester",
-            source: "mediated-harness",
-            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
-            content: event.text,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "tool_call") {
-          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
-          input.onStream?.({
-            agentRole: "tester",
-            source: "mediated-harness",
-            streamKind: "tool_call",
-            content: `${event.call.name}(${argsPreview})`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
-          });
-        }
-        if (event.kind === "complete") {
-          input.onStream?.({
-            agentRole: "tester",
-            source: "mediated-harness",
-            streamKind: "status",
-            content: `Completed in ${event.iterations} iterations`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-      },
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("tester", model, input),
     });
+    if (isOllama) markModelLoaded(model);
 
     const parsed = parseJsonText(result.text) as TesterResult;
     return {
@@ -879,13 +1097,126 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       testResults: parsed.testResults ?? "SKIPPED",
       testOutput: parsed.testOutput ?? "",
       testsRun: parsed.testsRun ?? 0,
+      failedTests: parsed.failedTests ?? [],
     };
   }
 
   private resolveHarnessModel(role: AgentRole): string {
     const raw = this.models[role];
+    if (!raw) return process.env.OLLAMA_FALLBACK_MODEL || "qwen3:8b";
     if (raw.startsWith("mediated:")) return raw.slice("mediated:".length);
+    if (raw.startsWith("zai:")) return raw.slice("zai:".length);
     return raw;
+  }
+
+  private resolveAnthropicMediatedModel(model: string): string {
+    return model.startsWith("anthropic-mediated:") ? model.slice("anthropic-mediated:".length) : model;
+  }
+
+  private resolveToolMode(_model: string): "native" | "xml" {
+    return "native";
+  }
+
+  private buildHarnessEventHandler(
+    role: string,
+    model: string,
+    input: { runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook },
+  ): (event: import("../mediated-agent-harness/types.ts").MediatedHarnessEvent) => void {
+    return (event) => {
+      if (event.kind === "streaming_text" || event.kind === "streaming_thinking") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: event.kind === "streaming_thinking" ? "streaming_thinking" : "streaming_text",
+          content: event.text,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model },
+        });
+        return;
+      }
+      if (event.kind === "text" || event.kind === "thinking") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: event.kind === "thinking" ? "thinking" : "assistant",
+          content: event.text,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model },
+        });
+      }
+      if (event.kind === "tool_call") {
+        const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: "tool_call",
+          content: `${event.call.name}(${argsPreview})`,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
+        });
+      }
+      if (event.kind === "tool_result") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: "tool_result",
+          content: event.result.output,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model, toolName: event.result.name, toolResult: event.result.output, isError: Boolean(event.result.isError) },
+        });
+      }
+      if (event.kind === "tool_error") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: "tool_error",
+          content: event.error,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model, toolName: event.call.name },
+        });
+      }
+      if (event.kind === "duplicate_recovery") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: "duplicate_recovery",
+          content: `Duplicate tool call detected: ${event.bannedCall}. Recovery restart #${event.recoveryCount}.`,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model, recoveryCount: event.recoveryCount },
+        });
+      }
+      if (event.kind === "complete") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: "status",
+          content: `Completed in ${event.iterations} iterations`,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model },
+        });
+      }
+    };
   }
 
   protected buildBuilderXmlPrompt(prompt: string): string {
@@ -915,75 +1246,27 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     model: string,
     toolMode: "native" | "xml"
   ): Promise<OpenCodeBuilderResult> {
-    const toolContext = this.buildToolContext(input.cwd, "builder");
-    const harness = new MediatedAgentHarness({
-      baseURL: `${this.ollamaBaseURL}/v1`,
-      apiKey: "ollama",
-      model,
-      braveApiKey: this.braveApiKey,
-      toolContext,
-    });
+    const toolContext = this.buildToolContext(input.cwd, "builder", undefined, undefined, input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("builder", model, toolContext));
 
-    const result = await harness.run("builder", toolMode === "xml" ? this.buildBuilderXmlPrompt(input.prompt) : input.prompt, {
+    const mediatedPrompt = [
+      "MEDIATED HARNESS OVERRIDE:",
+      "Ignore any instruction to output a FINAL_JSON block directly.",
+      "Use only tool calls while working, then end by calling the finish tool.",
+      "Do not return plain JSON or prose as your final answer.",
+      "",
+      toolMode === "xml" ? this.buildBuilderXmlPrompt(input.prompt) : input.prompt,
+    ].join("\n");
+
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
+    if (isOllama) await ensureModelLoaded(model);
+    const result = await harness.run("builder", mediatedPrompt, {
       maxIterations: 100,
       timeoutMs: 1_800_000,
       toolMode,
-      onEvent: (event) => {
-        if (event.kind === "text" || event.kind === "thinking") {
-          input.onStream?.({
-            agentRole: "builder",
-            source: "mediated-harness",
-            streamKind: event.kind === "thinking" ? "thinking" : "assistant",
-            content: event.text,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "tool_call") {
-          const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
-          input.onStream?.({
-            agentRole: "builder",
-            source: "mediated-harness",
-            streamKind: "tool_call",
-            content: `${event.call.name}(${argsPreview})`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model, toolName: event.call.name, toolArgs: event.call.args as import("../types.ts").Json },
-          });
-        }
-        if (event.kind === "tool_error") {
-          input.onStream?.({
-            agentRole: "builder",
-            source: "mediated-harness",
-            streamKind: "stderr",
-            content: `Tool error: ${event.error}`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-        if (event.kind === "complete") {
-          input.onStream?.({
-            agentRole: "builder",
-            source: "mediated-harness",
-            streamKind: "status",
-            content: `Completed in ${event.iterations} iterations`,
-            runId: input.runId,
-            ticketId: input.ticketId,
-            epicId: input.epicId,
-            sequence: 0,
-            metadata: { model },
-          });
-        }
-      },
+      onEvent: this.buildHarnessEventHandler("builder", model, input),
     });
+    if (isOllama) markModelLoaded(model);
 
     return {
       summary: result.text.slice(0, 500),
@@ -992,14 +1275,63 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     };
   }
 
+  private buildHarnessConfig(role: AgentRole, model: string, toolContext: ToolExecutionContext): any {
+    const numCtx = role === "coder" || role === "reviewer"
+      ? resolveOllamaContextWindow(this.resolveAnthropicMediatedModel(model))
+      : undefined;
+    if (this.anthropicOverride) {
+      return { ...this.anthropicOverride, braveApiKey: this.braveApiKey, toolContext, ...(numCtx ? { numCtx } : {}) };
+    }
+    if (model.startsWith("anthropic-mediated:")) {
+      const anthropicModel = this.resolveAnthropicMediatedModel(model);
+      return {
+        baseURL: process.env.ZAI_BASE_URL || process.env.ANTHROPIC_BASE_URL || "https://api.z.ai/api/anthropic",
+        apiKey: process.env.ZAI_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || "",
+        apiBackend: "anthropic" as const,
+        model: anthropicModel,
+        braveApiKey: this.braveApiKey,
+        toolContext,
+        ...(numCtx ? { numCtx } : {}),
+      };
+    }
+    if (model.startsWith("openrouter:")) {
+      return {
+        baseURL: "https://openrouter.ai/api/v1",
+        apiKey: this.openrouterApiKey,
+        apiBackend: "openrouter",
+        model: model.slice("openrouter:".length),
+        braveApiKey: this.braveApiKey,
+        toolContext,
+        ...(numCtx ? { numCtx } : {}),
+      };
+    }
+    return {
+      baseURL: this.ollamaBaseURL,
+      apiKey: "",
+      model,
+      braveApiKey: this.braveApiKey,
+      toolContext,
+      ...(numCtx ? { numCtx } : {}),
+    };
+  }
+
   private buildToolContext(
     cwd: string,
     workspaceId: string,
-    ragOptions?: { ragIndexId?: number; db?: any }
+    ragOptions?: { ragIndexId?: number; db?: any },
+    extraCommands?: string[],
+    readTrackingKey?: string
   ): ToolExecutionContext {
+    const config = loadConfig();
+    const availableCommands = Array.from(new Set([
+      ...Object.keys(config.commandCatalog),
+      ...(extraCommands ?? [])
+    ]));
     return {
       cwd,
       workspaceId,
+      readTrackingKey,
+      availableCommands,
       ragIndexId: ragOptions?.ragIndexId,
       db: ragOptions?.db,
       allowedPaths: ["*"],
@@ -1029,8 +1361,10 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
         const { promisify } = await import("node:util");
         const execFileAsync = promisify(execFile);
         try {
-          const { stdout } = await execFileAsync("git", ["diff"], { cwd, timeout: 10000 });
-          return stdout;
+          const { stdout } = await execFileAsync("git", ["diff", "--staged"], { cwd, timeout: 10000 });
+          if (stdout.trim()) return stdout;
+          const { stdout: unstaged } = await execFileAsync("git", ["diff"], { cwd, timeout: 10000 });
+          return unstaged;
         } catch { return ""; }
       },
       gitStatus: async () => {
@@ -1043,8 +1377,8 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
         } catch { return ""; }
       },
       runNamedCommand: async (name) => {
-        const config = loadConfig();
-        const command = config.commandCatalog[name as keyof typeof config.commandCatalog];
+        const builtinInstallCommand = name === "install" ? "npm install" : null;
+        const command = builtinInstallCommand || config.commandCatalog[name as keyof typeof config.commandCatalog];
         if (!command) return { stdout: "", stderr: `Unknown command: ${name}`, exitCode: 1 };
         const { exec } = await import("node:child_process");
         const { promisify } = await import("node:util");
@@ -1056,10 +1390,10 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
           return { stdout: err.stdout ?? "", stderr: err.stderr ?? String(err), exitCode: err.code ?? 1 };
         }
       },
+      getAvailableCommands: () => availableCommands,
       saveArtifact: async (opts) => {
         const { writeFile, mkdir } = await import("node:fs/promises");
         const path = await import("node:path");
-        const config = loadConfig();
         const dir = path.join(config.artifactsDir, workspaceId);
         await mkdir(dir, { recursive: true });
         const artifactPath = path.join(dir, `${opts.name}.txt`);
@@ -1070,12 +1404,19 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
   }
 }
 
-export function createGateway(): ModelGateway {
-  const models = loadConfig().models;
-  // If any role uses mediated: prefix, use the mediated harness gateway
-  const hasMediated = Object.values(models).some(m => m.startsWith("mediated:"));
-  if (hasMediated) {
-    return new MediatedAgentHarnessGateway();
-  }
-  return new OpenCodeHybridGateway();
+export function createGateway(modelsOverride?: Record<AgentRole, string>): ModelGateway {
+  return new MediatedAgentHarnessGateway(undefined, modelsOverride);
+}
+
+export function createAnthropicHarnessGateway(): MediatedAgentHarnessGateway {
+  const config = loadConfig();
+  const zaiBaseURL = process.env.ZAI_BASE_URL || process.env.ANTHROPIC_BASE_URL || "https://api.z.ai/api/anthropic";
+  const zaiApiKey = process.env.ZAI_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || "";
+  const zaiModel = process.env.ZAI_MODEL || "glm-5.1";
+  return new MediatedAgentHarnessGateway(undefined, undefined, {
+    baseURL: zaiBaseURL,
+    apiKey: zaiApiKey,
+    apiBackend: "anthropic" as const,
+    model: zaiModel,
+  });
 }

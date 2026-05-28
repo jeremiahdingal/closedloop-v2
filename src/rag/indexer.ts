@@ -13,6 +13,12 @@ const DEFAULT_EMBEDDING_MODEL = "nomic-embed-text";
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 const MAX_FILE_SIZE = 50 * 1024; // 50KB
 const SKIP_PATTERNS = /node_modules|\.git|\.next|dist|build|\.env|\.lock/;
+const TRANSIENT_RAG_PATH_PATTERNS = [
+  /(^|\/)playwright-report(\/|$)/,
+  /(^|\/)test-results(\/|$)/,
+  /(^|\/)coverage(\/|$)/,
+  /(^|\/)output\/generated(\/|$)/,
+];
 const EMBEDDING_BATCH_SIZE = 64;
 const EMBEDDING_MAX_CHARS = 4000;
 
@@ -30,6 +36,11 @@ export interface IndexResult {
   id: number;
   chunkCount: number;
   cached: boolean;
+}
+
+export function isTransientRagPath(relPath: string): boolean {
+  const normalized = relPath.replace(/\\/g, "/");
+  return TRANSIENT_RAG_PATH_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
 /**
@@ -274,10 +285,9 @@ async function walkDir(repoRoot: string, dir: string, scopePaths?: string[]): Pr
     const fullPath = join(dir, entry.name);
 
     // Skip patterns
-    if (SKIP_PATTERNS.test(entry.name)) continue;
-
     // Scope filter
     const relPathFromRoot = relative(repoRoot, fullPath).replace(/\\/g, "/");
+    if (SKIP_PATTERNS.test(entry.name) || isTransientRagPath(relPathFromRoot)) continue;
 
     if (entry.isDirectory()) {
       if (!shouldTraverseDir(relPathFromRoot, scopePaths)) continue;

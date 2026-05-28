@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
+import Calendar from "react-calendar";
+import "react-calendar/dist/Calendar.css";
 import "./styles.css";
 
 import {
@@ -8,6 +10,8 @@ import {
   AgentStreamStatus,
   Dashboard,
   Epic,
+  EpicMergeStatus,
+  OllamaPsSnapshot,
   Run,
   Ticket,
 } from "./types.ts";
@@ -22,6 +26,7 @@ import {
   isCompletedEvent,
   isRunActiveForRole,
   normalizeAgentRole,
+  normalizeDisplayedTicketId,
   normalizeTicketTitleKey,
   ticketStatusScore,
   truncateId,
@@ -31,30 +36,54 @@ import { AgentModal } from "./components/AgentModal.tsx";
 import { EpicModal } from "./components/EpicModal.tsx";
 import { PlanningModal } from "./components/PlanningModal.tsx";
 import { TicketModal } from "./components/TicketModal.tsx";
+import { DirectChatModal } from "./components/DirectChatModal.tsx";
+import { GameModal } from "./components/GameModal.tsx";
+import { OllamaPsPanel } from "./components/OllamaPsPanel.tsx";
+
+const TICKET_MODAL_EVENT_LIMIT = 500;
 
 export function App() {
   const [data, setData] = useState<Dashboard>({ epics: [], tickets: [], runs: [], agentEvents: [] });
   const [modelsConfig, setModelsConfig] = useState<AgentModelsConfig>({});
+  const [ollamaPs, setOllamaPs] = useState<OllamaPsSnapshot>({ ok: false, status: "idle", models: [] });
   const [modelOverrides, setModelOverrides] = useState<Record<string, string>>({});
+  const [remoteOverrideEnabled, setRemoteOverrideEnabled] = useState(false);
   const [title, setTitle] = useState("");
   const [goalText, setGoalText] = useState("");
   const [targetDir, setTargetDir] = useState("");
   const [targetDirEditing, setTargetDirEditing] = useState(false);
   const [targetBranch, setTargetBranch] = useState("");
   const [epicMode, setEpicMode] = useState<"build" | "plan">("build");
+  const [isScheduled, setIsScheduled] = useState(false);
+  const [scheduledDate, setScheduledDate] = useState("");
+  const [epicImages, setEpicImages] = useState<File[]>([]);
+  const [schedulerDate, setSchedulerDate] = useState<string>("");
   const [planSessionId, setPlanSessionId] = useState<string | null>(null);
+  const [planMinimized, setPlanMinimized] = useState(false);
+  const [planReady, setPlanReady] = useState(false);
+  const [planAwaitingClarification, setPlanAwaitingClarification] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [epicPage, setEpicPage] = useState(0);
+  const [epicPageSize] = useState(5);
+  const [epicTotal, setEpicTotal] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [openRole, setOpenRole] = useState<string | null>(null);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [isTetrisOpen, setIsTetrisOpen] = useState(false);
+  const [isPacmanOpen, setIsPacmanOpen] = useState(false);
+  const [isTamagotchiOpen, setIsTamagotchiOpen] = useState(false);
   const [selectedEpic, setSelectedEpic] = useState<string | null>(null);
   const [selectedEpicDetails, setSelectedEpicDetails] = useState<Epic | null>(null);
+  const [selectedEpicMergeStatus, setSelectedEpicMergeStatus] = useState<EpicMergeStatus | null>(null);
+  const [selectedEpicMergeStatusLoading, setSelectedEpicMergeStatusLoading] = useState(false);
   const [selectedTicket, setSelectedTicket] = useState<Ticket | null>(null);
   const [selectedTicketEvents, setSelectedTicketEvents] = useState<AgentEvent[]>([]);
   const selectedTicketRef = useRef<Ticket | null>(null);
   const latestAgentEventIdRef = useRef(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   async function refreshModels() {
     try {
@@ -71,6 +100,7 @@ export function App() {
         if (typeof cfg.targetDir === "string") setTargetDir(cfg.targetDir);
         if (typeof cfg.currentBranch === "string" && cfg.currentBranch)
           setTargetBranch(cfg.currentBranch);
+        if (typeof cfg.remoteOverrideEnabled === "boolean") setRemoteOverrideEnabled(cfg.remoteOverrideEnabled);
         if (cfg.models && typeof cfg.models === "object" && !Array.isArray(cfg.models)) {
           setModelsConfig(cfg.models as AgentModelsConfig);
         }
@@ -82,19 +112,29 @@ export function App() {
   async function refresh() {
     try {
       setLoading(true);
-      const [epics, tickets, runs, fetchedAgentEvents] = await Promise.all([
-        fetchJson<Epic[]>("/api/epics"),
+      const [epicResult, tickets, runs, fetchedAgentEvents, ollamaSnapshot] = await Promise.all([
+        fetchJson<{ epics: Epic[]; total: number }>("/api/epics?limit=" + epicPageSize + "&offset=" + (epicPage * epicPageSize)),
         fetchJson<Ticket[]>("/api/tickets"),
         fetchJson<Run[]>("/api/runs"),
         fetchJson<AgentEvent[]>("/api/agent-events?limit=600"),
+        fetchJson<OllamaPsSnapshot>("/api/ollama/ps").catch((): OllamaPsSnapshot => ({
+          ok: false,
+          status: "error",
+          models: [],
+          error: "Failed to load Ollama process list.",
+        })),
       ]);
+      
+      setEpicTotal(epicResult.total);
+      setOllamaPs(ollamaSnapshot);
+
       // Merge fetched events with any SSE-captured events to avoid losing recent ones
       setData((current) => {
         const merged = new Map<number, AgentEvent>();
         for (const e of fetchedAgentEvents) merged.set(e.id, e);
         for (const e of current.agentEvents) merged.set(e.id, e);
         const agentEvents = [...merged.values()].sort((a, b) => a.id - b.id).slice(-600);
-        return { epics, tickets, runs, agentEvents };
+        return { epics: epicResult.epics, tickets, runs, agentEvents };
       });
       void refreshModels();
       setError(null);
@@ -107,15 +147,15 @@ export function App() {
 
   useEffect(() => {
     void refresh();
-  }, []);
+  }, [epicPage]);
   useEffect(() => {
     if (!autoRefresh) return;
     const timer = window.setInterval(() => void refresh(), 5000);
     return () => window.clearInterval(timer);
-  }, [autoRefresh]);
+  }, [autoRefresh, epicPage]);
 
   const [lastEventTime, setLastEventTime] = useState<Map<string, number>>(new Map());
-  const [collapsedPanels, setCollapsedPanels] = useState<Set<string>>(new Set());
+  const [collapsedPanels, setCollapsedPanels] = useState<Set<string>>(new Set(["scheduler"]));
   const [nowTick, setNowTick] = useState<number>(Date.now());
 
   useEffect(() => {
@@ -147,6 +187,15 @@ export function App() {
     selectedTicketRef.current = selectedTicket;
   }, [selectedTicket]);
 
+  // Keep selectedTicket synced with latest ticket data (e.g., new currentRunId after retry)
+  useEffect(() => {
+    if (!selectedTicket) return;
+    const fresh = data.tickets.find(t => t.id === selectedTicket.id);
+    if (fresh && (fresh.status !== selectedTicket.status || fresh.currentRunId !== selectedTicket.currentRunId)) {
+      setSelectedTicket(fresh);
+    }
+  }, [data.tickets]);
+
   useEffect(() => {
     latestAgentEventIdRef.current = data.agentEvents.at(-1)?.id ?? 0;
   }, [data.agentEvents]);
@@ -170,12 +219,10 @@ export function App() {
       setSelectedTicketEvents((current) => {
         const selected = selectedTicketRef.current;
         if (!selected) return current;
-        const matchesTicket = row.ticket_id === selected.id;
-        const matchesRun = Boolean(selected.currentRunId) && row.run_id === selected.currentRunId;
-        if (!matchesTicket && !matchesRun) return current;
+        if (row.ticket_id !== selected.id && row.run_id !== selected.currentRunId) return current;
         const next = [...current, row];
         const deduped = Array.from(new Map(next.map((item) => [item.id, item])).values());
-        return deduped.slice(-200);
+        return deduped.slice(-TICKET_MODAL_EVENT_LIMIT);
       });
       const role = normalizeAgentRole(row.payload?.agentRole);
       setLastEventTime((prev) => new Map(prev).set(role, Date.now()));
@@ -190,10 +237,12 @@ export function App() {
     }
 
     let cancelled = false;
-    const params = new URLSearchParams({ ticketId: selectedTicket.id, limit: "200" });
-    if (selectedTicket.currentRunId) params.set("runId", selectedTicket.currentRunId);
+    const params = new URLSearchParams({ limit: String(TICKET_MODAL_EVENT_LIMIT) });
+    if (selectedTicket.currentRunId) {
+      params.set("runId", selectedTicket.currentRunId);
+    }
 
-    void fetchJson<AgentEvent[]>(`/api/agent-events?${params.toString()}`)
+    void fetchJson<AgentEvent[]>(`/api/tickets/${encodeURIComponent(selectedTicket.id)}/events?${params.toString()}`)
       .then((events) => {
         if (!cancelled) setSelectedTicketEvents(events);
       })
@@ -204,7 +253,30 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedTicket]);
+  }, [selectedTicket?.id, selectedTicket?.currentRunId]);
+
+  useEffect(() => {
+    if (!selectedEpicDetails) {
+      setSelectedEpicMergeStatus(null);
+      setSelectedEpicMergeStatusLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setSelectedEpicMergeStatusLoading(true);
+    void fetchJson<EpicMergeStatus>(`/api/epics/${encodeURIComponent(selectedEpicDetails.id)}/merge-status`)
+      .then((status) => {
+        if (!cancelled) setSelectedEpicMergeStatus(status);
+      })
+      .catch(() => {
+        if (!cancelled) setSelectedEpicMergeStatus(null);
+      })
+      .finally(() => {
+        if (!cancelled) setSelectedEpicMergeStatusLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedEpicDetails?.id, selectedEpicDetails?.updatedAt]);
 
   const isAgentActive = useMemo(() => {
     const now = Date.now();
@@ -226,11 +298,12 @@ export function App() {
         "playWriter",
         "playTester",
         "epicDecoder",
-        "builder",
+        "explorer",
+        "coder",
         "reviewer",
-        "tester",
         "epicReviewer",
         "doctor",
+        "builder",
       ];
       const ia = order.indexOf(a);
       const ib = order.indexOf(b);
@@ -271,7 +344,10 @@ export function App() {
     return status;
   }, [agentRoles, eventsByRole, data.runs, nowTick]);
 
-  const activeItems = openRole ? [...(eventsByRole.get(openRole) ?? [])].reverse() : [];
+  const activeItems = useMemo(() =>
+    openRole ? [...(eventsByRole.get(openRole) ?? [])].reverse() : [],
+    [openRole, eventsByRole]
+  );
 
   const dedupedTickets = useMemo(() => {
     const grouped = new Map<string, Ticket[]>();
@@ -311,6 +387,25 @@ export function App() {
     return grouped;
   }, [dedupedTickets]);
 
+  function localDate(d: Date) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+
+  const scheduledEpics = useMemo(
+    () => data.epics.filter((e) => e.scheduledDate).sort((a, b) => a.scheduledDate!.localeCompare(b.scheduledDate!)),
+    [data.epics],
+  );
+
+  const displayEpics = useMemo(() => {
+    if (!schedulerDate) return data.epics;
+    return data.epics.filter((e) => e.scheduledDate === schedulerDate);
+  }, [data.epics, schedulerDate]);
+
+  const displayScheduledEpics = useMemo(() => {
+    if (schedulerDate) return scheduledEpics.filter((e) => e.scheduledDate === schedulerDate);
+    return scheduledEpics;
+  }, [scheduledEpics, schedulerDate]);
+
   const activeCount = dedupedTickets.filter(
     (t) => t.status === "building" || t.status === "reviewing" || t.status === "testing"
   ).length;
@@ -339,15 +434,30 @@ export function App() {
     }
     try {
       setSubmitting(true);
-      await fetchJson("/api/epics", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title, goalText, targetDir, targetBranch: targetBranch || undefined }),
-      });
+      if (epicImages.length > 0 || isScheduled) {
+        const form = new FormData();
+        form.append("title", title);
+        form.append("goalText", goalText);
+        form.append("targetDir", targetDir);
+        if (targetBranch) form.append("targetBranch", targetBranch);
+        if (isScheduled && scheduledDate) form.append("scheduledDate", scheduledDate);
+        for (const f of epicImages) form.append("images", f);
+        await fetchJson("/api/epics", { method: "POST", body: form });
+      } else {
+        await fetchJson("/api/epics", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ title, goalText, targetDir, targetBranch: targetBranch || undefined }),
+        });
+      }
       await refresh();
       setTitle("");
       setGoalText("");
       setTargetBranch("");
+      setIsScheduled(false);
+      setScheduledDate("");
+      setEpicImages([]);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -403,6 +513,22 @@ export function App() {
     }
   }
 
+  async function markEpicDone(id: string) {
+    if (actionBusy) return;
+    const toastId = toast.loading("Marking epic as done...");
+    try {
+      setActionBusy(`mark-done-epic-${id}`);
+      const res = await fetch(`/api/epics/${encodeURIComponent(id)}/done`, { method: "POST" });
+      if (!res.ok) throw new Error("Failed to mark epic as done");
+      toast.success("Epic marked as done.", { id: toastId });
+      void refresh();
+    } catch (err) {
+      toast.error(`Error: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
   async function retryEpic(epicId: string) {
     const toastId = toast.loading("Re-queuing epic run...");
     try {
@@ -412,6 +538,28 @@ export function App() {
       toast.success("Epic re-queued.", { id: toastId });
     } catch (err) {
       toast.error(`Failed to retry epic: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function redecodeEpic(epicId: string) {
+    const confirmed = await confirmToast({
+      title: "Re-decode epic?",
+      description: "This clears the epic's current tickets and runs, then queues a fresh decoder pass.",
+      confirmLabel: "Re-decode Epic",
+    });
+    if (!confirmed) return;
+
+    const toastId = toast.loading("Re-decoding epic...");
+    try {
+      setActionBusy(`redecode-epic-${epicId}`);
+      await fetchJson(`/api/epics/${encodeURIComponent(epicId)}/redecode`, { method: "POST" });
+      await refresh();
+      toast.success("Epic queued for a fresh decode.", { id: toastId });
+    } catch (err) {
+      setError((err as Error).message);
+      toast.error(`Failed to re-decode epic: ${(err as Error).message}`, { id: toastId });
     } finally {
       setActionBusy(null);
     }
@@ -485,6 +633,36 @@ export function App() {
     } catch (err) {
       setError((err as Error).message);
       toast.error(`Failed to queue play loop: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function pauseEpic(epicId: string) {
+    const toastId = toast.loading("Pausing epic...");
+    try {
+      setActionBusy(`pause-epic-${epicId}`);
+      await fetchJson(`/api/epics/${encodeURIComponent(epicId)}/pause`, { method: "POST" });
+      await refresh();
+      toast.success("Epic paused.", { id: toastId });
+    } catch (err) {
+      setError((err as Error).message);
+      toast.error(`Failed to pause epic: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function resumeEpic(epicId: string) {
+    const toastId = toast.loading("Resuming epic...");
+    try {
+      setActionBusy(`resume-epic-${epicId}`);
+      await fetchJson(`/api/epics/${encodeURIComponent(epicId)}/resume`, { method: "POST" });
+      await refresh();
+      toast.success("Epic resumed.", { id: toastId });
+    } catch (err) {
+      setError((err as Error).message);
+      toast.error(`Failed to resume epic: ${(err as Error).message}`, { id: toastId });
     } finally {
       setActionBusy(null);
     }
@@ -607,6 +785,31 @@ export function App() {
     }
   }
 
+  async function rerunDirectTicket(ticketId: string) {
+    const confirmed = await confirmToast({
+      title: "Skip explorer and rerun?",
+      description: "This queues a new run that skips the explorer and goes directly to coding, using previous analysis or ticket allowedPaths.",
+      confirmLabel: "Skip Explorer & Rerun",
+    });
+    if (!confirmed) return;
+    const toastId = toast.loading("Queuing direct rerun (skip explorer)...");
+    try {
+      setActionBusy(`rerun-direct-ticket-${ticketId}`);
+      await fetchJson(`/api/tickets/${encodeURIComponent(ticketId)}/rerun-direct`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cancelActive: true }),
+      });
+      await refresh();
+      toast.success("Direct rerun queued (skip explorer).", { id: toastId });
+    } catch (err) {
+      setError((err as Error).message);
+      toast.error(`Failed to direct rerun: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
   async function updateAgentModel(role: string, model: string) {
     const current = modelsConfig[role]?.currentModel;
     if (!current || current === model) return;
@@ -622,6 +825,53 @@ export function App() {
       toast.success(`${role} now uses ${model}.`, { id: toastId });
     } catch (err) {
       toast.error(`Failed to update ${role}: ${(err as Error).message}`, { id: toastId });
+    }
+  }
+
+  async function mergeEpicToMain(epicId: string) {
+    const confirmed = await confirmToast({
+      title: "Merge epic to main?",
+      description: "This will merge the epic branch into local main if the repo is clean and conflict-free.",
+      confirmLabel: "Merge to Main",
+    });
+    if (!confirmed) return;
+    const toastId = toast.loading("Merging epic branch into main...");
+    try {
+      setActionBusy(`merge-epic-${epicId}`);
+      const result = await fetchJson<{ ok: true; sourceBranch: string; targetBranch: string; mergedCommit: string }>(
+        `/api/epics/${encodeURIComponent(epicId)}/merge-main`,
+        { method: "POST" }
+      );
+      toast.success(`Merged ${result.sourceBranch} into ${result.targetBranch}.`, { id: toastId });
+      if (selectedEpicDetails?.id === epicId) {
+        const status = await fetchJson<EpicMergeStatus>(`/api/epics/${encodeURIComponent(epicId)}/merge-status`);
+        setSelectedEpicMergeStatus(status);
+      }
+      await refresh();
+    } catch (err) {
+      toast.error(`Failed to merge epic: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function updateRemoteOverride(next: boolean) {
+    const toastId = toast.loading(next ? "Enabling Remote Override..." : "Disabling Remote Override...");
+    try {
+      const response = await fetchJson<{ remoteOverrideEnabled?: boolean }>("/api/config", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ remoteOverrideEnabled: next }),
+      });
+      if (typeof response.remoteOverrideEnabled === "boolean") {
+        setRemoteOverrideEnabled(response.remoteOverrideEnabled);
+      } else {
+        setRemoteOverrideEnabled(next);
+      }
+      toast.success(next ? "Remote Override enabled." : "Remote Override disabled.", { id: toastId });
+      void refreshModels();
+    } catch (err) {
+      toast.error(`Failed to update Remote Override: ${(err as Error).message}`, { id: toastId });
     }
   }
 
@@ -710,6 +960,18 @@ export function App() {
             <span className="subtitle-mono">workspace: {targetDir}</span>
           </div>
           <div className="topbar-actions">
+            <button className="btn" onClick={() => setIsTetrisOpen(true)}>
+              🎮 Tetris
+            </button>
+            <button className="btn" onClick={() => setIsPacmanOpen(true)}>
+              🕹️ Pac-Man
+            </button>
+            <button className="btn" onClick={() => setIsTamagotchiOpen(true)}>
+              🐾 Tamagotchi
+            </button>
+            <button className="btn" onClick={() => setIsChatOpen(true)}>
+              💬 Direct Chat
+            </button>
             <button className="btn" onClick={() => void refresh()} disabled={loading}>
               {loading ? "⏳ Refresh..." : "🔄 Refresh"}
             </button>
@@ -720,6 +982,14 @@ export function App() {
                 onChange={(e) => setAutoRefresh(e.target.checked)}
               />
               Auto-refresh
+            </label>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={remoteOverrideEnabled}
+                onChange={(e) => void updateRemoteOverride(e.target.checked)}
+              />
+              Remote Override
             </label>
           </div>
         </div>
@@ -813,13 +1083,16 @@ export function App() {
       <div className="main-grid">
         {/* Mobile Stacked View */}
         <div className="mobile-stacked">
+          <OllamaPsPanel snapshot={ollamaPs} />
+
           {/* Epics */}
           <div className="win-panel">
             <div className="win-titlebar">
               <div className="win-titlebar-text">
                 <span>📁</span>
-                <span>Epics ({data.epics.length})</span>
+                <span>Epics ({displayEpics.length})</span>
                 {selectedEpic && <span className="filter-badge">🔍 {truncateId(selectedEpic)}</span>}
+                {schedulerDate && <span className="filter-badge">📅 {schedulerDate}</span>}
               </div>
               <div className="win-titlebar-buttons">
                 <div className="win-btn-box" onClick={() => togglePanel("epics")}>
@@ -831,9 +1104,28 @@ export function App() {
             <div
               className={`win-content win-inset ${collapsedPanels.has("epics") ? "collapsed" : ""}`}
             >
+              <div className="pagination-bar">
+                <button
+                  className="mini-btn" 
+                  disabled={epicPage === 0} 
+                  onClick={() => setEpicPage(p => p - 1)}
+                >
+                  &lt; Prev
+                </button>
+                <span className="pagination-info">
+                  Page {epicPage + 1} of {Math.ceil(epicTotal / epicPageSize) || 1}
+                </span>
+                <button 
+                  className="mini-btn" 
+                  disabled={(epicPage + 1) * epicPageSize >= epicTotal} 
+                  onClick={() => setEpicPage(p => p + 1)}
+                >
+                  Next &gt;
+                </button>
+              </div>
               <div className="epic-list">
-                {data.epics.length ? (
-                  data.epics.map((epic) => (
+                {displayEpics.length ? (
+                  displayEpics.map((epic) => (
                     <div
                       key={epic.id}
                       className={`epic-item ${selectedEpic === epic.id ? "selected" : epic.status}`}
@@ -846,6 +1138,25 @@ export function App() {
                         </div>
                         <div className="item-actions">
                           <span className={`pill pill-${epic.status}`}>{epic.status}</span>
+                          {epic.status === "paused" ? (
+                            <button
+                              className="mini-btn"
+                              onClick={(e) => { e.stopPropagation(); void resumeEpic(epic.id); }}
+                              disabled={actionBusy !== null}
+                              title="Resume epic"
+                            >
+                              ▶
+                            </button>
+                          ) : ["executing", "planning", "reviewing"].includes(epic.status) ? (
+                            <button
+                              className="mini-btn"
+                              onClick={(e) => { e.stopPropagation(); void pauseEpic(epic.id); }}
+                              disabled={actionBusy !== null}
+                              title="Pause epic"
+                            >
+                              ⏸
+                            </button>
+                          ) : null}
                           <button
                             className="mini-btn"
                             onClick={(e) => {
@@ -912,7 +1223,7 @@ export function App() {
                       <div className="ticket-top">
                         <div style={{ flex: 1 }}>
                           <div className="ticket-id-row">
-                            <span className="ticket-id">{truncateId(ticket.id)}</span>
+                            <span className="ticket-id">{truncateId(normalizeDisplayedTicketId(ticket.id))}</span>
                             {ticket.priority && (
                               <span className={`priority-${ticket.priority}`}>{ticket.priority}</span>
                             )}
@@ -993,8 +1304,9 @@ export function App() {
 
         {/* Desktop Left Column */}
         <div className="left-col">
-          {/* Mission Status */}
-          <div className="win-panel">
+          <OllamaPsPanel snapshot={ollamaPs} />
+          {/* Legacy Mission Status (hidden) */}
+          <div className="win-panel mission-status-panel">
             <div className="win-titlebar">
               <div className="win-titlebar-text">
                 <span>📊</span>
@@ -1033,6 +1345,64 @@ export function App() {
                   <span className="crt-value">{activeCount}</span>
                 </div>
                 <div className="crt-body"></div>
+              </div>
+            </div>
+          </div>
+
+          {/* Scheduler */}
+          <div className="win-panel">
+            <div className="win-titlebar win-titlebar-blue">
+              <div className="win-titlebar-text">
+                <span>📅</span>
+                <span>Scheduler</span>
+                {scheduledEpics.length > 0 && <span className="win-titlebar-count">{scheduledEpics.length}</span>}
+              </div>
+              <div className="win-titlebar-buttons">
+                <div className="win-btn-box" onClick={() => togglePanel("scheduler")}>_</div>
+                <div className="win-btn-box">×</div>
+              </div>
+            </div>
+            <div className={`win-content ${collapsedPanels.has("scheduler") ? "collapsed" : ""}`}>
+              <div className="scheduler-content">
+                <Calendar
+                  calendarType="gregory"
+                  value={schedulerDate ? new Date(schedulerDate + "T00:00:00") : null}
+                  onClickDay={(date) => {
+                    const iso = localDate(date);
+                    setSchedulerDate(schedulerDate === iso ? "" : iso);
+                  }}
+                  tileContent={({ date, view }) => {
+                    if (view !== "month") return null;
+                    const iso = localDate(date);
+                    const dayEpics = scheduledEpics.filter(e => e.scheduledDate === iso);
+                    if (dayEpics.length === 0) return null;
+                    return (
+                      <div className="scheduler-tile-dots">
+                        {dayEpics.slice(0, 3).map((_, i) => (
+                          <span key={i} className="scheduler-tile-dot" />
+                        ))}
+                      </div>
+                    );
+                  }}
+                />
+                <div className="scheduler-events-label">Events</div>
+                <div className="scheduler-events">
+                  {displayScheduledEpics.length === 0 ? (
+                    <div className="scheduler-empty">No scheduled epics</div>
+                  ) : (
+                    displayScheduledEpics.map((epic) => (
+                      <div
+                        key={epic.id}
+                        className="scheduler-event"
+                        onClick={() => setSelectedEpic(epic.id)}
+                      >
+                        <span className="scheduler-event-date">{epic.scheduledDate}</span>
+                        <span className="scheduler-event-title">{epic.title}</span>
+                        <span className={`pill pill-${epic.status}`}>{epic.status}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -1150,6 +1520,45 @@ export function App() {
                     {targetDirEditing ? "💾" : "✏️"}
                   </button>
                 </div>
+                <div className="target-dir-row">
+                  <label className="scheduler-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={isScheduled}
+                      onChange={(e) => setIsScheduled(e.target.checked)}
+                    />
+                    <span>Scheduled</span>
+                  </label>
+                  {isScheduled && (
+                    <input
+                      type="date"
+                      className="date-input"
+                      value={scheduledDate}
+                      min={new Date().toISOString().slice(0, 10)}
+                      onChange={(e) => setScheduledDate(e.target.value)}
+                    />
+                  )}
+                </div>
+                <div className="target-dir-row">
+                  <label className="target-dir-label">Images:</label>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    style={{ display: "none" }}
+                    onChange={(e) => setEpicImages(Array.from(e.target.files ?? []))}
+                  />
+                  <button
+                    className="btn target-dir-btn"
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    📎
+                  </button>
+                  {epicImages.length > 0 && (
+                    <span className="file-count">{epicImages.length} file(s)</span>
+                  )}
+                </div>
                 <button
                   className="btn btn-primary"
                   onClick={() => void createEpic()}
@@ -1167,9 +1576,9 @@ export function App() {
             <div className="win-titlebar">
               <div className="win-titlebar-text">
                 <span>📁</span>
-                <span>Epics ({data.epics.length})</span>
+                <span>Epics ({displayEpics.length})</span>
                 {selectedEpic && <span className="filter-badge">🔍 {truncateId(selectedEpic)}</span>}
-              </div>
+                {schedulerDate && <span className="filter-badge">📅 {schedulerDate}</span>}              </div>
               <div className="win-titlebar-buttons">
                 <div className="win-btn-box" onClick={() => togglePanel("epicsDesktop")}>
                   _
@@ -1182,9 +1591,28 @@ export function App() {
                 collapsedPanels.has("epicsDesktop") ? "collapsed" : ""
               }`}
             >
+              <div className="pagination-bar">
+                <button 
+                  className="mini-btn" 
+                  disabled={epicPage === 0} 
+                  onClick={() => setEpicPage(p => p - 1)}
+                >
+                  &lt; Prev
+                </button>
+                <span className="pagination-info">
+                  Page {epicPage + 1} of {Math.ceil(epicTotal / epicPageSize) || 1}
+                </span>
+                <button 
+                  className="mini-btn" 
+                  disabled={(epicPage + 1) * epicPageSize >= epicTotal} 
+                  onClick={() => setEpicPage(p => p + 1)}
+                >
+                  Next &gt;
+                </button>
+              </div>
               <div className="epic-list">
-                {data.epics.length ? (
-                  data.epics.map((epic) => (
+                {displayEpics.length ? (
+                  displayEpics.map((epic) => (
                     <div
                       key={epic.id}
                       className={`epic-item ${selectedEpic === epic.id ? "selected" : epic.status}`}
@@ -1197,6 +1625,25 @@ export function App() {
                         </div>
                         <div className="item-actions">
                           <span className={`pill pill-${epic.status}`}>{epic.status}</span>
+                          {epic.status === "paused" ? (
+                            <button
+                              className="mini-btn"
+                              onClick={(e) => { e.stopPropagation(); void resumeEpic(epic.id); }}
+                              disabled={actionBusy !== null}
+                              title="Resume epic"
+                            >
+                              ▶
+                            </button>
+                          ) : ["executing", "planning", "reviewing"].includes(epic.status) ? (
+                            <button
+                              className="mini-btn"
+                              onClick={(e) => { e.stopPropagation(); void pauseEpic(epic.id); }}
+                              disabled={actionBusy !== null}
+                              title="Pause epic"
+                            >
+                              ⏸
+                            </button>
+                          ) : null}
                           <button
                             className="mini-btn"
                             onClick={(e) => {
@@ -1268,7 +1715,7 @@ export function App() {
                       <div className="ticket-top">
                         <div style={{ flex: 1 }}>
                           <div className="ticket-id-row">
-                            <span className="ticket-id">{truncateId(ticket.id)}</span>
+                            <span className="ticket-id">{truncateId(normalizeDisplayedTicketId(ticket.id))}</span>
                             {ticket.priority && (
                               <span className={`priority-${ticket.priority}`}>{ticket.priority}</span>
                             )}
@@ -1356,16 +1803,48 @@ export function App() {
           sessionId={planSessionId}
           epicTitle={title}
           initialBranch={targetBranch || undefined}
-          open={true}
-          onClose={() => setPlanSessionId(null)}
+          open={!planMinimized}
+          onMinimize={() => setPlanMinimized(true)}
+          onReady={() => setPlanReady(true)}
+          onStateChange={({ hasPlan, awaitingClarification }) => {
+            setPlanReady(hasPlan && !awaitingClarification);
+            setPlanAwaitingClarification(awaitingClarification);
+          }}
+          onClose={() => {
+            setPlanSessionId(null);
+            setPlanMinimized(false);
+            setPlanReady(false);
+            setPlanAwaitingClarification(false);
+          }}
           onApproved={(epicId) => {
             setPlanSessionId(null);
+            setPlanMinimized(false);
+            setPlanReady(false);
+            setPlanAwaitingClarification(false);
             setTitle("");
             setGoalText("");
             setTargetBranch("");
             void refresh();
           }}
         />
+      )}
+
+      {planMinimized && planSessionId && (
+        <div 
+          className={`minimized-planner-indicator ${planReady ? 'is-ready' : planAwaitingClarification ? 'is-ready' : ''}`}
+          onClick={() => setPlanMinimized(false)}
+          title={
+            planReady
+              ? "Plan is ready. Click to open."
+              : planAwaitingClarification
+              ? "Planner needs clarification. Click to answer."
+              : "Planning in progress... Click to open."
+          }
+        >
+          <span className="min-icon">📐</span>
+          <span className="min-label">Planning: {title}</span>
+          {(planReady || planAwaitingClarification) && <span className="min-ready-dot" />}
+        </div>
       )}
 
       {openRole && (
@@ -1383,13 +1862,14 @@ export function App() {
       {selectedTicket && (
         <TicketModal
           ticket={selectedTicket}
-          events={data.agentEvents}
+          events={selectedTicketEvents}
           runs={data.runs}
           open={true}
           onClose={() => setSelectedTicket(null)}
           onCancel={() => void cancelTicket(selectedTicket.id)}
           onRerun={() => void rerunTicket(selectedTicket.id)}
           onForceRerunInPlace={() => void forceRerunTicketInPlace(selectedTicket.id)}
+          onRerunDirect={() => void rerunDirectTicket(selectedTicket.id)}
           onForceRescue={() => void forceRescueTicket(selectedTicket.id)}
           onDelete={() => void deleteTicket(selectedTicket.id)}
           actionBusy={actionBusy !== null}
@@ -1401,16 +1881,34 @@ export function App() {
           epic={selectedEpicDetails}
           open={true}
           onClose={() => setSelectedEpicDetails(null)}
+          onRedecode={() => void redecodeEpic(selectedEpicDetails.id)}
           onRetry={() => void retryEpic(selectedEpicDetails.id)}
           onReview={() => void reviewEpic(selectedEpicDetails.id)}
           onPlayLoop={() => void playLoopEpic(selectedEpicDetails.id)}
+          onMergeToMain={() => void mergeEpicToMain(selectedEpicDetails.id)}
+          onMarkDone={() => void markEpicDone(selectedEpicDetails.id)}
           onCancel={() => void cancelEpic(selectedEpicDetails.id)}
+          onPause={() => void pauseEpic(selectedEpicDetails.id)}
+          onResume={() => void resumeEpic(selectedEpicDetails.id)}
           onDelete={() => void deleteEpic(selectedEpicDetails.id)}
           actionBusy={actionBusy !== null}
+          mergeStatus={selectedEpicMergeStatus}
+          mergeStatusLoading={selectedEpicMergeStatusLoading}
           epicEvents={data.agentEvents.filter((e) => e.payload?.epicId === selectedEpicDetails.id)}
           epicTickets={data.tickets.filter((t) => t.epicId === selectedEpicDetails.id)}
         />
       )}
+
+      <DirectChatModal
+        isOpen={isChatOpen}
+        onClose={() => setIsChatOpen(false)}
+        modelsConfig={modelsConfig}
+        defaultTargetDir={targetDir}
+      />
+
+      <GameModal isOpen={isTetrisOpen} onClose={() => setIsTetrisOpen(false)} game="tetris" />
+      <GameModal isOpen={isPacmanOpen} onClose={() => setIsPacmanOpen(false)} game="pacman" />
+      <GameModal isOpen={isTamagotchiOpen} onClose={() => setIsTamagotchiOpen(false)} game="tamagotchi" />
     </div>
   );
 }

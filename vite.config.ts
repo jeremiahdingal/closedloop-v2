@@ -7,6 +7,8 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    host: true,
+    allowedHosts: ["0b0b-82-129-110-116.ngrok-free.app"],
     proxy: {
       "/api": "http://127.0.0.1:4010",
       "/health": "http://127.0.0.1:4010"

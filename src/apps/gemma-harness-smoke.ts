@@ -115,8 +115,8 @@ async function main(): Promise<void> {
   };
 
   const harness = new MediatedAgentHarness({
-    baseURL: `${OLLAMA_BASE}/v1`,
-    apiKey: "ollama",
+    baseURL: OLLAMA_BASE,
+    apiKey: "",
     model: MODEL,
     braveApiKey: process.env.BRAVE_API_KEY,
     toolContext
@@ -260,23 +260,24 @@ async function runXmlCompatLoop(toolContext: ToolExecutionContext) {
 
   for (let iteration = 1; iteration <= 8; iteration += 1) {
     console.log(color(33, `[compat] iteration ${iteration}/8`));
-    const response = await fetch(`${OLLAMA_BASE}/v1/chat/completions`, {
+    const response = await fetch(`${OLLAMA_BASE}/api/chat`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: "Bearer ollama"
       },
       body: JSON.stringify({
         model: MODEL,
         messages,
         stream: false,
-        temperature: 1.0,
-        top_p: 0.95,
-        top_k: 64
+        options: {
+          temperature: 1.0,
+          top_p: 0.95,
+          top_k: 64,
+        }
       })
     });
-    const payload = await response.json() as any;
-    const content = String(payload?.choices?.[0]?.message?.content || "");
+    const payload = await response.json() as { message?: { content?: string } };
+    const content = String(payload?.message?.content || "");
     console.log(color(33, `[compat-text] ${content.slice(0, 300)}`));
     const call = extractXmlCall(content);
     if (!call) {

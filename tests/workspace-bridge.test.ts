@@ -102,7 +102,8 @@ test("workspace bridge cleans up archived workspaces after retention", async () 
 
     assert.equal(cleaned.length, 1);
     assert.equal(cleaned[0].id, workspace.id);
-    assert.equal(existsSync(workspace.worktreePath), false);
+    // Direct checkout mode: worktreePath === repoRoot, so directory persists.
+    // Verify ticket branch was deleted instead.
     const branchList = await git(root, ["branch", "--list", workspace.branchName]);
     assert.equal(branchList.stdout.trim(), "");
     assert.equal(services.db.getWorkspace(workspace.id)?.status, "cleaned");

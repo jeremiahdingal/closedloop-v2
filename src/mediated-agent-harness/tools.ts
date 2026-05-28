@@ -1,13 +1,42 @@
-import path from "node:path";
+﻿import path from "node:path";
 import { readFile, readdir, stat, writeFile, mkdir, unlink } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ToolDef, ToolExecutionContext, ToolCall, ToolResult } from "./types.ts";
 import { ToolExecutionError } from "./errors.ts";
 import { retrieveChunks } from "../rag/retriever.ts";
+import { fuzzyMatch } from "../utils.ts";
 import { chromium, type Browser, type Page, type BrowserContext } from "playwright";
 
 const execFileAsync = promisify(execFile);
+
+// Read-before-write tracking: maps run/workspace session key -> Set of normalized file paths read
+const filesReadBySession = new Map<string, Set<string>>();
+
+function normalizeTrackedPath(cwd: string, filePath: string): string {
+  const resolved = path.resolve(cwd, filePath);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function resolveReadTrackingKey(trackingKey: string | undefined, cwd: string): string {
+  return trackingKey && trackingKey.trim().length > 0 ? trackingKey : cwd;
+}
+
+export function trackFileRead(trackingKey: string | undefined, cwd: string, filePath: string): void {
+  const key = resolveReadTrackingKey(trackingKey, cwd);
+  let set = filesReadBySession.get(key);
+  if (!set) { set = new Set(); filesReadBySession.set(key, set); }
+  set.add(normalizeTrackedPath(cwd, filePath));
+}
+
+export function hasFileBeenRead(trackingKey: string | undefined, cwd: string, filePath: string): boolean {
+  const key = resolveReadTrackingKey(trackingKey, cwd);
+  return filesReadBySession.get(key)?.has(normalizeTrackedPath(cwd, filePath)) ?? false;
+}
+
+export function resetSessionTracking(trackingKey: string | undefined, cwd?: string): void {
+  filesReadBySession.delete(resolveReadTrackingKey(trackingKey, cwd ?? ""));
+}
 
 // Browser state management
 const browserState = new Map<string, { browser: Browser; context: BrowserContext; page: Page }>();
@@ -438,6 +467,32 @@ export const WORKSPACE_TOOLS: ToolDef[] = [
   {
     type: "function",
     function: {
+      name: "search_replace",
+      description: "Find and replace a block of text in an existing file. The 'search' string must match content in the file (fuzzy whitespace matching is applied). Prefer this over write_file for targeted edits to existing files.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "File path relative to workspace root"
+          },
+          search: {
+            type: "string",
+            description: "Exact text to find in the file"
+          },
+          replace: {
+            type: "string",
+            description: "Replacement text"
+          }
+        },
+        required: ["path", "search", "replace"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "git_diff",
       description: "Show the plain workspace diff (unstaged changes).",
       parameters: {
@@ -509,7 +564,7 @@ export const WORKSPACE_TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "read_context_packet",
-      description: "Read the context.json file from the workspace root. Contains ticket context and workspace metadata.",
+      description: "Read the orchestrator context packet for this workspace. The canonical location is .orchestrator/context.json, with context.json supported as a legacy fallback. Do not browse for this file manually.",
       parameters: {
         type: "object",
         properties: {},
@@ -704,6 +759,8 @@ export const TOOL_ALIASES: Record<string, string> = {
   diff: "git_diff",
   git: "run_command",
   edit: "write_file",
+  replace: "search_replace",
+  search_and_replace: "search_replace",
   create: "write_file",
   update: "write_file",
   delete: "remove_file",
@@ -770,6 +827,8 @@ export async function executeToolCall(
         return await execWriteFiles(call.id, args, ctx);
       case "remove_file":
         return await execRemoveFile(call.id, args, ctx);
+      case "search_replace":
+        return await execSearchReplace(call.id, args, ctx);
       case "git_diff":
         return await execGitDiff(call.id, ctx);
       case "git_diff_staged":
@@ -844,6 +903,12 @@ export async function executeToolCall(
 
 // ─── Individual tool implementations ────────────────────────────────────────
 
+// Track files already read by explore_mode to prevent re-reading
+const exploreModeReadFiles: Set<string> = new Set();
+
+export function resetExploreModeFiles(): void {
+  exploreModeReadFiles.clear();
+}
 async function execExploreMode(
   callId: string,
   args: Record<string, unknown>,
@@ -874,7 +939,7 @@ async function execExploreMode(
     return { callId, name: "explore_mode", output: "Error: calls array is required", isError: true };
   }
 
-  const allowedTools = new Set(["glob_files", "grep_files", "list_dir", "read_file", "read_files", "semantic_search", "git_status", "list_changed_files"]);
+  const allowedTools = new Set(["glob_files", "grep_files", "list_dir", "read_file", "read_files", "semantic_search", "git_status", "list_changed_files", "read_context_packet", "read_artifact", "web_search"]);
   const results: string[] = [];
 
   for (const [index, call] of calls.entries()) {
@@ -884,9 +949,24 @@ async function execExploreMode(
       continue;
     }
 
+    // Deduplication: skip files already read
+    const filePath = (call.args?.path as string) || (call.args?.pattern as string) || "";
+    if ((toolName === "read_file" || toolName === "read_files") && filePath && exploreModeReadFiles.has(filePath)) {
+      results.push(`--- [${index}] ${toolName}(${JSON.stringify(call.args)}) ---\n[SKIPPED] File already read in a previous iteration. Use the information you already have.`);
+      continue;
+    }
+
     try {
       const result = await executeToolCall({ id: `${callId}_${index}`, name: toolName, args: call.args }, ctx);
       results.push(`--- [${index}] ${toolName}(${JSON.stringify(call.args)}) ---\n${result.output}`);
+      // Track read files for dedup
+      if ((toolName === "read_file" || toolName === "read_files") && filePath) {
+        if (toolName === "read_files" && Array.isArray(call.args?.paths)) {
+          (call.args.paths as string[]).forEach((p: string) => exploreModeReadFiles.add(p));
+        } else {
+          exploreModeReadFiles.add(filePath);
+        }
+      }
     } catch (err) {
       results.push(`--- [${index}] ${toolName} ---\nError: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -957,7 +1037,7 @@ async function execGlobFiles(
     callId,
     name: "glob_files",
     output: limited.length > 0
-      ? limited.join("\n")
+      ? limited.map(p => p.replace(/\\/g, "/")).join("\n")
       : `No files matched the pattern "${pattern}".`,
     isError: false
   };
@@ -1097,6 +1177,25 @@ async function execListDir(
       output: lines.length > 0 ? lines.join("\n") : "(empty directory)"
     };
   } catch (err: any) {
+    // On ENOENT, try to list the parent so the model can course-correct instead of stalling
+    if (err.code === "ENOENT" && fullPath !== resolvedCwd) {
+      try {
+        const parentPath = path.dirname(fullPath);
+        if (parentPath.startsWith(resolvedCwd)) {
+          const parentEntries = await readdir(parentPath, { withFileTypes: true });
+          const parentLines = parentEntries
+            .filter(e => !e.name.startsWith("."))
+            .map(e => `${e.name}${e.isDirectory() ? "/" : ""}`)
+            .sort();
+          return {
+            callId,
+            name: "list_dir",
+            output: `Path not found: ${dirPath}\nDid you mean one of these?\n${parentLines.join("\n")}`,
+            isError: true
+          };
+        }
+      } catch { /* parent also not accessible */ }
+    }
     return {
       callId,
       name: "list_dir",
@@ -1132,6 +1231,8 @@ async function execReadFile(
   if (content === undefined) {
     return { callId, name: "read_file", output: `Error: file not found: ${filePath}`, isError: true };
   }
+
+  trackFileRead(ctx.readTrackingKey, ctx.cwd, filePath);
 
   // Truncate large files
   const maxLen = 50000;
@@ -1175,6 +1276,7 @@ async function execReadFiles(
     if (content === undefined) {
       parts.push(`--- ${fp} ---\n(Error: file not found)`);
     } else {
+      trackFileRead(ctx.readTrackingKey, ctx.cwd, fp);
       const maxLen = 30000;
       const output = content.length > maxLen
         ? content.slice(0, maxLen) + `\n... [truncated]`
@@ -1207,6 +1309,36 @@ async function execWriteFile(
       output: "Error: writes to .git/ and node_modules/ are forbidden",
       isError: true
     };
+  }
+
+  // Read-before-write guard: hard block if overwriting existing file that wasn't read
+  const targetPath = path.resolve(ctx.cwd, filePath);
+  try {
+    const st = await stat(targetPath);
+    if (st.isFile() && !hasFileBeenRead(ctx.readTrackingKey, ctx.cwd, filePath)) {
+      return {
+        callId,
+        name: "write_file",
+        output: `Error: You must read "${filePath}" before overwriting it. Use read_file first.`,
+        isError: true
+      };
+    }
+  } catch {
+    // File doesn't exist — new file, no guard needed
+  }
+
+  // Validate JSON files before writing
+  if (filePath.replace(/\\/g, "/").endsWith(".json")) {
+    try {
+      JSON.parse(content);
+    } catch (parseErr) {
+      return {
+        callId,
+        name: "write_file",
+        output: `Error: invalid JSON for ${filePath}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}. Fix syntax (check trailing commas, double commas, missing quotes) and retry.`,
+        isError: true
+      };
+    }
   }
 
   await ctx.writeFiles([{ path: filePath, content }]);
@@ -1258,6 +1390,40 @@ async function execWriteFiles(
         output: `Error: writes to .git/ and node_modules/ are forbidden (got: ${f.path})`,
         isError: true
       };
+    }
+  }
+
+  // Read-before-write guard: check each existing file was read
+  for (const f of files) {
+    const targetPath = path.resolve(ctx.cwd, f.path);
+    try {
+      const st = await stat(targetPath);
+      if (st.isFile() && !hasFileBeenRead(ctx.readTrackingKey, ctx.cwd, f.path)) {
+        return {
+          callId,
+          name: "write_files",
+          output: `Error: You must read "${f.path}" before overwriting it. Use read_file first.`,
+          isError: true
+        };
+      }
+    } catch {
+      // File doesn't exist — new file, no guard needed
+    }
+  }
+
+  // Validate JSON files before writing
+  for (const f of files) {
+    if (f.path.replace(/\\/g, "/").endsWith(".json")) {
+      try {
+        JSON.parse(f.content);
+      } catch (parseErr) {
+        return {
+          callId,
+          name: "write_files",
+          output: `Error: invalid JSON for ${f.path}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}. Fix syntax and retry.`,
+          isError: true
+        };
+      }
     }
   }
 
@@ -1320,6 +1486,119 @@ async function execRemoveFile(
       isError: true
     };
   }
+}
+
+async function execSearchReplace(
+  callId: string,
+  args: Record<string, unknown>,
+  ctx: ToolExecutionContext
+): Promise<ToolResult> {
+  const filePath = String(args.path ?? "");
+  const search = String(args.search ?? "");
+  const replace = String(args.replace ?? "");
+
+  if (!filePath || !search) {
+    return { callId, name: "search_replace", output: "Error: path and search are required", isError: true };
+  }
+
+  // Read-before-replace guard: model must read the file first to have exact content
+  if (!hasFileBeenRead(ctx.readTrackingKey, ctx.cwd, filePath)) {
+    return {
+      callId,
+      name: "search_replace",
+      output: `Error: You must read_file("${filePath}") before using search_replace on it. Read the file first, then use the exact content from the read result as your search block.`,
+      isError: true
+    };
+  }
+
+  const normalized = filePath.replace(/\\/g, "/");
+  if (normalized.startsWith(".git/") || normalized.includes("/.git/") ||
+      normalized.startsWith("node_modules/") || normalized.includes("/node_modules/")) {
+    return { callId, name: "search_replace", output: "Error: writes to .git/ and node_modules/ are forbidden", isError: true };
+  }
+
+  const cwdResolved = path.resolve(ctx.cwd);
+  const targetPath = path.resolve(ctx.cwd, filePath);
+  if (targetPath !== cwdResolved && !targetPath.startsWith(`${cwdResolved}${path.sep}`)) {
+    return { callId, name: "search_replace", output: "Error: path is outside workspace", isError: true };
+  }
+
+  // Identity check
+  if (search === replace) {
+    return { callId, name: "search_replace", output: `Skipped identity transform for ${filePath} (search === replace)` };
+  }
+
+  // Read existing content
+  let content: string;
+  try {
+    content = await readFile(targetPath, "utf8");
+  } catch (err: any) {
+    if (err?.code === "ENOENT") {
+      return { callId, name: "search_replace", output: `Error: file not found: ${filePath}`, isError: true };
+    }
+    return { callId, name: "search_replace", output: `Error reading file: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+
+  // Exact match
+  let index = content.indexOf(search);
+  let usedFuzzy = false;
+
+  // Fuzzy whitespace fallback
+  if (index === -1) {
+    const fuzzyResult = fuzzyMatch(content, search);
+    if (fuzzyResult) {
+      index = fuzzyResult.index;
+      usedFuzzy = true;
+    }
+  }
+
+  if (index === -1) {
+    return {
+      callId,
+      name: "search_replace",
+      output: `Error: search block not found in ${filePath}. First 200 chars of search: ${search.slice(0, 200)}. First 200 chars of file: ${content.slice(0, 200)}`,
+      isError: true
+    };
+  }
+
+  const newContent = content.slice(0, index) + replace + content.slice(index + search.length);
+  await mkdir(path.dirname(targetPath), { recursive: true });
+
+  // Validate JSON files — auto-repair common issues, reject if still broken
+  let finalContent = newContent;
+  if (normalized.endsWith(".json")) {
+    try {
+      JSON.parse(newContent);
+    } catch (firstErr) {
+      // Try auto-repair: double commas, trailing commas before } or ]
+      let repaired = newContent
+        .replace(/,\s*([}\]])/g, "$1")   // trailing comma before } or ]
+        .replace(/,+\s*,/g, ",")          // double/triple commas → single
+        .replace(/,\s*,/g, ",");          // comma-whitespace-comma
+      try {
+        JSON.parse(repaired);
+        finalContent = repaired;
+        console.log(`[search_replace] Auto-repaired JSON in ${filePath}`);
+      } catch (repairErr) {
+        const errMsg = repairErr instanceof Error ? repairErr.message : String(repairErr);
+        return {
+          callId,
+          name: "search_replace",
+          output: `Error: search_replace would produce invalid JSON in ${filePath}. NOT written. Parse error: ${errMsg}. Use write_file with the complete valid JSON instead.`,
+          isError: true
+        };
+      }
+    }
+  }
+
+  await writeFile(targetPath, finalContent, "utf8");
+
+  const repaired = finalContent !== newContent ? " (JSON auto-repaired)" : "";
+  return {
+    callId,
+    name: "search_replace",
+    output: `Applied search_replace to ${filePath}${usedFuzzy ? " (fuzzy whitespace match)" : ""}${repaired} (${search.length} chars replaced with ${replace.length} chars)`
+  };
 }
 
 async function execGitDiff(
@@ -1398,6 +1677,16 @@ async function execRunCommand(
     return { callId, name: "run_command", output: "Error: name is required", isError: true };
   }
 
+  const availableCommands = ctx.getAvailableCommands?.() ?? ctx.availableCommands ?? [];
+  if (availableCommands.length > 0 && !availableCommands.includes(name)) {
+    return {
+      callId,
+      name: "run_command",
+      output: `Error: command '${name}' is not available in this workspace. Available commands: ${availableCommands.join(", ")}`,
+      isError: true
+    };
+  }
+
   const result = await ctx.runNamedCommand(name);
   const output = [
     result.stdout.trim(),
@@ -1417,14 +1706,25 @@ async function execReadContextPacket(
   callId: string,
   ctx: ToolExecutionContext
 ): Promise<ToolResult> {
-  const contextPath = path.join(ctx.cwd, "context.json");
+  const contextPaths = [
+    path.join(ctx.cwd, ".orchestrator", "context.json"),
+    path.join(ctx.cwd, "context.json"),
+  ];
   try {
-    const content = await readFile(contextPath, "utf-8");
-    return { callId, name: "read_context_packet", output: content };
-  } catch (err: any) {
-    if (err.code === "ENOENT") {
-      return { callId, name: "read_context_packet", output: "(no context.json found)" };
+    for (const contextPath of contextPaths) {
+      try {
+        const content = await readFile(contextPath, "utf-8");
+        return { callId, name: "read_context_packet", output: content };
+      } catch (err: any) {
+        if (err.code !== "ENOENT") throw err;
+      }
     }
+    return {
+      callId,
+      name: "read_context_packet",
+      output: "(no orchestrator context packet found; continue with the prompt, compacted history, git_diff/git_status, and targeted file reads)",
+    };
+  } catch (err: any) {
     return { callId, name: "read_context_packet", output: `Error: ${err.message}`, isError: true };
   }
 }
@@ -1633,10 +1933,23 @@ export function getCompactToolContract(toolNames: string[]): string {
   return lines.join("\n");
 }
 
-export function getAvailableToolsList(role: string): string[] {
-  const common = ["explore_mode", "read_file", "read_files", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
+export function getAvailableToolsList(role: string, options?: { availableCommands?: string[] }): string[] {
+  const availableCommands = new Set(options?.availableCommands ?? []);
+  const common = ["explore_mode", "read_file", "read_files", "read_context_packet", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
   if (role === "builder") {
     return [...common, "write_file", "write_files", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files"];
+  }
+  if (role === "explorer") {
+    return availableCommands.has("install")
+      ? [...common, "run_command"]
+      : ["explore_mode", "read_file", "read_files", "read_context_packet", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
+  }
+  if (role === "coder") {
+    const writeTools = ["write_file", "write_files", "search_replace"];
+    const gitTools = ["git_diff", "git_diff_staged", "git_status", "list_changed_files"];
+    return availableCommands.has("install")
+      ? [...common, ...writeTools, ...gitTools, "run_command"]
+      : [...common, ...writeTools, ...gitTools];
   }
   if (role === "reviewer") {
     return ["read_file", "list_dir", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files", "finish"];
@@ -1645,7 +1958,10 @@ export function getAvailableToolsList(role: string): string[] {
     return ["read_file", "glob_files", "grep_files", "list_dir", "semantic_search", "web_search", "finish"];
   }
   if (role === "epic-reviewer" || role === "epicReviewer") {
-    return ["read_file", "list_dir", "write_file", "write_files", "remove_file", "run_command", "git_diff", "git_diff_staged", "git_status", "list_changed_files", "finish"];
+    return ["read_file", "read_files", "list_dir", "write_file", "write_files", "search_replace", "remove_file", "glob_files", "grep_files", "run_command", "git_diff", "git_diff_staged", "git_status", "list_changed_files", "finish"];
+  }
+  if (role === "tester") {
+    return [...common, "run_command", "git_diff", "git_status"];
   }
   return common;
 }
@@ -1653,13 +1969,17 @@ export function getAvailableToolsList(role: string): string[] {
 // ─── Simple glob matching fallback ──────────────────────────────────────────
 
 function matchGlob(filePath: string, pattern: string): boolean {
+  // Normalize to forward slashes for cross-platform matching (Windows uses backslashes)
+  const normalized = filePath.replace(/\\/g, "/");
+  const normalizedPattern = pattern.replace(/\\/g, "/");
+
   // Convert simple glob to regex
-  const regex = pattern
+  const regex = normalizedPattern
     .replace(/\./g, "\\.")
     .replace(/\*\*/g, "<<GLOBSTAR>>")
     .replace(/\*/g, "[^/]*")
     .replace(/<<GLOBSTAR>>/g, ".*")
     .replace(/\?/g, "[^/]");
 
-  return new RegExp(`^${regex}$`).test(filePath);
+  return new RegExp(`^${regex}$`).test(normalized);
 }

@@ -8,11 +8,13 @@ export type Json =
 
 export type RunStatus = "queued" | "running" | "waiting" | "succeeded" | "failed" | "escalated" | "cancelled";
 export type TicketStatus = "queued" | "building" | "reviewing" | "testing" | "approved" | "escalated" | "failed" | "cancelled";
-export type EpicStatus = "planning" | "executing" | "reviewing" | "done" | "failed" | "cancelled";
+export type EpicStatus = "planning" | "executing" | "reviewing" | "done" | "failed" | "cancelled" | "paused";
 
 export type AgentRole =
   | "epicDecoder"
   | "builder"
+  | "explorer"
+  | "coder"
   | "reviewer"
   | "tester"
   | "epicReviewer"
@@ -28,6 +30,9 @@ export type EpicRecord = {
   targetDir: string;
   targetBranch: string | null;
   status: EpicStatus;
+  pausedFromStatus: EpicStatus | null;
+  scheduledDate: string | null;
+  assetPaths: string[];
   createdAt: string;
   updatedAt: string;
 };
@@ -55,7 +60,7 @@ export type TicketRecord = {
 
 export type RunRecord = {
   id: string;
-  kind: "epic" | "ticket";
+  kind: "epic" | "ticket" | "epic_review" | "epic_play_loop";
   epicId: string | null;
   ticketId: string | null;
   status: RunStatus;
@@ -77,10 +82,31 @@ export type WorkspaceRecord = {
   branchName: string;
   baseCommit: string;
   headCommit: string | null;
+  savedBranch: string | null;
   status: "active" | "archived" | "cleaned";
   leaseOwner: string | null;
   createdAt: string;
   updatedAt: string;
+};
+
+export type DirectChatSessionRecord = {
+  id: string;
+  title: string;
+  targetDir: string;
+  branchName: string;
+  model: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type DirectChatMessageRecord = {
+  id: number;
+  sessionId: string;
+  role: "user" | "assistant" | "system" | "tool";
+  content: string;
+  toolCallsJson: string | null;
+  toolResultsJson: string | null;
+  createdAt: string;
 };
 
 export type BuilderOperation =
@@ -106,13 +132,15 @@ export type GoalTicketPlan = {
   description: string;
   acceptanceCriteria: string[];
   dependencies: string[];
-  allowedPaths: string[];
+  allowedPaths?: string[];
   priority: "high" | "medium" | "low";
+  testSpecs?: string[];
 };
 
 export type GoalDecomposition = {
   summary: string;
   tickets: GoalTicketPlan[];
+  clarificationQuestions?: string[];
 };
 
 export type GoalReview = {
@@ -122,7 +150,7 @@ export type GoalReview = {
 };
 
 export type FailureDecision = {
-  decision: "retry_same_node" | "retry_builder" | "blocked" | "todo" | "escalate";
+  decision: "retry_same_node" | "retry_builder" | "blocked" | "todo" | "escalate" | "approve" | "review_existing";
   reason: string;
 };
 
@@ -186,8 +214,8 @@ export type WriteFileInput = {
 
 export type AgentStreamPayload = {
   agentRole: AgentRole;
-  source: "opencode" | "orchestrator" | "mediated-harness";
-  streamKind: "stdout" | "stderr" | "thinking" | "assistant" | "system" | "status" | "raw" | "tool_call" | "plan_cleared";
+  source: "opencode" | "orchestrator" | "mediated-harness" | "zai";
+  streamKind: "stdout" | "stderr" | "thinking" | "assistant" | "system" | "status" | "raw" | "tool_call" | "tool_result" | "tool_error" | "error" | "plan_cleared" | "streaming_text" | "streaming_thinking" | "duplicate_recovery";
   content: string;
   runId?: string | null;
   ticketId?: string | null;
@@ -222,4 +250,90 @@ export type TesterResult = {
   testResults: "PASS" | "FAIL" | "SKIPPED";
   testOutput: string;
   testsRun: number;
+  failedTests?: Array<{ name: string; error: string }>;
+};
+
+export type EpicReviewDisposition =
+  | "approved_complete"
+  | "partial_ready"
+  | "not_reviewable";
+
+export type TicketEpicReviewPacket = {
+  ticketId: string;
+  title: string;
+  description: string;
+  acceptanceCriteria: string[];
+  allowedPaths: string[];
+  dependencies: string[];
+  ticketStatus: string;
+  currentRunId: string | null;
+  builderSummary: string | null;
+  intendedFiles: string[];
+  lastDiff: string | null;
+  diffPresent: boolean;
+  review: {
+    verdict: boolean;
+    blockers: string[];
+    suggestions: string[];
+  } | null;
+  failure: {
+    stage: string;
+    reason: string;
+  } | null;
+  epicReviewReadiness: "ready" | "blocked";
+  epicReviewDisposition: EpicReviewDisposition;
+};
+
+export type EditOperation =
+  | { kind: "search_replace"; path: string; expected_sha256: string; search: string; replace: string }
+  | { kind: "create_file"; path: string; content: string }
+  | { kind: "append_file"; path: string; content: string }
+  | { kind: "delete_file"; path: string; expected_sha256: string; reason: string }
+  | { kind: "rename_file"; path: string; newPath: string; expected_sha256: string; reason: string };
+
+export type CanonicalEditPacket = {
+  ticketId: string;
+  goalText: string;
+  acceptanceCriteria: string[];
+  allowedPaths: string[];
+  files: Array<{
+    path: string;
+    exists: boolean;
+    sha256: string | null;
+    content: string | null; // null if too large, then excerpts used
+    excerpts?: Array<{ content: string; startLine: number; endLine: number }>;
+  }>;
+  destructivePermissions: {
+    allowFileDeletion: boolean;
+    allowFileRename: boolean;
+    allowLargeDeletion: boolean;
+    allowFullReplace: boolean;
+  };
+  allowedDeletePaths: string[];
+  allowedRenamePaths: string[];
+  allowedFullReplacePaths: string[];
+};
+
+export type ExplorerOutput = {
+  relevantFiles: string[];
+  relevantSymbols: string[];
+  likelyEditRegions: Array<{ path: string; region: string }>;
+  summary: string;
+  risks: string[];
+  missingContext: string[];
+  recommendedFilesForCoding: string[];
+  blockers?: string[];
+};
+
+export type CoderOutput = {
+  summary: string;
+  intendedFiles: string[];
+  unresolvedBlockers: string[];
+  operations: EditOperation[];
+};
+
+export type CoderRunResult = {
+  text: string;
+  toolCalls: Array<{ name: string; args: Record<string, unknown> }>;
+  iterations: number;
 };

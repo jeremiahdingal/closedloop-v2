@@ -9,7 +9,7 @@ import type { AgentStreamPayload } from "../types.ts";
 export class RecoveryService {
   readonly config = loadConfig();
   private readonly db: AppDatabase;
-  private readonly ticketRunner: TicketRunner;
+  readonly ticketRunner: TicketRunner;
   private readonly goalRunner: GoalRunner;
 
   constructor(db: AppDatabase, ticketRunner: TicketRunner, goalRunner: GoalRunner) {
@@ -45,8 +45,31 @@ export class RecoveryService {
 
   healQueueState(): { recovered: number; failedDuplicates: number } {
     const jobs = this.db.listJobRecords();
-    const groups = new Map<string, Array<{ id: string; kind: string; status: string; payload: any }>>();
+    const staleThreshold = Date.now() - this.config.staleRunAfterMs;
+    const staleCoderThreshold = Date.now() - this.config.staleCoderRunAfterMs;
+
+    // First pass: requeue zombie running jobs (no heartbeat for a long time)
+    let recovered = 0;
+    let failedDuplicates = 0;
     for (const job of jobs) {
+      if (job.status !== "running") continue;
+      const payload = (job.payload ?? {}) as Record<string, unknown>;
+      const runId = String(payload.runId ?? "");
+      if (!runId) continue;
+      const run = this.db.getRun(runId);
+      if (!run) continue;
+      const heartbeat = run.heartbeatAt ? new Date(run.heartbeatAt).getTime() : 0;
+      const threshold = (run.currentNode ?? "").toLowerCase() === "coder" ? staleCoderThreshold : staleThreshold;
+      if (heartbeat > 0 && heartbeat < threshold) {
+        this.db.failJob(job.id, `Recovered zombie running job for stalled run ${runId}.`, true);
+        recovered += 1;
+      }
+    }
+
+    // Second pass: deduplicate active jobs per run
+    const groups = new Map<string, Array<{ id: string; kind: string; status: string; payload: any }>>();
+    const freshJobs = this.db.listJobRecords();
+    for (const job of freshJobs) {
       const payload = (job.payload ?? {}) as Record<string, unknown>;
       const runId = String(payload.runId ?? "");
       if (!runId) continue;
@@ -55,9 +78,6 @@ export class RecoveryService {
       bucket.push({ id: job.id, kind: job.kind, status: job.status, payload });
       groups.set(key, bucket);
     }
-
-    let recovered = 0;
-    let failedDuplicates = 0;
 
     for (const bucket of groups.values()) {
       const runId = String(bucket[0].payload.runId);
@@ -220,10 +240,25 @@ export class RecoveryService {
     staleAfterMs = this.config.staleRunAfterMs,
     maxRecoveries = this.config.staleRunMaxRecoveries
   ): Promise<string[]> {
-    const threshold = Date.now() - staleAfterMs;
     const staleRunIds: string[] = [];
     for (const run of this.db.listRuns("running")) {
       if (run.epicId && (run.currentNode === "goal_review" || run.currentNode === "manual_goal_review")) {
+        const heartbeat = run.heartbeatAt ? new Date(run.heartbeatAt).getTime() : 0;
+        const epicReviewTimeout = Number(process.env.EPIC_REVIEW_TIMEOUT_MS || 300_000);
+        const threshold = Date.now() - epicReviewTimeout;
+        if (heartbeat < threshold) {
+          console.log(`[RECOVERY] Epic review run ${run.id} stalled (no heartbeat for ${Math.round((Date.now() - heartbeat) / 1000)}s). Re-enqueueing.`);
+          this.db.updateRun({ runId: run.id, status: "failed", currentNode: "error", heartbeatAt: nowIso(), lastMessage: "Epic review stalled, timed out.", errorText: "Epic review timed out" });
+          for (const job of this.db.listJobRecords()) {
+            if (job.kind === "run_epic_review" && (job.status === "queued" || job.status === "running")) {
+              const payload = job.payload as Record<string, unknown>;
+              if (payload?.runId === run.id || payload?.epicId === run.epicId) {
+                this.db.failJob(job.id, "Stale epic review run recovered.", true);
+              }
+            }
+          }
+          this.db.enqueueJob("run_epic_review", { epicId: run.epicId, runId: run.id });
+        }
         continue;
       }
       if (run.epicId && run.currentNode === "execute_tickets") {
@@ -231,6 +266,12 @@ export class RecoveryService {
         const allDone = tickets.every(t => t.status === "approved" || t.status === "failed" || t.status === "escalated");
         if (allDone) continue;
       }
+
+      // Determine timeout based on node
+      const node = (run.currentNode ?? "").toLowerCase();
+      const effectiveStaleAfterMs = node === "coder" ? this.config.staleCoderRunAfterMs : staleAfterMs;
+      const threshold = Date.now() - effectiveStaleAfterMs;
+
       const heartbeat = run.heartbeatAt ? new Date(run.heartbeatAt).getTime() : 0;
       if (heartbeat < threshold) {
         staleRunIds.push(run.id);
@@ -252,9 +293,12 @@ export class RecoveryService {
             || lower.includes("network");
         });
 
+        const isReviewerStall = node.includes("reviewer");
         const repeatedBlockers = streamTexts.some((text) => text.toLowerCase().includes("blocker"));
         const repeatedTestFailure = streamTexts.some((text) => text.toLowerCase().includes("tests failed"));
-        const doctor = deterministicDoctor({ repeatedBlockers, repeatedTestFailure, noDiff, infraFailure, isStall: true });
+        const doctor = isReviewerStall
+          ? { decision: "retry_same_node" as const, reason: "Reviewer stalled; restarting reviewer on existing diff." }
+          : deterministicDoctor({ repeatedBlockers, repeatedTestFailure, noDiff, infraFailure, isStall: true });
 
         const ticketLabel = run.ticketId ? `ticket ${run.ticketId}` : `run ${run.id}`;
         if (run.attempt >= maxRecoveries || doctor.decision === "escalate" || doctor.decision === "blocked") {
@@ -328,7 +372,11 @@ export class RecoveryService {
               lastMessage: requeueMessage
             });
           }
-          this.db.enqueueJob("run_ticket", { ticketId: run.ticketId, epicId: run.epicId, runId: run.id });
+          if (isReviewerStall) {
+            this.db.enqueueJob("run_ticket", { ticketId: run.ticketId, epicId: run.epicId, runId: run.id, recovery: true, recoveryNode: "reviewer" });
+          } else {
+            this.db.enqueueJob("run_ticket", { ticketId: run.ticketId, epicId: run.epicId, runId: run.id, recovery: true });
+          }
         } else if (run.epicId) {
           this.db.enqueueJob("run_epic", { epicId: run.epicId, runId: run.id });
         }
@@ -351,7 +399,45 @@ export class RecoveryService {
     if (job.kind === "run_ticket") {
       const run = this.db.getRun(String(job.payload.runId));
       if (!run || run.status !== "queued") return;
+
+      // Gate: check that all dependency tickets are approved before starting
+      const ticket = run.ticketId ? this.db.getTicket(run.ticketId) : null;
+      if (ticket && ticket.dependencies?.length) {
+        const unmet = ticket.dependencies.filter(depId => {
+          const dep = this.db.getTicket(depId);
+          return !dep || dep.status !== "approved";
+        });
+        if (unmet.length) {
+          // Re-queue instead of running — dependencies not yet met
+          this.db.failJob(job.id, `Waiting for dependencies: ${unmet.join(", ")}`, false);
+          this.db.enqueueJob("run_ticket", { ticketId: ticket.id, epicId: ticket.epicId, runId: run.id });
+          return;
+        }
+      }
+
       await this.ticketRunner.runExisting(run.id);
+
+      // Check if all tickets in the epic are now approved — trigger epic review
+      if (ticket?.epicId) {
+        const epicTickets = this.db.listTickets(ticket.epicId);
+        const allTerminal = epicTickets.every(t =>
+          t.status === "approved" || t.status === "failed" || t.status === "escalated"
+        );
+        const anyApproved = epicTickets.some(t => t.status === "approved");
+        if (allTerminal && anyApproved) {
+          const epic = this.db.getEpic(ticket.epicId);
+          const hasPendingReview = this.db.listJobRecords().some(j =>
+            j.kind === "run_epic_review" && (j.status === "queued" || j.status === "running")
+            && (j.payload as any)?.epicId === ticket.epicId
+          );
+          if (epic && epic.status !== "approved" && epic.status !== "reviewing" && !hasPendingReview) {
+            console.log(`[RECOVERY] All tickets terminal for epic ${ticket.epicId}. Triggering epic review.`);
+            this.goalRunner.enqueueManualReview(ticket.epicId).catch(err => {
+              console.warn(`[RECOVERY] Failed to enqueue epic review: ${err}`);
+            });
+          }
+        }
+      }
       return;
     }
     if (job.kind === "run_epic") {
@@ -368,7 +454,7 @@ export class RecoveryService {
     }
     if (job.kind === "run_epic_play_loop") {
       const run = this.db.getRun(String(job.payload.runId));
-      if (!run || run.status !== "queued") return;
+      if (!run || run.status === "failed" || run.status === "succeeded" || run.status === "cancelled") return;
       await this.goalRunner.runManualPlayLoopExisting(run.id);
       return;
     }

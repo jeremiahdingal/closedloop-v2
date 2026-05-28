@@ -10,6 +10,7 @@ function createMockContext(cwd: string): ToolExecutionContext {
   return {
     cwd,
     workspaceId: "test-ws",
+    readTrackingKey: "test-run",
     allowedPaths: ["*"],
     readFiles: async (paths: string[]) => {
       const result: Record<string, string> = {};
@@ -58,12 +59,12 @@ function createMockContext(cwd: string): ToolExecutionContext {
 
 // ─── Tool definitions ───────────────────────────────────────────────────────
 
-test("WORKSPACE_TOOLS has 17 tools including finish and web_search", () => {
-  assert.equal(WORKSPACE_TOOLS.length, 17);
+test("WORKSPACE_TOOLS includes core workspace and resume tools", () => {
   const names = WORKSPACE_TOOLS.map(t => t.function.name);
   assert.ok(names.includes("finish"));
   assert.ok(names.includes("glob_files"));
   assert.ok(names.includes("list_dir"));
+  assert.ok(names.includes("read_context_packet"));
   assert.ok(names.includes("read_artifact"));
   assert.ok(names.includes("git_diff"));
   assert.ok(names.includes("git_diff_staged"));
@@ -274,12 +275,29 @@ test("run_command executes whitelisted command", async () => {
   await rm(tmpDir, { recursive: true, force: true });
 });
 
-test("read_context_packet reads context.json", async () => {
+test("run_command rejects command names outside workspace availability", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-test-"));
+  const ctx = createMockContext(tmpDir);
+
+  const result = await executeToolCall(
+    { id: "call_1", name: "run_command", args: { name: "install" } },
+    ctx
+  );
+
+  assert.equal(result.isError, true);
+  assert.ok(result.output.includes("not available"));
+
+  await rm(tmpDir, { recursive: true, force: true });
+});
+
+test("read_context_packet reads .orchestrator/context.json", async () => {
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-test-"));
   const ctx = createMockContext(tmpDir);
 
   try {
-    await writeFile(path.join(tmpDir, "context.json"), '{"ticket":"T-123"}', "utf-8");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(path.join(tmpDir, ".orchestrator"), { recursive: true });
+    await writeFile(path.join(tmpDir, ".orchestrator", "context.json"), '{"ticket":"T-123"}', "utf-8");
 
     const result = await executeToolCall(
       { id: "call_1", name: "read_context_packet", args: {} },
@@ -288,6 +306,78 @@ test("read_context_packet reads context.json", async () => {
 
     assert.equal(result.isError, undefined);
     assert.ok(result.output.includes("T-123"));
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("search_replace allows edits after an earlier read in the same tracking session", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-test-"));
+  const firstCtx = createMockContext(tmpDir);
+  const secondCtx = { ...createMockContext(tmpDir) };
+
+  try {
+    await writeFile(path.join(tmpDir, "note.txt"), "before text", "utf-8");
+
+    const readResult = await executeToolCall(
+      { id: "call_1", name: "read_file", args: { path: "note.txt" } },
+      firstCtx
+    );
+    assert.equal(readResult.isError, undefined);
+
+    const replaceResult = await executeToolCall(
+      { id: "call_2", name: "search_replace", args: { path: "note.txt", search: "before", replace: "after" } },
+      secondCtx
+    );
+
+    assert.equal(replaceResult.isError, undefined);
+    const content = await readFile(path.join(tmpDir, "note.txt"), "utf-8");
+    assert.equal(content, "after text");
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("search_replace matches previously read files even when path spelling changes", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-test-"));
+  const ctx = createMockContext(tmpDir);
+
+  try {
+    await writeFile(path.join(tmpDir, "nested.txt"), "alpha beta", "utf-8");
+
+    const readResult = await executeToolCall(
+      { id: "call_1", name: "read_file", args: { path: "./nested.txt" } },
+      ctx
+    );
+    assert.equal(readResult.isError, undefined);
+
+    const replaceResult = await executeToolCall(
+      { id: "call_2", name: "search_replace", args: { path: "nested.txt", search: "alpha", replace: "omega" } },
+      ctx
+    );
+
+    assert.equal(replaceResult.isError, undefined);
+    const content = await readFile(path.join(tmpDir, "nested.txt"), "utf-8");
+    assert.equal(content, "omega beta");
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("read_context_packet supports legacy root context.json fallback", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-test-"));
+  const ctx = createMockContext(tmpDir);
+
+  try {
+    await writeFile(path.join(tmpDir, "context.json"), '{"ticket":"T-legacy"}', "utf-8");
+
+    const result = await executeToolCall(
+      { id: "call_1", name: "read_context_packet", args: {} },
+      ctx
+    );
+
+    assert.equal(result.isError, undefined);
+    assert.ok(result.output.includes("T-legacy"));
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
   }
@@ -303,7 +393,7 @@ test("read_context_packet returns message when not found", async () => {
   );
 
   assert.equal(result.isError, undefined);
-  assert.ok(result.output.includes("no context.json"));
+  assert.ok(result.output.includes("no orchestrator context packet"));
 
   await rm(tmpDir, { recursive: true, force: true });
 });

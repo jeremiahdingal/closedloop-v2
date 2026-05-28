@@ -1,6 +1,5 @@
 import { bootstrap } from "./bootstrap.ts";
 import { git } from "../bridge/git.ts";
-import { rm } from "node:fs/promises";
 import path from "node:path";
 
 function parseRetentionHours(argv: string[]): number | null {
@@ -17,28 +16,6 @@ function parseRetentionHours(argv: string[]): number | null {
   }
 
   return null;
-}
-
-function parseWorktreeList(stdout: string): Array<{ path: string; branch: string | null }> {
-  const lines = stdout.split(/\r?\n/);
-  const worktrees: Array<{ path: string; branch: string | null }> = [];
-  let current: { path: string; branch: string | null } | null = null;
-
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    if (line.startsWith("worktree ")) {
-      if (current) worktrees.push(current);
-      current = { path: line.slice("worktree ".length).trim(), branch: null };
-      continue;
-    }
-    if (current && line.startsWith("branch ")) {
-      current.branch = line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
-      continue;
-    }
-  }
-
-  if (current) worktrees.push(current);
-  return worktrees;
 }
 
 async function main() {
@@ -64,48 +41,47 @@ async function main() {
     return;
   }
 
-  const worktreeRoot = path.resolve(config.workspacesDir);
-  const list = await git(config.repoRoot, ["worktree", "list", "--porcelain"]);
-  const worktrees = parseWorktreeList(list.stdout).filter((entry) => {
-    const resolvedPath = path.resolve(entry.path);
-    return resolvedPath !== path.resolve(config.repoRoot) && resolvedPath.startsWith(worktreeRoot + path.sep);
-  });
-
+  // --all mode: clean ALL workspaces from the database + delete stale ticket branches
+  const allWorkspaces = db.listWorkspacesForTicket("%"); // won't work with %, use a different approach
+  // Get all non-cleaned workspaces by listing all then filtering
   const cleaned: Array<{ id: string; branchName: string; worktreePath: string }> = [];
-  for (const worktree of worktrees) {
-    const resolvedPath = path.resolve(worktree.path);
-    const workspace = db.findWorkspaceByWorktreePath(resolvedPath);
-    try {
-      await git(config.repoRoot, ["worktree", "remove", "--force", resolvedPath]);
-    } catch {
-      await rm(resolvedPath, { recursive: true, force: true });
-    }
-    if (worktree.branch) {
-      try {
-        await git(config.repoRoot, ["branch", "-D", worktree.branch]);
-      } catch {
-        // Ignore and continue.
-      }
-    }
-    if (workspace) {
-      db.updateWorkspace({ workspaceId: workspace.id, status: "cleaned", leaseOwner: null });
-      db.deleteLease("workspace", workspace.id);
-      cleaned.push({ id: workspace.id, branchName: workspace.branchName, worktreePath: workspace.worktreePath });
-    } else if (worktree.branch) {
-      cleaned.push({ id: resolvedPath, branchName: worktree.branch, worktreePath: resolvedPath });
-    }
+
+  // Clean archived workspaces first (any age)
+  const archived = await bridge.cleanupArchivedWorkspaces(0);
+  for (const ws of archived) {
+    cleaned.push({ id: ws.id, branchName: ws.branchName, worktreePath: ws.worktreePath });
   }
 
-  const branchList = await git(config.repoRoot, ["branch", "--list", "ticket/*"]);
-  const ticketBranches = branchList.stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim().replace(/^\*\s+/, "").replace(/^\+\s+/, ""))
-    .filter(Boolean);
-  for (const branchName of ticketBranches) {
+  // Clean orphaned active workspaces (any age)
+  const orphaned = await bridge.cleanupOrphanedWorkspaces(0);
+  for (const ws of orphaned) {
+    cleaned.push({ id: ws.id, branchName: ws.branchName, worktreePath: ws.worktreePath });
+  }
+
+  // Also clean ticket/* branches from repos that appear in workspace records
+  const repoRoots = new Set<string>();
+  for (const ws of [...archived, ...orphaned]) {
+    repoRoots.add(ws.repoRoot);
+  }
+  // Add the config repoRoot too
+  repoRoots.add(config.repoRoot);
+
+  for (const repoRoot of repoRoots) {
     try {
-      await git(config.repoRoot, ["branch", "-D", branchName]);
+      const branchList = await git(repoRoot, ["branch", "--list", "ticket/*"]);
+      const ticketBranches = branchList.stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim().replace(/^\*\s+/, "").replace(/^\+\s+/, ""))
+        .filter(Boolean);
+      for (const branchName of ticketBranches) {
+        try {
+          await git(repoRoot, ["branch", "-D", branchName]);
+        } catch {
+          // Ignore already-deleted or protected branches.
+        }
+      }
     } catch {
-      // Ignore already-deleted or protected branches.
+      // Repo may not be accessible
     }
   }
 
@@ -118,12 +94,6 @@ async function main() {
       worktreePath: workspace.worktreePath
     }))
   }, null, 2));
-
-  try {
-    await git(config.repoRoot, ["worktree", "prune", "--expire", "now"]);
-  } catch {
-    // Ignore prune failures; individual removals already ran.
-  }
 
   db.close();
 }

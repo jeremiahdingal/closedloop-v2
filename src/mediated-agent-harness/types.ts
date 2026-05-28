@@ -69,17 +69,22 @@ export interface StreamState {
 
 export interface MediatedHarnessConfig {
   baseURL?: string;
+  /** API key for Anthropic-compatible backends */
   apiKey?: string;
+  /** "ollama" (default) or "anthropic" or "openrouter" for OpenRouter-compatible endpoints */
+  apiBackend?: "ollama" | "anthropic" | "openrouter";
   model: string;
   cwd: string;
   role?: string;
   toolMode?: "native" | "xml";
+  noThink?: boolean;
   allowedPaths?: string[];
   maxIterations?: number;
   timeoutMs?: number;
   temperature?: number;
   topP?: number;
   topK?: number;
+  numCtx?: number;
   braveApiKey?: string;
   onEvent?: (event: MediatedHarnessEvent) => void;
 }
@@ -87,7 +92,9 @@ export interface MediatedHarnessConfig {
 export interface ToolExecutionContext {
   cwd: string;
   workspaceId: string;
+  readTrackingKey?: string;
   allowedPaths: string[];
+  availableCommands?: string[];
   braveApiKey?: string;
   ragIndexId?: number;
   db?: any; // AppDatabase - optional to avoid circular deps
@@ -109,11 +116,14 @@ export interface ToolExecutionContext {
 export type MediatedHarnessEvent =
   | { kind: "thinking"; text: string }
   | { kind: "text"; text: string }
+  | { kind: "streaming_text"; text: string }
+  | { kind: "streaming_thinking"; text: string }
   | { kind: "tool_call"; call: ToolCall }
   | { kind: "tool_result"; result: ToolResult }
   | { kind: "tool_error"; call: ToolCall; error: string }
   | { kind: "complete"; result: string; iterations: number }
-  | { kind: "error"; error: string };
+  | { kind: "error"; error: string }
+  | { kind: "duplicate_recovery"; bannedCall: string; recoveryCount: number };
 
 // ─── Result ─────────────────────────────────────────────────────────────────
 
@@ -168,5 +178,53 @@ export interface ToolCallDelta {
   function?: {
     name?: string;
     arguments?: string;
+  };
+}
+
+// ─── Duplicate recovery types ───────────────────────────────────────────────
+
+export interface BannedCallSignature {
+  toolName: string;
+  argsHash: string;
+  errorMessage: string;
+  errorKind: string;
+  bannedAt: number;
+}
+
+export interface DuplicateRecoveryState {
+  bannedSignatures: BannedCallSignature[];
+  recoveryCount: number;
+  postRecoveryCallCount: number;
+  isInRecovery: boolean;
+  hasMadeProgress: boolean;
+}
+
+// ─── Ollama native API types ─────────────────────────────────────────────────
+
+export interface OllamaChatResponse {
+  model: string;
+  created_at: string;
+  message: OllamaChatMessage;
+  done: boolean;
+  done_reason?: string;
+  total_duration?: number;
+  load_duration?: number;
+  prompt_eval_count?: number;
+  prompt_eval_duration?: number;
+  eval_count?: number;
+  eval_duration?: number;
+}
+
+export interface OllamaChatMessage {
+  role: string;
+  content: string;
+  thinking?: string;
+  tool_calls?: OllamaNativeToolCall[];
+}
+
+export interface OllamaNativeToolCall {
+  function: {
+    name: string;
+    arguments: Record<string, unknown>;
   };
 }

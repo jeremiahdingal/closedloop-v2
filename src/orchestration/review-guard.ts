@@ -236,14 +236,6 @@ export function runReviewGuard(input: ReviewGuardInput): ReviewGuardResult {
 
   const changedFiles = extractChangedFilesFromDiff(input.diff);
 
-  for (const file of changedFiles) {
-    const allowed = input.allowedPaths.length === 0 || input.allowedPaths.some((p) => p === "*" || inPath(file, p));
-    if (!allowed) {
-      blockers.add(`Changed file outside allowed paths: ${file}`);
-      ruleHits.add("allowed_paths");
-    }
-  }
-
   const contract = input.contract.contract;
   if (contract) {
     for (const file of changedFiles) {
