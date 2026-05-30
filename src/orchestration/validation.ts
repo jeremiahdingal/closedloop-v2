@@ -10,6 +10,12 @@ import type {
   GoalTicketPlan,
   ReviewerVerdict
 } from "../types.ts";
+import type {
+  JudgedTicket,
+  ModelDecompositionJudgement,
+  ModelHardenedTicketResult,
+  ModelRepairResult,
+} from "./knowledge/types.ts";
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
@@ -79,6 +85,22 @@ function isGoalTicketPlan(value: unknown): value is GoalTicketPlan {
     isStringArray(ticket.dependencies) &&
     (ticket.allowedPaths === undefined || isStringArray(ticket.allowedPaths)) &&
     (ticket.priority === "high" || ticket.priority === "medium" || ticket.priority === "low")
+  );
+}
+
+function isJudgedTicket(value: unknown): value is JudgedTicket {
+  if (!isGoalTicketPlan(value)) return false;
+  const ticket = value as Record<string, unknown>;
+  const validRisk =
+    ticket.riskLevel === undefined
+    || ticket.riskLevel === "low"
+    || ticket.riskLevel === "medium"
+    || ticket.riskLevel === "high";
+  return (
+    validRisk
+    && (ticket.nonGoals === undefined || isStringArray(ticket.nonGoals))
+    && (ticket.localModelNotes === undefined || isStringArray(ticket.localModelNotes))
+    && (ticket.fallbackNotes === undefined || isStringArray(ticket.fallbackNotes))
   );
 }
 
@@ -235,6 +257,50 @@ export function validateGoalDecomposition(value: unknown): GoalDecomposition {
     throw new Error("Goal decomposition shape invalid");
   }
   return record as unknown as GoalDecomposition;
+}
+
+export function validateModelHardenedTicketResult(value: unknown): ModelHardenedTicketResult {
+  if (!value || typeof value !== "object") throw new Error("Model hardened ticket result is not an object");
+  const record = value as Record<string, unknown>;
+  if (typeof record.summary !== "string" || !Array.isArray(record.tickets) || !record.tickets.every(isJudgedTicket)) {
+    throw new Error("Model hardened ticket result shape invalid");
+  }
+  return record as ModelHardenedTicketResult;
+}
+
+export function validateModelDecompositionJudgement(value: unknown): ModelDecompositionJudgement {
+  if (!value || typeof value !== "object") throw new Error("Model decomposition judgement is not an object");
+  const record = value as Record<string, unknown>;
+  if (
+    !isStringArray(record.approvedTicketIds)
+    || !isStringArray(record.rejectedTicketIds)
+    || !record.rejectionReasons
+    || typeof record.rejectionReasons !== "object"
+    || !record.repairSuggestions
+    || typeof record.repairSuggestions !== "object"
+    || typeof record.overallConfidence !== "number"
+  ) {
+    throw new Error("Model decomposition judgement shape invalid");
+  }
+  for (const valueList of Object.values(record.rejectionReasons as Record<string, unknown>)) {
+    if (!isStringArray(valueList)) throw new Error("Model decomposition judgement rejectionReasons shape invalid");
+  }
+  for (const valueList of Object.values(record.repairSuggestions as Record<string, unknown>)) {
+    if (!isStringArray(valueList)) throw new Error("Model decomposition judgement repairSuggestions shape invalid");
+  }
+  if (record.notes !== undefined && !isStringArray(record.notes)) {
+    throw new Error("Model decomposition judgement notes shape invalid");
+  }
+  return record as ModelDecompositionJudgement;
+}
+
+export function validateModelRepairResult(value: unknown): ModelRepairResult {
+  if (!value || typeof value !== "object") throw new Error("Model repair result is not an object");
+  const record = value as Record<string, unknown>;
+  if (typeof record.summary !== "string" || !Array.isArray(record.tickets) || !record.tickets.every(isJudgedTicket)) {
+    throw new Error("Model repair result shape invalid");
+  }
+  return record as ModelRepairResult;
 }
 
 export function validateBuilderPlan(value: unknown): BuilderPlan {

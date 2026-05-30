@@ -504,6 +504,36 @@ export class AppDatabase {
     `).run(JSON.stringify(allowedPaths), nowIso(), ticketId);
   }
 
+  updateTicketDetails(input: {
+    ticketId: string;
+    title?: string;
+    description?: string;
+    acceptanceCriteria?: string[];
+    dependencies?: string[];
+    allowedPaths?: string[];
+    priority?: TicketRecord["priority"];
+  }): TicketRecord {
+    const current = this.getTicket(input.ticketId);
+    if (!current) throw new Error(`Ticket not found: ${input.ticketId}`);
+
+    this.db.prepare(`
+      UPDATE tickets
+      SET title = ?, description = ?, acceptance_criteria_json = ?, dependencies_json = ?, allowed_paths_json = ?, priority = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      input.title ?? current.title,
+      input.description ?? current.description,
+      JSON.stringify(input.acceptanceCriteria ?? current.acceptanceCriteria),
+      JSON.stringify(input.dependencies ?? current.dependencies),
+      JSON.stringify(input.allowedPaths ?? current.allowedPaths),
+      input.priority ?? current.priority,
+      nowIso(),
+      input.ticketId
+    );
+
+    return this.getTicket(input.ticketId)!;
+  }
+
   deleteTicket(id: string): void {
     this.db.prepare(`DELETE FROM tickets WHERE id = ?`).run(id);
   }

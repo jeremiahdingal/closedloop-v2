@@ -12,6 +12,9 @@ export type EpicStatus = "planning" | "executing" | "reviewing" | "done" | "fail
 
 export type AgentRole =
   | "epicDecoder"
+  | "ticketHardener"
+  | "decompositionJudge"
+  | "ticketRepair"
   | "builder"
   | "explorer"
   | "coder"
@@ -141,6 +144,7 @@ export type GoalDecomposition = {
   summary: string;
   tickets: GoalTicketPlan[];
   clarificationQuestions?: string[];
+  planningMetadata?: import("./orchestration/knowledge/types.ts").DecoderPlanningMetadata;
 };
 
 export type GoalReview = {

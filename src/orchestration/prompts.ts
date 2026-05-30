@@ -1181,6 +1181,200 @@ export function epicDecoderPlanModePrompt(
   return sections.join("\n\n");
 }
 
+export function ticketHardenerPrompt(input: {
+  epicTitle: string;
+  plannerProfile: string;
+  fallbackMode: string;
+  knowledgeSections: Array<{ title: string; content: string }>;
+  draftTickets: GoalTicketPlan[];
+}): string {
+  return [
+    "You are the Ticket Hardener.",
+    "Rewrite the draft tickets into builder-ready tickets for a local coding model.",
+    "Preserve intent and dependency order, but make each ticket narrow, explicit, and executable.",
+    "Return JSON only with shape:",
+    JSON.stringify({
+      summary: "string",
+      tickets: [{
+        id: "string",
+        title: "string",
+        description: "string",
+        acceptanceCriteria: ["string"],
+        dependencies: ["string"],
+        allowedPaths: ["string"],
+        priority: "high|medium|low",
+        nonGoals: ["string"],
+        riskLevel: "low|medium|high",
+        localModelNotes: ["string"],
+        fallbackNotes: ["string"],
+      }]
+    }, null, 2),
+    `Epic Title: ${input.epicTitle}`,
+    `Planner profile: ${input.plannerProfile}`,
+    `Fallback mode: ${input.fallbackMode}`,
+    ...input.knowledgeSections.map((section) => `## ${section.title}\n${section.content}`),
+    "## Draft Tickets",
+    JSON.stringify(input.draftTickets, null, 2),
+    [
+      "Requirements:",
+      "- Keep tickets atomic and self-contained.",
+      "- Narrow allowedPaths to 1-3 specific paths when possible.",
+      "- Replace vague acceptance criteria with specific, testable checks.",
+      "- Add nonGoals that stop scope creep.",
+      "- Add explicit localModelNotes for narrow execution.",
+      "- If fallback mode is active, keep scope conservative and say so in fallbackNotes.",
+    ].join("\n"),
+  ].join("\n\n");
+}
+
+export function decompositionJudgePrompt(input: {
+  epicTitle: string;
+  plannerProfile: string;
+  fallbackMode: string;
+  knowledgeSections: Array<{ title: string; content: string }>;
+  tickets: GoalTicketPlan[];
+}): string {
+  return [
+    "You are the Decomposition Judge.",
+    "Evaluate whether each ticket is ready for a local builder model.",
+    "Do not rewrite tickets. Judge them and explain what must be repaired.",
+    "Return JSON only with shape:",
+    JSON.stringify({
+      approvedTicketIds: ["string"],
+      rejectedTicketIds: ["string"],
+      rejectionReasons: { T1: ["string"] },
+      repairSuggestions: { T1: ["string"] },
+      overallConfidence: 0,
+      notes: ["string"],
+    }, null, 2),
+    `Epic Title: ${input.epicTitle}`,
+    `Planner profile: ${input.plannerProfile}`,
+    `Fallback mode: ${input.fallbackMode}`,
+    ...input.knowledgeSections.map((section) => `## ${section.title}\n${section.content}`),
+    "## Candidate Tickets",
+    JSON.stringify(input.tickets, null, 2),
+    [
+      "Judge criteria:",
+      "- Scope is narrow.",
+      "- allowedPaths are specific.",
+      "- Acceptance criteria are concrete and testable.",
+      "- The ticket does not rely on hidden repo context.",
+      "- The ticket is safe for a local model to execute.",
+      "- The ticket includes enough verification guidance.",
+    ].join("\n"),
+  ].join("\n\n");
+}
+
+export function ticketRepairPrompt(input: {
+  epicTitle: string;
+  plannerProfile: string;
+  fallbackMode: string;
+  knowledgeSections: Array<{ title: string; content: string }>;
+  rejectedTickets: GoalTicketPlan[];
+  rejectionReasons: Record<string, string[]>;
+  repairSuggestions: Record<string, string[]>;
+}): string {
+  return [
+    "You are the Ticket Repair agent.",
+    "Repair only the rejected tickets. Split tickets if needed, but do not invent repo facts outside the selected knowledge.",
+    "Return JSON only with shape:",
+    JSON.stringify({
+      summary: "string",
+      tickets: [{
+        id: "string",
+        title: "string",
+        description: "string",
+        acceptanceCriteria: ["string"],
+        dependencies: ["string"],
+        allowedPaths: ["string"],
+        priority: "high|medium|low",
+        nonGoals: ["string"],
+        riskLevel: "low|medium|high",
+        localModelNotes: ["string"],
+        fallbackNotes: ["string"],
+      }]
+    }, null, 2),
+    `Epic Title: ${input.epicTitle}`,
+    `Planner profile: ${input.plannerProfile}`,
+    `Fallback mode: ${input.fallbackMode}`,
+    ...input.knowledgeSections.map((section) => `## ${section.title}\n${section.content}`),
+    "## Rejected Tickets",
+    JSON.stringify(input.rejectedTickets, null, 2),
+    "## Rejection Reasons",
+    JSON.stringify(input.rejectionReasons, null, 2),
+    "## Repair Suggestions",
+    JSON.stringify(input.repairSuggestions, null, 2),
+  ].join("\n\n");
+}
+
+export function remoteKnowledgeRefreshPrompt(input: {
+  repoRoot: string;
+  commitHash: string;
+  refreshReason: string;
+  localMemory: string[];
+  contextPackets: Array<{ title: string; content: string }>;
+  maxArtifactSize: number;
+}): string {
+  return [
+    "You are maintaining a durable knowledgebase for weaker local coding agents.",
+    "Your output must help local agents decode epics into small tickets, avoid broad or vague work, choose relevant context, respect architecture boundaries, write testable acceptance criteria, avoid known failure modes, and operate successfully with 9B/27B local models.",
+    "Do not produce a generic repo summary.",
+    "Do not dump raw source.",
+    "Produce compact operational knowledge only.",
+    "Return JSON only with this shape:",
+    JSON.stringify({
+      summaryOfChanges: "string",
+      domainsRefreshed: ["string"],
+      importantArchitectureRules: ["string"],
+      updatedTicketPatterns: ["string"],
+      knownFailureModes: ["string"],
+      stalenessStatus: "fresh|stale|critical_stale|missing",
+      warnings: ["string"],
+      confidenceScore: 0,
+      artifacts: [
+        {
+          kind: "repo_capsule|domain_map|architecture_rules|api_contract_notes|ticket_decomposition_patterns|known_failure_modes|testing_guidance|local_model_instructions|recent_change_history|staleness_report|refresh_metadata",
+          title: "string",
+          domains: ["string"],
+          content: "string"
+        }
+      ]
+    }, null, 2),
+    `Repository root: ${input.repoRoot}`,
+    `Current commit: ${input.commitHash}`,
+    `Refresh reason: ${input.refreshReason}`,
+    `Maximum artifact size: ${input.maxArtifactSize} characters`,
+    "Required artifacts:",
+    [
+      "repo_capsule",
+      "domain_map",
+      "architecture_rules",
+      "api_contract_notes",
+      "ticket_decomposition_patterns",
+      "known_failure_modes",
+      "testing_guidance",
+      "local_model_instructions",
+      "recent_change_history",
+      "staleness_report",
+      "refresh_metadata",
+    ].join(", "),
+    input.localMemory.length
+      ? `Recent local epic memory:\n${input.localMemory.map((line) => `- ${line}`).join("\n")}`
+      : "Recent local epic memory: none available.",
+    ...input.contextPackets.map((packet) => `## ${packet.title}\n${packet.content}`),
+    [
+      "Critical requirements:",
+      "- Every artifact must be compact and actionable.",
+      "- Domain map must be parseable and name major subsystems.",
+      "- Architecture rules must be concrete, not vague.",
+      "- Known failure modes must include prevention guidance.",
+      "- Testing guidance must mention real verification categories or commands.",
+      "- Local model instructions must explicitly optimize for small/local model planning.",
+      "- Never include long raw code excerpts or a filesystem dump.",
+    ].join("\n"),
+  ].join("\n\n");
+}
+
 export function playWriterPrompt(
   epic: EpicRecord,
   tickets: TicketRecord[],

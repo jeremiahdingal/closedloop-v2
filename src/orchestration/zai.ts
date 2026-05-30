@@ -10,6 +10,7 @@ export type ZaiTaskInput = {
   role: Extract<AgentRole, "epicDecoder" | "epicReviewer" | "builder"> | string;
   cwd?: string;
   prompt: string;
+  modelOverride?: string;
   runId?: string | null;
   ticketId?: string | null;
   epicId?: string | null;
@@ -568,7 +569,7 @@ export class ZaiRunner {
   }
 
   private async runRaw(input: ZaiTaskInput & { cwd: string }): Promise<{ combined: string; launchInfo: ZaiLaunchInfo }> {
-    const configuredModel = loadConfig().models[input.role as AgentRole] ?? "";
+    const configuredModel = input.modelOverride ?? loadConfig().models[input.role as AgentRole] ?? "";
     const model = this.resolveModel(configuredModel);
     const launch = await this.resolveLaunch({ cwd: input.cwd, prompt: input.prompt, model });
     const chunks: string[] = [];

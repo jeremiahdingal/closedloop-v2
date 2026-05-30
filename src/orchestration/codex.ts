@@ -1,7 +1,7 @@
 ﻿import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import path from "node:path";
-import { loadConfig } from "../config.ts";
+import { loadConfig, resolveConstrainedTargetDir } from "../config.ts";
 import type { AgentRole, AgentStreamPayload, GoalDecomposition, GoalReview } from "../types.ts";
 import { validateGoalDecomposition, validateGoalReview, parseJsonText } from "./validation.ts";
 
@@ -9,6 +9,7 @@ export type CodexTaskInput = {
   role: Extract<AgentRole, "epicDecoder" | "epicReviewer" | "builder">;
   cwd: string;
   prompt: string;
+  modelOverride?: string;
   runId?: string | null;
   ticketId?: string | null;
   epicId?: string | null;
@@ -65,16 +66,20 @@ function buildLaunchInfo(input: {
   cwd: string;
   repoRoot: string;
   promptLength: number;
+  modelOverride?: string;
   cwdExists: boolean;
   cwdIsDirectory: boolean;
 }): CodexLaunchInfo {
   const isWin = process.platform === "win32";
+  const args = ["exec", "--yolo", "--skip-git-repo-check", "-C", input.cwd];
+  if (input.modelOverride) args.push("--model", input.modelOverride);
+  args.push("-");
   return {
     cwd: input.cwd,
     repoRoot: input.repoRoot,
     promptLength: input.promptLength,
     command: "codex",
-    args: ["exec", "--yolo", "--skip-git-repo-check", "-C", input.cwd, "-"],
+    args,
     shell: isWin ? "cmd.exe" : true, // Use cmd.exe on Windows to avoid PowerShell quirks
     cwdExists: input.cwdExists,
     cwdIsDirectory: input.cwdIsDirectory
@@ -180,7 +185,7 @@ export class CodexRunner {
 
   async resolveLaunch(input: { cwd: string; promptLength: number }): Promise<{ command: string; args: string[]; info: CodexLaunchInfo }> {
     const config = loadConfig();
-    const cwd = path.resolve(input.cwd);
+    const cwd = resolveConstrainedTargetDir(input.cwd);
     const cwdStat = await stat(cwd)
       .then((value) => ({ exists: true, isDirectory: value.isDirectory() }))
       .catch(() => ({ exists: false, isDirectory: false }));
@@ -189,6 +194,7 @@ export class CodexRunner {
       cwd,
       repoRoot: config.repoRoot,
       promptLength: input.promptLength,
+      modelOverride: process.env.CODEX_CLI_MODEL || undefined,
       cwdExists: cwdStat.exists,
       cwdIsDirectory: cwdStat.isDirectory
     });
@@ -235,6 +241,16 @@ export class CodexRunner {
 
   private async runRaw(input: CodexTaskInput): Promise<{ combined: string; launchInfo: CodexLaunchInfo }> {
     const launch = await this.resolveLaunch({ cwd: input.cwd, promptLength: input.prompt.length });
+    if (input.modelOverride) {
+      launch.args = [...launch.args];
+      const dashIndex = launch.args.lastIndexOf("-");
+      if (dashIndex >= 0) {
+        launch.args.splice(dashIndex, 0, "--model", input.modelOverride);
+      } else {
+        launch.args.push("--model", input.modelOverride);
+      }
+      launch.info.args = launch.args;
+    }
     const args = [...launch.args];
     const chunks: string[] = [];
     let sequence = 0;
@@ -251,7 +267,7 @@ export class CodexRunner {
         epicId: input.epicId,
         sequence: sequence++,
         done,
-        metadata: { cwd: input.cwd, command: launch.command, promptLength: launch.info.promptLength }
+        metadata: { cwd: input.cwd, command: launch.command, promptLength: launch.info.promptLength, model: input.modelOverride ?? process.env.CODEX_CLI_MODEL ?? null }
       });
     };
 

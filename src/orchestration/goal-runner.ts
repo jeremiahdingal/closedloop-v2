@@ -8,7 +8,7 @@ import type { ModelGateway } from "./models.ts";
 import type { AgentStreamPayload, EpicRecord, GoalDecomposition, GoalReview, GoalTicketPlan, TicketEpicReviewPacket, TicketRecord } from "../types.ts";
 import { TicketRunner } from "./ticket-runner.ts";
 import { loadConfig } from "../config.ts";
-import { readWorkspaceConfig } from "../config.ts";
+import { readWorkspaceConfig, resolveKnowledgePipelineConfig } from "../config.ts";
 import { loadLangGraphRuntime, type LangGraphRuntime } from "./langgraph-loader.ts";
 import { formatOpenCodeFailure } from "./opencode.ts";
 import { formatCodexFailure } from "./codex.ts";
@@ -20,6 +20,9 @@ import { git } from "../bridge/git.ts";
 import { ensureProjectStructureFile } from "./project-structure.ts";
 import { PlayLoopService } from "./play-loop.ts";
 import { resolveRuntimeProfile } from "../runtime-profile.ts";
+import { decodeEpicWithKnowledgePipeline } from "./epic-decoder-pipeline.ts";
+import { KnowledgebaseService } from "./knowledge/knowledgebase.ts";
+import type { DecoderPlanningMetadata, LocalEpicMemory } from "./knowledge/types.ts";
 
 type GoalGraphState = {
   runId: string;
@@ -177,6 +180,7 @@ export class GoalRunner {
   private readonly lifecycle: LifecycleService;
   private readonly bridge: WorkspaceBridge;
   private readonly playLoop: PlayLoopService;
+  private readonly knowledgebase: KnowledgebaseService;
 
   constructor(db: AppDatabase, ticketRunner: TicketRunner, gateway: ModelGateway, lifecycle: LifecycleService, bridge?: WorkspaceBridge) {
     this.db = db;
@@ -189,6 +193,7 @@ export class GoalRunner {
       executeTickets: this.executeTickets.bind(this),
       runEpicReview: this.runEpicReview.bind(this)
     }, this.epicReviewTimeoutMs, this.heartbeatIntervalMs);
+    this.knowledgebase = new KnowledgebaseService(this.config);
   }
 
   private buildOverrideFinalization(tickets: TicketRecord[]): {
@@ -268,7 +273,7 @@ export class GoalRunner {
     this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Repair tickets execution complete`, runId, epicId: epic.id, sequence: 0 });
   }
 
-  private materializeTickets(epicId: string, plans: GoalTicketPlan[]) {
+  private materializeTickets(epicId: string, plans: GoalTicketPlan[], planningMetadata?: DecoderPlanningMetadata | null) {
     const existing = this.db.listTickets(epicId);
     const byId = new Map(existing.map((ticket) => [ticket.id, ticket] as const));
     const bySourceId = new Map<string, TicketRecord>(
@@ -318,7 +323,18 @@ export class GoalRunner {
       status: "queued",
       diffFiles: [],
       prUrl: null,
-      metadata: { maxBuildAttempts: 10, sourceTicketId: String((ticket as GoalTicketPlan & { sourceTicketId?: string }).sourceTicketId || ticket.id) }
+      metadata: {
+        maxBuildAttempts: 10,
+        sourceTicketId: String((ticket as GoalTicketPlan & { sourceTicketId?: string }).sourceTicketId || ticket.id),
+        planningMetadata: planningMetadata ? {
+          plannerProfile: planningMetadata.plannerProfile,
+          knowledgebaseVersionUsed: planningMetadata.knowledgebaseVersionUsed,
+          knowledgeFreshnessState: planningMetadata.knowledgeFreshnessState,
+          fallbackState: planningMetadata.fallbackState,
+          selectedKnowledgeSections: planningMetadata.selectedKnowledgeSections,
+          score: planningMetadata.ticketQualityScores[ticket.id] ?? null,
+        } : null,
+      }
     }));
 
     const allIds = Array.from(new Set(plans.map((plan) => planIdToTicketId.get(plan.id) || plan.id)));
@@ -330,6 +346,62 @@ export class GoalRunner {
       reusedCount: allIds.length - created.length,
       createdCount: created.length
     };
+  }
+
+  private async handleApprovedEpicCompletion(epic: EpicRecord, summary: string, ticketSummaries: string[], planningMetadata?: DecoderPlanningMetadata | null): Promise<void> {
+    try {
+      const runtimeProfile = resolveRuntimeProfile(this.gateway.models, readWorkspaceConfig());
+      const ticketCount = this.db.listTickets(epic.id).length;
+      const qualityNotes = planningMetadata
+        ? [`Judge confidence ${planningMetadata.judgeConfidence}`, `Rejected before repair: ${planningMetadata.rejectedTicketCount}`]
+        : [];
+      const memory: LocalEpicMemory = {
+        epicId: epic.id,
+        epicTitle: epic.title,
+        summary,
+        domainsTouched: planningMetadata?.includedArtifactKinds.map((kind) => String(kind)) ?? [],
+        ticketCount,
+        ticketQualityNotes: qualityNotes,
+        failureModesEncountered: planningMetadata?.warnings ?? [],
+        importantFixes: ticketSummaries,
+        testsChanged: [],
+        builderIssues: [],
+        reviewerIssues: [],
+        plannerIssues: planningMetadata?.repairHistory ?? [],
+        decompositionTooBroad: (planningMetadata?.rejectedTicketCount ?? 0) > 0,
+        localModelsStruggled: (planningMetadata?.judgeConfidence ?? 100) < 90,
+        remoteOverrideEnabled: runtimeProfile.remoteOverrideEnabled,
+        plannerProfile: planningMetadata?.plannerProfile ?? resolveKnowledgePipelineConfig(readWorkspaceConfig()).plannerProfile,
+        knowledgeVersionUsed: planningMetadata?.knowledgebaseVersionUsed ?? null,
+        createdAt: nowIso(),
+      };
+      await this.knowledgebase.appendEpicMemory(epic.targetDir, memory);
+      const refreshState = await this.knowledgebase.readRefreshState(epic.targetDir);
+      const knowledgeConfig = resolveKnowledgePipelineConfig(readWorkspaceConfig());
+      const nextCount = refreshState.approvedEpicsSinceKnowledgeRefresh + 1;
+      await this.knowledgebase.markRefreshState(epic.targetDir, {
+        approvedEpicsSinceKnowledgeRefresh: nextCount,
+        plannerFailureCount: 0,
+      });
+      if (knowledgeConfig.enableRemoteKnowledgeRefresh && nextCount >= knowledgeConfig.approvedEpicRefreshInterval) {
+        this.db.enqueueJob("run_knowledge_refresh", { repoRoot: epic.targetDir, reason: "approved_epic_interval", epicId: epic.id });
+        this.db.recordEvent({
+          aggregateType: "epic",
+          aggregateId: epic.id,
+          kind: "knowledge_refresh_queued",
+          message: "Queued knowledge refresh after approved epic interval.",
+          payload: { repoRoot: epic.targetDir, reason: "approved_epic_interval", approvedEpicsSinceRefresh: nextCount },
+        });
+        await this.knowledgebase.markRefreshState(epic.targetDir, { refreshStatus: "queued" });
+      }
+    } catch (error) {
+      this.db.recordEvent({
+        aggregateType: "epic",
+        aggregateId: epic.id,
+        kind: "knowledge_memory_warning",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async enqueueGoal(epicId: string): Promise<string> {
@@ -448,7 +520,7 @@ export class GoalRunner {
       }
       if (!plan) throw new Error("Epic decoder produced no result");
       const normalizedPlans = normalizeGoalTicketPlans(epic.id, plan.tickets);
-      const materialized = this.db.transaction(() => this.materializeTickets(epic.id, normalizedPlans));
+      const materialized = this.db.transaction(() => this.materializeTickets(epic.id, normalizedPlans, plan.planningMetadata ?? null));
       console.log(`[LangGraph] Node: decompose_goal - Materialized ${materialized.ticketIds.length} tickets`);
       if (materialized.reusedCount > 0) {
         this.recordAgentStream({
@@ -633,6 +705,10 @@ export class GoalRunner {
         message: state.reviewSummary,
         payload: { verdict: state.reviewVerdict, ticketSummaries: state.ticketSummaries, playLoopSuccess: state.playLoopSuccess }
       });
+      if (approved || failForward) {
+        const planEvent = this.db.listEventsAfterId(0, { runId, kind: "decoder_pipeline_complete" }).slice(-1)[0] as { payload?: DecoderPlanningMetadata } | undefined;
+        await this.handleApprovedEpicCompletion(epic, state.reviewSummary, state.ticketSummaries, planEvent?.payload ?? null);
+      }
       return state;
     };
 
@@ -717,6 +793,10 @@ export class GoalRunner {
       const runStatus = approved ? "succeeded" : failForward ? "succeeded" : "failed";
       this.db.updateRun({ runId, status: runStatus, currentNode: "complete", heartbeatAt: nowIso(), lastMessage: review.summary, errorText: (approved || failForward) ? null : review.summary });
       this.recordAgentStream({ agentRole: "system", source: "orchestrator", streamKind: "status", content: `Epic review ${approved ? "approved" : failForward ? "approved with followups" : "rejected"}: ${review.summary}`, runId, epicId: epic.id, sequence: 3, done: true });
+      if (approved || failForward) {
+        const planEvent = this.db.listEventsAfterId(0, { runId, kind: "decoder_pipeline_complete" }).slice(-1)[0] as { payload?: DecoderPlanningMetadata } | undefined;
+        await this.handleApprovedEpicCompletion(epic, review.summary, finalTickets.map((ticket) => `${ticket.id}:${ticket.status}`), planEvent?.payload ?? null);
+      }
     } catch (error) {
       if (error instanceof EpicCancelledError) return;
       if (error instanceof EpicPausedError) return;
@@ -751,6 +831,7 @@ export class GoalRunner {
 
   private async runEpicDecoder(epic: EpicRecord, runId: string, compact = false, retryNote?: string | null): Promise<GoalDecomposition> {
     const runtimeProfile = resolveRuntimeProfile(this.gateway.models, readWorkspaceConfig());
+    const knowledgeConfig = resolveKnowledgePipelineConfig(readWorkspaceConfig());
     const ragCtx = compact ? null : await this.buildRagContext(epic.targetDir, `${epic.title} ${epic.goalText}`);
     const projectStructure = compact ? null : await ensureProjectStructureFile(epic.targetDir).catch(() => null);
 
@@ -758,6 +839,34 @@ export class GoalRunner {
     if (epic.assetPaths && epic.assetPaths.length > 0) {
       assetContext = "\n\nREFERENCE IMAGES:\nThe user provided reference images for this epic. Use read_file to examine them and incorporate their content:\n"
         + epic.assetPaths.map(p => `- ${p}`).join("\n") + "\n";
+    }
+
+    if (!compact && knowledgeConfig.enableKnowledgePipeline) {
+      try {
+        return await decodeEpicWithKnowledgePipeline({
+          epic,
+          runId,
+          gateway: this.gateway,
+          db: this.db,
+          config: knowledgeConfig,
+          compact,
+          retryNote,
+          onStream: (event) => this.recordAgentStream({
+            ...event,
+            runId: event.runId ?? runId,
+            epicId: event.epicId ?? epic.id,
+          }),
+        });
+      } catch (error) {
+        console.warn(`[KNOWLEDGE-PIPELINE] Falling back to legacy decoder for ${epic.id}: ${error}`);
+        this.db.recordEvent({
+          aggregateType: "epic",
+          aggregateId: epic.id,
+          runId,
+          kind: "decoder_pipeline_failed",
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
 
     let prompt: string;
@@ -1146,7 +1255,7 @@ export class GoalRunner {
     // Materialize plan tickets and update epic status
     this.db.updateEpicStatus(epicId, "executing");
     const normalizedPlans = normalizeGoalTicketPlans(epicId, plan.tickets);
-    this.db.transaction(() => this.materializeTickets(epicId, normalizedPlans));
+    this.db.transaction(() => this.materializeTickets(epicId, normalizedPlans, plan.planningMetadata ?? null));
 
     // Enqueue a normal epic run (which will find the pre-materialized tickets)
     return this.enqueueGoal(epicId);

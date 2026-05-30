@@ -2,9 +2,11 @@ import { AppDatabase } from "../db/database.ts";
 import { TicketRunner } from "./ticket-runner.ts";
 import { GoalRunner } from "./goal-runner.ts";
 import { deterministicDoctor } from "../bridge/doctor.ts";
-import { loadConfig } from "../config.ts";
+import { loadConfig, readWorkspaceConfig, resolveKnowledgePipelineConfig } from "../config.ts";
 import { nowIso } from "../utils.ts";
 import type { AgentStreamPayload } from "../types.ts";
+import { KnowledgeRefreshService } from "./knowledge/remote-refresh.ts";
+import { createGateway } from "./models.ts";
 
 export class RecoveryService {
   readonly config = loadConfig();
@@ -430,7 +432,7 @@ export class RecoveryService {
             j.kind === "run_epic_review" && (j.status === "queued" || j.status === "running")
             && (j.payload as any)?.epicId === ticket.epicId
           );
-          if (epic && epic.status !== "approved" && epic.status !== "reviewing" && !hasPendingReview) {
+          if (epic && epic.status !== "done" && epic.status !== "reviewing" && !hasPendingReview) {
             console.log(`[RECOVERY] All tickets terminal for epic ${ticket.epicId}. Triggering epic review.`);
             this.goalRunner.enqueueManualReview(ticket.epicId).catch(err => {
               console.warn(`[RECOVERY] Failed to enqueue epic review: ${err}`);
@@ -456,6 +458,17 @@ export class RecoveryService {
       const run = this.db.getRun(String(job.payload.runId));
       if (!run || run.status === "failed" || run.status === "succeeded" || run.status === "cancelled") return;
       await this.goalRunner.runManualPlayLoopExisting(run.id);
+      return;
+    }
+    if (job.kind === "run_knowledge_refresh") {
+      const payload = job.payload as { repoRoot: string; reason?: string };
+      const refreshService = new KnowledgeRefreshService(
+        this.db,
+        createGateway(),
+        undefined,
+        (event) => this.recordAgentStream(event),
+      );
+      await refreshService.runJob(payload, resolveKnowledgePipelineConfig(readWorkspaceConfig()));
       return;
     }
     throw new Error(`Unsupported job kind: ${job.kind}`);

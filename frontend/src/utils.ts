@@ -84,6 +84,9 @@ export function isRunActiveForRole(role: string, run: Run): boolean {
   if (run.status !== "running") return false;
   const node = (run.currentNode || "").toLowerCase();
   if (role === "system") return true;
+  if (role === "ticketHardener") return run.kind === "epic" && (node.includes("harden") || node.includes("hardener"));
+  if (role === "decompositionJudge") return run.kind === "epic" && (node.includes("judge") || node.includes("decomposition"));
+  if (role === "ticketRepair") return run.kind === "epic" && node.includes("repair");
   if (role === "builder") return run.kind === "ticket" && (node === "builder" || node.includes("build"));
   if (role === "explorer") return run.kind === "ticket" && (node === "explorer" || node.includes("explore"));
   if (role === "coder") return run.kind === "ticket" && (node === "coder" || node.includes("code"));

@@ -310,9 +310,10 @@ test("fresh retry can preserve skipExplorer", async () => {
 
     assert.equal(result.status, "approved");
     assert.ok(captured);
-    assert.equal(captured?.options?.skipExplorer, true);
-    assert.equal(services.db.getRun(captured!.runId)?.lastMessage, "Auto-retry from fresh (skip explorer).");
-    assert.equal(services.db.getTicket("ticket_skip_explorer_retry")?.currentRunId, captured!.runId);
+    const capturedRun = captured as { runId: string; options: { skipExplorer?: boolean } | undefined };
+    assert.equal(capturedRun.options?.skipExplorer, true);
+    assert.equal(services.db.getRun(capturedRun.runId)?.lastMessage, "Auto-retry from fresh (skip explorer).");
+    assert.equal(services.db.getTicket("ticket_skip_explorer_retry")?.currentRunId, capturedRun.runId);
   } finally {
     services.restore();
   }

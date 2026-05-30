@@ -11,12 +11,20 @@ import type {
   ReviewerVerdict,
   TesterResult
 } from "../types.ts";
+import type {
+  ModelDecompositionJudgement,
+  ModelHardenedTicketResult,
+  ModelRepairResult,
+} from "./knowledge/types.ts";
 import {
   parseJsonText,
   validateBuilderPlan,
   validateFailureDecision,
   validateGoalDecomposition,
   validateGoalReview,
+  validateModelDecompositionJudgement,
+  validateModelHardenedTicketResult,
+  validateModelRepairResult,
   validateReviewerVerdict
 } from "./validation.ts";
 import { OpenCodeRunner } from "./opencode.ts";
@@ -34,12 +42,15 @@ export type StreamHook = (event: AgentStreamPayload) => void;
 
 export interface ModelGateway {
   readonly models: Record<AgentRole, string>;
-  rawPrompt(role: AgentRole, prompt: string): Promise<string>;
+  rawPrompt(role: AgentRole, prompt: string, onStream?: StreamHook): Promise<string>;
   getGoalDecomposition(prompt: string): Promise<GoalDecomposition>;
   getBuilderPlan(prompt: string): Promise<BuilderPlan>;
   getReviewerVerdict(prompt: string): Promise<ReviewerVerdict>;
   getGoalReview(prompt: string): Promise<GoalReview>;
   getFailureDecision(prompt: string): Promise<FailureDecision>;
+  runTicketHardener?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelHardenedTicketResult>;
+  runDecompositionJudge?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelDecompositionJudgement>;
+  runTicketRepair?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelRepairResult>;
   runBuilderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<OpenCodeBuilderResult>;
   runReviewerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; timeoutMs?: number; onStream?: StreamHook }): Promise<ReviewerVerdict>;
   runTesterInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<TesterResult>;
@@ -113,6 +124,32 @@ riskLevel: z.enum(["low", "medium", "high"])
       verdict: z.enum(["approved", "needs_followups", "failed"]),
       summary: z.string(),
       followupTickets: z.array(GoalTicketPlanSchema)
+    }),
+    hardenedTicketResult: z.object({
+      summary: z.string(),
+      tickets: z.array(GoalTicketPlanSchema.extend({
+        nonGoals: z.array(z.string()).optional(),
+        riskLevel: z.enum(["low", "medium", "high"]).optional(),
+        localModelNotes: z.array(z.string()).optional(),
+        fallbackNotes: z.array(z.string()).optional(),
+      }))
+    }),
+    decompositionJudgement: z.object({
+      approvedTicketIds: z.array(z.string()),
+      rejectedTicketIds: z.array(z.string()),
+      rejectionReasons: z.record(z.array(z.string())),
+      repairSuggestions: z.record(z.array(z.string())),
+      overallConfidence: z.number(),
+      notes: z.array(z.string()).optional(),
+    }),
+    repairResult: z.object({
+      summary: z.string(),
+      tickets: z.array(GoalTicketPlanSchema.extend({
+        nonGoals: z.array(z.string()).optional(),
+        riskLevel: z.enum(["low", "medium", "high"]).optional(),
+        localModelNotes: z.array(z.string()).optional(),
+        fallbackNotes: z.array(z.string()).optional(),
+      }))
     }),
     failureDecision: z.object({
       decision: z.enum(["retry_same_node", "retry_builder", "blocked", "todo", "escalate", "review_existing"]),
@@ -241,6 +278,87 @@ export class OllamaGateway implements ModelGateway {
     return this.invokeStructured("doctor", prompt, validateFailureDecision, "failureDecision");
   }
 
+  async runTicketHardener(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelHardenedTicketResult> {
+    const model = resolveOllamaModel("ticketHardener", this.models);
+    input.onStream?.({
+      agentRole: "ticketHardener",
+      source: "orchestrator",
+      streamKind: "status",
+      content: `Hardening tickets via local Ollama JSON call (${model})...`,
+      runId: input.runId,
+      epicId: input.epicId,
+      sequence: 0,
+      metadata: { model },
+    });
+    const result = await this.invokeStructured("ticketHardener", input.prompt, validateModelHardenedTicketResult, "hardenedTicketResult");
+    input.onStream?.({
+      agentRole: "ticketHardener",
+      source: "orchestrator",
+      streamKind: "assistant",
+      content: result.summary,
+      runId: input.runId,
+      epicId: input.epicId,
+      sequence: 1,
+      done: true,
+      metadata: { model, ticketCount: result.tickets.length },
+    });
+    return result;
+  }
+
+  async runDecompositionJudge(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelDecompositionJudgement> {
+    const model = resolveOllamaModel("decompositionJudge", this.models);
+    input.onStream?.({
+      agentRole: "decompositionJudge",
+      source: "orchestrator",
+      streamKind: "status",
+      content: `Judging decomposition via local Ollama JSON call (${model})...`,
+      runId: input.runId,
+      epicId: input.epicId,
+      sequence: 0,
+      metadata: { model },
+    });
+    const result = await this.invokeStructured("decompositionJudge", input.prompt, validateModelDecompositionJudgement, "decompositionJudgement");
+    input.onStream?.({
+      agentRole: "decompositionJudge",
+      source: "orchestrator",
+      streamKind: "assistant",
+      content: `Judge approved ${result.approvedTicketIds.length} ticket(s), rejected ${result.rejectedTicketIds.length}, confidence ${result.overallConfidence}.`,
+      runId: input.runId,
+      epicId: input.epicId,
+      sequence: 1,
+      done: true,
+      metadata: { model, approved: result.approvedTicketIds.length, rejected: result.rejectedTicketIds.length, confidence: result.overallConfidence },
+    });
+    return result;
+  }
+
+  async runTicketRepair(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelRepairResult> {
+    const model = resolveOllamaModel("ticketRepair", this.models);
+    input.onStream?.({
+      agentRole: "ticketRepair",
+      source: "orchestrator",
+      streamKind: "status",
+      content: `Repairing rejected tickets via local Ollama JSON call (${model})...`,
+      runId: input.runId,
+      epicId: input.epicId,
+      sequence: 0,
+      metadata: { model },
+    });
+    const result = await this.invokeStructured("ticketRepair", input.prompt, validateModelRepairResult, "repairResult");
+    input.onStream?.({
+      agentRole: "ticketRepair",
+      source: "orchestrator",
+      streamKind: "assistant",
+      content: result.summary,
+      runId: input.runId,
+      epicId: input.epicId,
+      sequence: 1,
+      done: true,
+      metadata: { model, ticketCount: result.tickets.length },
+    });
+    return result;
+  }
+
   runExplorerInWorkspace(_input: { cwd: string; prompt: string }): Promise<string> {
     throw new Error("Explorer requires mediated harness (MediatedAgentHarnessGateway)");
   }
@@ -300,8 +418,8 @@ export class OpenCodeHybridGateway implements ModelGateway {
     this.zai = new ZaiRunner();
   }
 
-  rawPrompt(role: AgentRole, prompt: string): Promise<string> {
-    return this.ollama.rawPrompt(role, prompt);
+  rawPrompt(role: AgentRole, prompt: string, onStream?: StreamHook): Promise<string> {
+    return this.ollama.rawPrompt(role, prompt, onStream);
   }
 
   getGoalDecomposition(prompt: string): Promise<GoalDecomposition> {
@@ -322,6 +440,18 @@ export class OpenCodeHybridGateway implements ModelGateway {
 
   getFailureDecision(prompt: string): Promise<FailureDecision> {
     return this.ollama.getFailureDecision(prompt);
+  }
+
+  runTicketHardener(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelHardenedTicketResult> {
+    return this.ollama.runTicketHardener(input);
+  }
+
+  runDecompositionJudge(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelDecompositionJudgement> {
+    return this.ollama.runDecompositionJudge(input);
+  }
+
+  runTicketRepair(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelRepairResult> {
+    return this.ollama.runTicketRepair(input);
   }
 
   runBuilderInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<OpenCodeBuilderResult> {
@@ -430,7 +560,7 @@ export class DryRunGateway implements ModelGateway {
     return loadConfig().models;
   }
 
-  async rawPrompt(_role: AgentRole, _prompt: string): Promise<string> {
+  async rawPrompt(_role: AgentRole, _prompt: string, _onStream?: StreamHook): Promise<string> {
     return JSON.stringify({ ok: true });
   }
 
@@ -541,6 +671,9 @@ export class MockGateway implements ModelGateway {
   }
   private readonly responses: Partial<{
     goalDecomposition: GoalDecomposition;
+    hardenedTicketResult: ModelHardenedTicketResult;
+    decompositionJudgement: ModelDecompositionJudgement;
+    repairResult: ModelRepairResult;
     builderPlans: BuilderPlan[];
     reviewerVerdicts: ReviewerVerdict[];
     goalReview: GoalReview;
@@ -548,6 +681,9 @@ export class MockGateway implements ModelGateway {
   }>;
   constructor(responses: Partial<{
     goalDecomposition: GoalDecomposition;
+    hardenedTicketResult: ModelHardenedTicketResult;
+    decompositionJudgement: ModelDecompositionJudgement;
+    repairResult: ModelRepairResult;
     builderPlans: BuilderPlan[];
     reviewerVerdicts: ReviewerVerdict[];
     goalReview: GoalReview;
@@ -556,7 +692,7 @@ export class MockGateway implements ModelGateway {
     this.responses = responses;
   }
 
-  async rawPrompt(_role: AgentRole, _prompt: string): Promise<string> {
+  async rawPrompt(_role: AgentRole, _prompt: string, _onStream?: StreamHook): Promise<string> {
     return JSON.stringify({ ok: true });
   }
 
@@ -586,6 +722,21 @@ export class MockGateway implements ModelGateway {
     const decision = this.responses.failureDecisions?.shift();
     if (!decision) throw new Error("Missing mock failure decision");
     return decision;
+  }
+
+  async runTicketHardener(_input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelHardenedTicketResult> {
+    if (!this.responses.hardenedTicketResult) throw new Error("Missing mock hardened ticket result");
+    return this.responses.hardenedTicketResult;
+  }
+
+  async runDecompositionJudge(_input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelDecompositionJudgement> {
+    if (!this.responses.decompositionJudgement) throw new Error("Missing mock decomposition judgement");
+    return this.responses.decompositionJudgement;
+  }
+
+  async runTicketRepair(_input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelRepairResult> {
+    if (!this.responses.repairResult) throw new Error("Missing mock repair result");
+    return this.responses.repairResult;
   }
 
   async runExplorerInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string> {
@@ -659,15 +810,15 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     return resolveRuntimeProfile(this.getBaseModels(), readWorkspaceConfig());
   }
 
-  rawPrompt(role: AgentRole, prompt: string): Promise<string> {
-    const model = this.resolveHarnessModel(role);
-    if (model.startsWith("zai:")) {
-      return this.zai.rawPrompt(role, prompt, this.zai.resolveModel(model));
+  rawPrompt(role: AgentRole, prompt: string, onStream?: StreamHook): Promise<string> {
+    const configuredModel = this.models[role] ?? "";
+    if (configuredModel.startsWith("zai:")) {
+      return this.zai.rawPrompt(role, prompt, this.zai.resolveModel(configuredModel), onStream);
     }
-    if (model.startsWith("anthropic-mediated:")) {
-      return this.zai.rawPrompt(role, prompt, this.resolveAnthropicMediatedModel(model));
+    if (configuredModel.startsWith("anthropic-mediated:")) {
+      return this.zai.rawPrompt(role, prompt, this.resolveAnthropicMediatedModel(configuredModel), onStream);
     }
-    return this.ollama.rawPrompt(role, prompt);
+    return this.ollama.rawPrompt(role, prompt, onStream);
   }
 
   getGoalDecomposition(prompt: string): Promise<GoalDecomposition> {
@@ -748,7 +899,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       return this.qwen.runEpicDecoder({ role: "epicDecoder", ...input });
     }
     if (configuredModel.startsWith("zai:")) {
-      return this.zai.runEpicDecoder({ role: "epicDecoder", ...input });
+      return this.zai.runEpicDecoder({ role: "epicDecoder", modelOverride: configuredModel, ...input });
     }
     if (configuredModel.startsWith("anthropic-mediated:")) {
       const model = this.resolveHarnessModel("epicDecoder");
@@ -814,7 +965,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       return this.codex.runEpicReviewer({ role: "epicReviewer", ...input });
     }
     if (configuredModel.startsWith("zai:")) {
-      return this.zai.runEpicReviewer({ role: "epicReviewer", ...input });
+      return this.zai.runEpicReviewer({ role: "epicReviewer", modelOverride: configuredModel, ...input });
     }
     if (configuredModel.startsWith("anthropic-mediated:")) {
       const model = this.resolveHarnessModel("epicReviewer");
@@ -857,6 +1008,59 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     if (isOllama) markModelLoaded(model);
 
     return validateGoalReview(parseJsonText(result.text));
+  }
+
+  runTicketHardener(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    epicId?: string | null;
+    onStream?: StreamHook;
+  }): Promise<ModelHardenedTicketResult> {
+    return this.ollama.runTicketHardener(input);
+  }
+
+  runDecompositionJudge(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    epicId?: string | null;
+    onStream?: StreamHook;
+  }): Promise<ModelDecompositionJudgement> {
+    return this.ollama.runDecompositionJudge(input);
+  }
+
+  async runTicketRepair(input: {
+    cwd: string;
+    prompt: string;
+    runId?: string | null;
+    epicId?: string | null;
+    onStream?: StreamHook;
+  }): Promise<ModelRepairResult> {
+    const model = this.resolveHarnessModel("ticketRepair");
+    input.onStream?.({
+      agentRole: "ticketRepair",
+      source: "orchestrator",
+      streamKind: "status",
+      content: "Repairing rejected tickets via mediated agent harness...",
+      runId: input.runId,
+      epicId: input.epicId,
+      sequence: 0,
+    });
+
+    const toolContext = this.buildToolContext(input.cwd, "ticketRepair", undefined, undefined, input.runId ?? undefined);
+    const harness = new MediatedAgentHarness(this.buildHarnessConfig("ticketRepair", model, toolContext));
+    const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
+    if (isOllama) await ensureModelLoaded(model);
+    const result = await harness.run("ticketRepair", input.prompt, {
+      maxIterations: 40,
+      timeoutMs: 600_000,
+      toolMode: this.resolveToolMode(model),
+      onEvent: this.buildHarnessEventHandler("ticketRepair", model, input),
+    });
+    if (isOllama) markModelLoaded(model);
+
+    return validateModelRepairResult(parseJsonText(result.text));
   }
 
   async runEpicDecoderOpenCode(input: {

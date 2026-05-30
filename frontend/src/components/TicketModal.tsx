@@ -25,6 +25,14 @@ export function TicketModal(props: {
   onForceRerunInPlace: () => void;
   onRerunDirect: () => void;
   onForceRescue: () => void;
+  onUpdate: (input: {
+    title: string;
+    description: string;
+    acceptanceCriteria: string[];
+    dependencies: string[];
+    allowedPaths: string[];
+    priority: string;
+  }) => Promise<void>;
   onDelete: () => void;
   actionBusy: boolean;
 }) {
@@ -37,10 +45,27 @@ export function TicketModal(props: {
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [expandedDiffFiles, setExpandedDiffFiles] = useState<Record<string, boolean>>({});
+  const [isEditing, setIsEditing] = useState(false);
+  const [draftTitle, setDraftTitle] = useState(props.ticket.title);
+  const [draftDescription, setDraftDescription] = useState(props.ticket.description);
+  const [draftAcceptanceCriteria, setDraftAcceptanceCriteria] = useState(props.ticket.acceptanceCriteria.join("\n"));
+  const [draftDependencies, setDraftDependencies] = useState(props.ticket.dependencies.join("\n"));
+  const [draftAllowedPaths, setDraftAllowedPaths] = useState(props.ticket.allowedPaths.join("\n"));
+  const [draftPriority, setDraftPriority] = useState(props.ticket.priority);
 
   useEffect(() => {
     feedEndRef.current?.scrollIntoView({ behavior: "instant" });
   }, [ticketEvents.length]);
+
+  useEffect(() => {
+    setIsEditing(false);
+    setDraftTitle(props.ticket.title);
+    setDraftDescription(props.ticket.description);
+    setDraftAcceptanceCriteria(props.ticket.acceptanceCriteria.join("\n"));
+    setDraftDependencies(props.ticket.dependencies.join("\n"));
+    setDraftAllowedPaths(props.ticket.allowedPaths.join("\n"));
+    setDraftPriority(props.ticket.priority);
+  }, [props.ticket]);
 
   useEffect(() => {
     let cancelled = false;
@@ -84,6 +109,34 @@ export function TicketModal(props: {
     { additions: 0, deletions: 0 }
   );
 
+  const parseLines = (value: string) =>
+    value
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+  const handleSave = async () => {
+    await props.onUpdate({
+      title: draftTitle.trim(),
+      description: draftDescription.trim(),
+      acceptanceCriteria: parseLines(draftAcceptanceCriteria),
+      dependencies: parseLines(draftDependencies),
+      allowedPaths: parseLines(draftAllowedPaths),
+      priority: draftPriority,
+    });
+    setIsEditing(false);
+  };
+
+  const handleCancelEdit = () => {
+    setIsEditing(false);
+    setDraftTitle(props.ticket.title);
+    setDraftDescription(props.ticket.description);
+    setDraftAcceptanceCriteria(props.ticket.acceptanceCriteria.join("\n"));
+    setDraftDependencies(props.ticket.dependencies.join("\n"));
+    setDraftAllowedPaths(props.ticket.allowedPaths.join("\n"));
+    setDraftPriority(props.ticket.priority);
+  };
+
   return (
     <div className="modal-backdrop" onClick={props.onClose}>
       <div className="modal ticket-modal" onClick={(e) => e.stopPropagation()}>
@@ -113,7 +166,74 @@ export function TicketModal(props: {
               )}
             </div>
 
-            {props.ticket.description ? (
+            {isEditing ? (
+              <div className="ticket-edit-card">
+                <label className="ticket-edit-field">
+                  <span className="detail-label">Title</span>
+                  <input
+                    className="ticket-edit-input"
+                    value={draftTitle}
+                    onChange={(e) => setDraftTitle(e.target.value)}
+                    disabled={props.actionBusy}
+                  />
+                </label>
+                <label className="ticket-edit-field">
+                  <span className="detail-label">Priority</span>
+                  <select
+                    className="ticket-edit-input"
+                    value={draftPriority}
+                    onChange={(e) => setDraftPriority(e.target.value)}
+                    disabled={props.actionBusy}
+                  >
+                    <option value="high">high</option>
+                    <option value="medium">medium</option>
+                    <option value="low">low</option>
+                  </select>
+                </label>
+                <label className="ticket-edit-field">
+                  <span className="detail-label">Description</span>
+                  <textarea
+                    className="ticket-edit-textarea"
+                    value={draftDescription}
+                    onChange={(e) => setDraftDescription(e.target.value)}
+                    disabled={props.actionBusy}
+                    rows={6}
+                  />
+                </label>
+                <label className="ticket-edit-field">
+                  <span className="detail-label">Acceptance Criteria</span>
+                  <textarea
+                    className="ticket-edit-textarea"
+                    value={draftAcceptanceCriteria}
+                    onChange={(e) => setDraftAcceptanceCriteria(e.target.value)}
+                    disabled={props.actionBusy}
+                    rows={5}
+                  />
+                </label>
+                <label className="ticket-edit-field">
+                  <span className="detail-label">Dependencies</span>
+                  <textarea
+                    className="ticket-edit-textarea"
+                    value={draftDependencies}
+                    onChange={(e) => setDraftDependencies(e.target.value)}
+                    disabled={props.actionBusy}
+                    rows={4}
+                  />
+                </label>
+                <label className="ticket-edit-field">
+                  <span className="detail-label">Allowed Paths</span>
+                  <textarea
+                    className="ticket-edit-textarea ticket-edit-mono"
+                    value={draftAllowedPaths}
+                    onChange={(e) => setDraftAllowedPaths(e.target.value)}
+                    disabled={props.actionBusy}
+                    rows={4}
+                  />
+                </label>
+              </div>
+            ) : null}
+
+            {!isEditing && props.ticket.description ? (
               <div className="ticket-detail-message">
                 <span className="detail-label">Description</span>
                 <div className="plan-md-content">
@@ -158,6 +278,22 @@ export function TicketModal(props: {
                 <span className="detail-value">
                   {props.ticket.dependencies.length > 0
                     ? props.ticket.dependencies.map((d) => d.split("__").pop()).join(", ")
+                    : "none"}
+                </span>
+              </div>
+              <div className="detail-section">
+                <span className="detail-label">Allowed Paths</span>
+                <span className="detail-value">
+                  {props.ticket.allowedPaths.length > 0
+                    ? props.ticket.allowedPaths.join(", ")
+                    : "none"}
+                </span>
+              </div>
+              <div className="detail-section detail-section-wide">
+                <span className="detail-label">Acceptance Criteria</span>
+                <span className="detail-value detail-value-list">
+                  {props.ticket.acceptanceCriteria.length > 0
+                    ? props.ticket.acceptanceCriteria.join("\n")
                     : "none"}
                 </span>
               </div>
@@ -277,6 +413,24 @@ export function TicketModal(props: {
           </div>
         </div>
         <div className="modal-footer">
+          {isEditing ? (
+            <>
+              <button className="btn btn-modal-cancel" onClick={handleCancelEdit} disabled={props.actionBusy}>
+                Cancel Edit
+              </button>
+              <button
+                className="btn btn-modal-save"
+                onClick={handleSave}
+                disabled={props.actionBusy || !draftTitle.trim() || !draftDescription.trim()}
+              >
+                Save Ticket
+              </button>
+            </>
+          ) : (
+            <button className="btn btn-modal-edit" onClick={() => setIsEditing(true)} disabled={props.actionBusy}>
+              Edit Ticket
+            </button>
+          )}
           <button className="btn btn-modal-cancel" onClick={props.onCancel} disabled={props.actionBusy}>
             ⏹ Stop
           </button>

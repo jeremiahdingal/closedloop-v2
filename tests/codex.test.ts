@@ -7,6 +7,18 @@ import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import { CodexLaunchError, CodexRunner } from "../src/orchestration/codex.ts";
 
+let previousConstraintFlag: string | undefined;
+
+test.beforeEach(() => {
+  previousConstraintFlag = process.env.DISABLE_TARGET_DIR_CONSTRAINT;
+  process.env.DISABLE_TARGET_DIR_CONSTRAINT = "1";
+});
+
+test.afterEach(() => {
+  if (previousConstraintFlag === undefined) delete process.env.DISABLE_TARGET_DIR_CONSTRAINT;
+  else process.env.DISABLE_TARGET_DIR_CONSTRAINT = previousConstraintFlag;
+});
+
 function createSpawnStub(
   assertLaunch: (command: string, args: string[], options: Record<string, unknown>, stdin: PassThrough) => void,
   output = '<FINAL_JSON>{"summary":"ok","tickets":[]}</FINAL_JSON>'

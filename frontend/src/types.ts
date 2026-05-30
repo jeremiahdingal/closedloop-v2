@@ -36,14 +36,17 @@ export type Ticket = {
   epicId: string;
   title: string;
   description: string;
+  acceptanceCriteria: string[];
   status: string;
   currentNode: string | null;
   lastMessage: string | null;
   priority: string;
   dependencies: string[];
+  allowedPaths: string[];
   currentRunId: string | null;
   diffFiles?: { path: string; additions: number; deletions: number }[];
   prUrl?: string | null;
+  updatedAt?: string;
 };
 
 export type Run = {
@@ -93,6 +96,73 @@ export type AgentModelInfo = {
 };
 
 export type AgentModelsConfig = Record<string, AgentModelInfo>;
+
+export type PlannerProfile = "small-local" | "medium-local" | "remote-strong";
+
+export type KnowledgePipelineConfig = {
+  enableKnowledgePipeline: boolean;
+  enableRemoteKnowledgeRefresh: boolean;
+  enableModelBackedHardener: boolean;
+  enableModelBackedJudge: boolean;
+  enableModelBackedRepair: boolean;
+  strictModelPlanningStages: boolean;
+  remoteOverrideForMissingKnowledge: boolean;
+  allowDeterministicPlanningFallback: boolean;
+  approvedEpicRefreshInterval: number;
+  remoteKnowledgeModel: string;
+  plannerProfile: PlannerProfile;
+  requireFreshKnowledgeForLargeEpics: boolean;
+  maxKnowledgeArtifactSize: number;
+  maxSelectedKnowledgeTokens: number;
+  refreshOnPlannerFailureThreshold: number;
+  refreshOnUnknownDomain: boolean;
+  keepKnowledgeHistoryCount: number;
+  allowRawRepoContext: boolean;
+  requireTicketHardener: boolean;
+  requireDecompositionJudge: boolean;
+  smallLocalPlannerTargetTokens: number;
+  mediumLocalPlannerTargetTokens: number;
+  remoteStrongPlannerTargetTokens: number;
+  repairAttemptLimit: number;
+};
+
+export type KnowledgeStatus = {
+  available: boolean;
+  valid: boolean;
+  currentPath: string | null;
+  version: string | null;
+  missingArtifacts: string[];
+  invalidArtifacts: string[];
+  warnings: string[];
+};
+
+export type KnowledgeFreshnessStatus = {
+  state: "fresh" | "stale" | "critical_stale" | "missing";
+  refreshRequired: boolean;
+  reasonCodes: string[];
+  lastRefreshCommit: string | null;
+  currentCommit: string | null;
+  approvedEpicsSinceRefresh: number;
+  warnings: string[];
+};
+
+export type KnowledgeRefreshState = {
+  approvedEpicsSinceKnowledgeRefresh?: number;
+  lastRefreshAt?: string;
+  lastRefreshCommit?: string | null;
+  lastRefreshReason?: string;
+  refreshStatus?: "idle" | "queued" | "running" | "completed" | "failed" | "skipped";
+  lastFailureReason?: string | null;
+  plannerFailureCount?: number;
+  unknownDomainCount?: number;
+};
+
+export type KnowledgeStatusResponse = {
+  repoRoot: string;
+  status: KnowledgeStatus;
+  freshness: KnowledgeFreshnessStatus;
+  refreshState: KnowledgeRefreshState | null;
+};
 
 export type OllamaPsModel = {
   name: string;
@@ -161,6 +231,26 @@ export type AgentStreamStatus = "idle" | "running" | "stalled" | "completed";
 export type GoalDecomposition = {
   summary: string;
   clarificationQuestions?: string[];
+  planningMetadata?: {
+    plannerProfile?: PlannerProfile;
+    knowledgebaseVersionUsed?: string | null;
+    knowledgeFreshnessState?: string;
+    fallbackState?: string;
+    usedRemoteFallbackForPlanning?: boolean;
+    judgePassed?: boolean;
+    judgeConfidence?: number;
+    hardenerModel?: string | null;
+    judgeModel?: string | null;
+    repairModel?: string | null;
+    hardenerMode?: "llm" | "deterministic";
+    judgeMode?: "llm" | "deterministic";
+    repairMode?: "llm" | "deterministic";
+    warnings?: string[];
+    selectedKnowledgeSections?: string[];
+    includedArtifactKinds?: string[];
+    contextBudgetUsed?: number;
+    contextBudgetLimit?: number;
+  };
   tickets: Array<{
     id: string;
     title: string;

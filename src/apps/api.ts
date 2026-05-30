@@ -5,7 +5,14 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { bootstrap } from "./bootstrap.ts";
-import { loadConfig, readWorkspaceConfig, updateAgentModel, updateWorkspaceConfig } from "../config.ts";
+import {
+  loadConfig,
+  readWorkspaceConfig,
+  resolveConstrainedTargetDir,
+  resolveKnowledgePipelineConfig,
+  updateAgentModel,
+  updateWorkspaceConfig
+} from "../config.ts";
 import type { 
   AgentRole, 
   AgentStreamPayload, 
@@ -14,7 +21,7 @@ import type {
   DirectChatMessageRecord 
 } from "../types.ts";
 import { runPlanDecoder, extractPlanFromStream, planNeedsClarification } from "../orchestration/plan-runner.ts";
-import { randomId } from "../utils.ts";
+import { randomId, safeJoin } from "../utils.ts";
 import { git } from "../bridge/git.ts";
 import { runMediatedLoop, resolveModelContextWindow } from "../mediated-agent-harness/loop.ts";
 import { buildToolingContext } from "../rag/context-builder.ts";
@@ -24,6 +31,10 @@ import type { ChatMessage } from "../mediated-agent-harness/types.ts";
 import { getOllamaPsSnapshot } from "./ollama-ps.ts";
 import { resolveAgentModelInfo } from "../runtime-profile.ts";
 import { getEpicMergeStatus, mergeEpicToMain } from "./epic-merge.ts";
+import { KnowledgebaseService } from "../orchestration/knowledge/knowledgebase.ts";
+import { selectKnowledgeSlice } from "../orchestration/knowledge/selector.ts";
+import { hardenTickets } from "../orchestration/knowledge/hardener.ts";
+import { judgeDecomposition } from "../orchestration/knowledge/judge.ts";
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
@@ -236,6 +247,35 @@ type PlanSession = {
 
 const planSessions = new Map<string, PlanSession>();
 const chatEmitters = new Map<string, EventEmitter>();
+const knowledgebase = new KnowledgebaseService(loadConfig());
+
+async function validatePlanForApproval(session: PlanSession, workspaceConfig = readWorkspaceConfig()) {
+  const knowledgeConfig = resolveKnowledgePipelineConfig(workspaceConfig);
+  const freshness = await knowledgebase.getFreshness(session.targetDir, knowledgeConfig);
+  const snapshot = await knowledgebase.loadCurrent(session.targetDir);
+  const selectedKnowledge = selectKnowledgeSlice({
+    epic: {
+      id: session.id,
+      title: session.epicTitle,
+      goalText: session.epicDescription,
+      targetDir: session.targetDir,
+      targetBranch: session.targetBranch,
+      status: "planning",
+      pausedFromStatus: null,
+      scheduledDate: null,
+      assetPaths: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+    snapshot,
+    freshness,
+    plannerProfile: knowledgeConfig.plannerProfile,
+    maxSelectedKnowledgeTokens: knowledgeConfig.maxSelectedKnowledgeTokens,
+  });
+  const hardened = hardenTickets(session.latestPlan?.tickets ?? [], selectedKnowledge);
+  const judgement = judgeDecomposition(hardened, knowledgeConfig.plannerProfile);
+  return { knowledgeConfig, selectedKnowledge, hardened, judgement };
+}
 
 async function runDirectChat(sessionId: string, db: any) {
   const session = db.getDirectChatSession(sessionId);
@@ -262,7 +302,7 @@ async function runDirectChat(sessionId: string, db: any) {
 
     const chatMessages = context.messages;
 
-    const repoRoot = session.targetDir;
+    const repoRoot = resolveConstrainedTargetDir(session.targetDir);
     if (session.branchName) {
       await git(repoRoot, ["checkout", "-b", session.branchName]).catch(() => git(repoRoot, ["checkout", session.branchName])).catch(() => {});
     }
@@ -322,14 +362,14 @@ async function runDirectChat(sessionId: string, db: any) {
       readFiles: async (paths: string[]) => {
         const res: Record<string, string> = {};
         for (const p of paths) {
-          const full = path.resolve(repoRoot, p);
+          const full = safeJoin(repoRoot, p);
           res[p] = await readFile(full, "utf8").catch(() => "");
         }
         return res;
       },
       writeFiles: async (files: { path: string; content: string }[]) => {
         for (const f of files) {
-          const full = path.resolve(repoRoot, f.path);
+          const full = safeJoin(repoRoot, f.path);
           await writeFile(full, f.content);
         }
       },
@@ -485,6 +525,7 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
   epicDecoder: [
     { id: "gemini-cli", label: "Gemini CLI", description: "Workspace-aware local Gemini CLI execution" },
     { id: "qwen-cli", label: "Qwen CLI", description: "Workspace-aware local Qwen CLI execution" },
+    { id: "mediated:batiai/qwen3.6-27b:iq3", label: "Mediated (BatiAI Qwen3.6-27B iq3)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:qwen3-coder:30b", label: "Mediated (qwen3-coder:30b)", description: "Local tool execution via Ollama + harness" },
     { id: "mediated:glm-4.7-flash:q4_K_M", label: "Mediated (glm-4.7-flash)", description: "Local tool execution via Ollama + harness" },
@@ -506,6 +547,24 @@ const SWITCHABLE_ADAPTORS: Record<string, ModelAdapterOption[]> = {
     { id: "mediated:ibm/granite4.1:30b-q3_K_M", label: "Mediated (Granite 4.1 30B)", description: "Local tool execution via Ollama + harness" },
     { id: "opencode:qwen3-coder:30b", label: "OpenCode (qwen3-coder:30b)", description: "Workspace-aware, bash + file tools via OpenCode CLI" },
     { id: "codex-cli", label: "Codex CLI", description: "Workspace-aware, bash + file tools via ChatGPT subscription" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
+  ],
+  ticketHardener: [
+    { id: "qwen3.5:9b", label: "Ollama (qwen3.5:9b)", description: "Direct Ollama JSON call for compact ticket hardening" },
+    { id: "mediated:qwen3.5:9b", label: "Mediated (qwen3.5:9b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:batiai/qwen3.6-27b:iq3", label: "Mediated (BatiAI Qwen3.6-27B iq3)", description: "Local tool execution via Ollama + harness" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
+  ],
+  decompositionJudge: [
+    { id: "mediated:batiai/qwen3.6-27b:iq3", label: "Mediated (BatiAI Qwen3.6-27B iq3)", description: "Local tool execution via Ollama + harness" },
+    { id: "qwen3.5:9b", label: "Ollama (qwen3.5:9b)", description: "Direct Ollama JSON call - no workspace tools" },
+    { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
+    { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
+  ],
+  ticketRepair: [
+    { id: "mediated:batiai/qwen3.6-27b:iq3", label: "Mediated (BatiAI Qwen3.6-27B iq3)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)", description: "Local tool execution via Ollama + harness" },
+    { id: "mediated:qwen3.5:9b", label: "Mediated (qwen3.5:9b)", description: "Local tool execution via Ollama + harness" },
     { id: "zai:glm-5.1", label: "Z AI (glm-5.1)", description: "Cloud AI via Z.ai Anthropic-compatible API" },
   ],
   reviewer: [
@@ -681,7 +740,7 @@ function inferModelLabel(rawModel: string): string {
 }
 
 function isAgentRole(value: string): value is AgentRole {
-  return ["epicDecoder", "builder", "reviewer", "tester", "epicReviewer", "playWriter", "playTester", "doctor", "system", "coder"].includes(value);
+  return ["epicDecoder", "ticketHardener", "decompositionJudge", "ticketRepair", "builder", "reviewer", "tester", "epicReviewer", "playWriter", "playTester", "doctor", "system", "coder"].includes(value);
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -791,6 +850,59 @@ async function main() {
         return json(res, 200, { epics, total, limit, offset });
       }
       if (url.pathname === "/api/tickets" && req.method === "GET") return json(res, 200, db.listTickets(url.searchParams.get("epicId") || undefined));
+      const updateTicketMatch = /^\/api\/tickets\/([^/]+)$/.exec(url.pathname);
+      if (updateTicketMatch && req.method === "PUT") {
+        const ticketId = decodeURIComponent(updateTicketMatch[1]);
+        const current = db.getTicket(ticketId);
+        if (!current) return json(res, 404, { error: "ticket_not_found" });
+
+        const body = await readBody(req);
+        const title = typeof body.title === "string" ? body.title.trim() : current.title;
+        const description = typeof body.description === "string" ? body.description.trim() : current.description;
+        const acceptanceCriteria = Array.isArray(body.acceptanceCriteria)
+          ? body.acceptanceCriteria.map((item: unknown) => String(item).trim()).filter(Boolean)
+          : current.acceptanceCriteria;
+        const dependencies = Array.isArray(body.dependencies)
+          ? body.dependencies.map((item: unknown) => String(item).trim()).filter(Boolean)
+          : current.dependencies;
+        const allowedPaths = Array.isArray(body.allowedPaths)
+          ? body.allowedPaths.map((item: unknown) => String(item).trim()).filter(Boolean)
+          : current.allowedPaths;
+        const priority = body.priority === "high" || body.priority === "medium" || body.priority === "low"
+          ? body.priority
+          : current.priority;
+
+        if (!title) return json(res, 400, { error: "invalid_title", message: "Ticket title is required." });
+        if (!description) return json(res, 400, { error: "invalid_description", message: "Ticket description is required." });
+
+        const updated = db.updateTicketDetails({
+          ticketId,
+          title,
+          description,
+          acceptanceCriteria,
+          dependencies,
+          allowedPaths,
+          priority
+        });
+
+        db.recordEvent({
+          aggregateType: "ticket",
+          aggregateId: ticketId,
+          runId: null,
+          ticketId,
+          kind: "ticket_updated",
+          message: `Ticket details updated for ${ticketId}.`,
+          payload: {
+            title: updated.title,
+            priority: updated.priority,
+            dependencyCount: updated.dependencies.length,
+            allowedPathCount: updated.allowedPaths.length,
+            acceptanceCriteriaCount: updated.acceptanceCriteria.length
+          }
+        });
+
+        return json(res, 200, updated);
+      }
       if (url.pathname === "/api/runs" && req.method === "GET") return json(res, 200, db.listRuns());
       if (url.pathname === "/api/jobs" && req.method === "GET") return json(res, 200, db.listJobs());
       if (url.pathname === "/api/events" && req.method === "GET") return json(res, 200, db.listEvents());
@@ -856,7 +968,7 @@ async function main() {
           const { fields, files } = await readMultipartBody(req);
           title = String(fields.title || "Untitled epic");
           goalText = String(fields.goalText || "");
-          targetDir = String(fields.targetDir || process.cwd());
+          targetDir = resolveConstrainedTargetDir(String(fields.targetDir || process.cwd()));
           targetBranch = fields.targetBranch || undefined;
           scheduledDate = fields.scheduledDate || null;
           uploadedFiles = files;
@@ -864,7 +976,7 @@ async function main() {
           const body = await readBody(req);
           title = String(body.title || "Untitled epic");
           goalText = String(body.goalText || "");
-          targetDir = String(body.targetDir || process.cwd());
+          targetDir = resolveConstrainedTargetDir(String(body.targetDir || process.cwd()));
           targetBranch = body.targetBranch ? String(body.targetBranch) : undefined;
           scheduledDate = body.scheduledDate || null;
         }
@@ -1434,16 +1546,70 @@ async function main() {
       }
       if (url.pathname === "/api/config" && req.method === "GET") {
         const wsConfig = readWorkspaceConfig();
-        const repoRoot = typeof wsConfig.targetDir === "string" ? wsConfig.targetDir : process.cwd();
+        const knowledgeConfig = resolveKnowledgePipelineConfig(wsConfig);
+        const repoRoot = resolveConstrainedTargetDir(
+          typeof wsConfig.targetDir === "string" ? wsConfig.targetDir : process.cwd(),
+          wsConfig
+        );
         const currentBranch = await git(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
           .then(r => r.stdout.trim())
           .catch(() => null);
         return json(res, 200, { 
           targetDir: repoRoot,
-          ...wsConfig, 
+          ...wsConfig,
+          epicDecoderKnowledge: knowledgeConfig,
           currentBranch, 
           models: getAgentModelsConfig() 
         });
+      }
+      if (url.pathname === "/api/knowledge/status" && req.method === "GET") {
+        const workspaceConfig = readWorkspaceConfig();
+        const repoRoot = resolveConstrainedTargetDir(
+          typeof url.searchParams.get("repoRoot") === "string" && url.searchParams.get("repoRoot")
+            ? String(url.searchParams.get("repoRoot"))
+            : typeof workspaceConfig.targetDir === "string"
+              ? workspaceConfig.targetDir
+              : process.cwd(),
+          workspaceConfig,
+        );
+        const knowledgeConfig = resolveKnowledgePipelineConfig(workspaceConfig);
+        const [status, freshness, refreshState] = await Promise.all([
+          knowledgebase.getStatus(repoRoot),
+          knowledgebase.getFreshness(repoRoot, knowledgeConfig),
+          knowledgebase.readRefreshState(repoRoot),
+        ]);
+        return json(res, 200, { repoRoot, status, freshness, refreshState });
+      }
+      if (url.pathname === "/api/knowledge/refresh" && req.method === "POST") {
+        const workspaceConfig = readWorkspaceConfig();
+        const body = await readBody(req);
+        const repoRoot = resolveConstrainedTargetDir(
+          typeof body.repoRoot === "string" && body.repoRoot
+            ? body.repoRoot
+            : typeof workspaceConfig.targetDir === "string"
+              ? workspaceConfig.targetDir
+              : process.cwd(),
+          workspaceConfig,
+        );
+        const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : "manual_refresh";
+        const existing = db.listJobRecords().find((job: any) =>
+          job.kind === "run_knowledge_refresh"
+          && (job.status === "queued" || job.status === "running")
+          && String((job.payload ?? {}).repoRoot ?? "") === repoRoot,
+        );
+        if (existing && !body.force) {
+          return json(res, 200, { ok: true, queued: false, skipped: true, reason: "already_queued", repoRoot, jobId: existing.id });
+        }
+        const jobId = db.enqueueJob("run_knowledge_refresh", { repoRoot, reason, requestedBy: "api_manual_refresh" });
+        await knowledgebase.markRefreshState(repoRoot, { refreshStatus: "queued", lastRefreshReason: reason });
+        db.recordEvent({
+          aggregateType: "epic",
+          aggregateId: repoRoot,
+          kind: "knowledge_refresh_queued",
+          message: `Knowledge refresh queued for ${repoRoot}.`,
+          payload: { repoRoot, reason, jobId },
+        });
+        return json(res, 202, { ok: true, queued: true, repoRoot, reason, jobId });
       }
       if (url.pathname === "/api/models" && req.method === "GET") {
         return json(res, 200, getAgentModelsConfig());
@@ -1536,7 +1702,7 @@ async function main() {
           const body = await readBody(req);
           const epicTitle = String(body.epicTitle || "Untitled Plan");
           const epicDescription = String(body.epicDescription || "");
-          const targetDir = String(body.targetDir || process.cwd());
+          const targetDir = resolveConstrainedTargetDir(String(body.targetDir || process.cwd()));
 
           const targetBranch = body.targetBranch ? String(body.targetBranch) : null;
           const sessionId = randomId("plan");
@@ -1641,10 +1807,51 @@ async function main() {
             message: "The planner has not produced any tickets yet."
           });
         }
+        const { selectedKnowledge, hardened, judgement } = await validatePlanForApproval(session);
+        if (!judgement.passed) {
+          return json(res, 409, {
+            error: "plan_not_builder_ready",
+            message: "The approved plan still contains weak tickets.",
+            rejectionReasons: judgement.rejectionReasons,
+            repairSuggestions: judgement.repairSuggestions,
+          });
+        }
 
         const approveBody = await readBody(req);
         // Allow approve-time override; fall back to branch set at session creation
         const resolvedBranch = (approveBody.targetBranch ? String(approveBody.targetBranch) : null) ?? session.targetBranch ?? undefined;
+        session.latestPlan = {
+          ...session.latestPlan,
+          tickets: hardened,
+          planningMetadata: {
+            ...(session.latestPlan.planningMetadata ?? {
+              pipelineEnabled: true,
+              pipelineVersion: "v1",
+              remoteOverrideEnabled: readWorkspaceConfig().remoteOverrideEnabled === true,
+              plannerProfile: selectedKnowledge.plannerProfile,
+              knowledgebaseVersionUsed: selectedKnowledge.knowledgeVersion,
+              knowledgeFreshnessState: selectedKnowledge.freshnessState,
+              fallbackState: selectedKnowledge.fallbackMode,
+              selectedKnowledgeSections: selectedKnowledge.sections.map((section) => section.title),
+              includedArtifactKinds: selectedKnowledge.includedArtifactKinds,
+              excludedArtifactKinds: selectedKnowledge.excludedArtifactKinds,
+              contextBudgetUsed: selectedKnowledge.estimatedTokens,
+              contextBudgetLimit: selectedKnowledge.budgetLimit,
+              ticketQualityScores: {},
+              judgePassed: true,
+              judgeConfidence: 100,
+              rejectedTicketCount: 0,
+              repairAttempts: 0,
+              repairHistory: [],
+              warnings: selectedKnowledge.warnings,
+              refreshRecommendation: null,
+            }),
+            ticketQualityScores: judgement.perTicketScores,
+            judgePassed: judgement.passed,
+            judgeConfidence: judgement.overallConfidence,
+            rejectedTicketCount: judgement.rejectedTickets.length,
+          },
+        };
 
         const epic = GoalRunner.createEpic(db, {
           title: session.epicTitle,
@@ -1679,7 +1886,7 @@ async function main() {
         const session = db.createDirectChatSession({
           id: randomId("chat"),
           title: String(body.title || "New Chat"),
-          targetDir: String(body.targetDir || process.cwd()),
+          targetDir: resolveConstrainedTargetDir(String(body.targetDir || process.cwd())),
           branchName: String(body.branchName || "main"),
           model: String(body.model || "")
         });

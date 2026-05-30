@@ -11,7 +11,10 @@ import {
   Dashboard,
   Epic,
   EpicMergeStatus,
+  KnowledgePipelineConfig,
+  KnowledgeStatusResponse,
   OllamaPsSnapshot,
+  PlannerProfile,
   Run,
   Ticket,
 } from "./types.ts";
@@ -41,10 +44,21 @@ import { GameModal } from "./components/GameModal.tsx";
 import { OllamaPsPanel } from "./components/OllamaPsPanel.tsx";
 
 const TICKET_MODAL_EVENT_LIMIT = 500;
+const REMOTE_KNOWLEDGE_MODEL_OPTIONS = [
+  { id: "zai:glm-5.1", label: "Z AI (glm-5.1)" },
+  { id: "codex-cli", label: "Codex CLI" },
+  { id: "anthropic-mediated:glm-4.7", label: "Anthropic-Mediated (glm-4.7)" },
+  { id: "mediated:batiai/qwen3.6-27b:iq3", label: "Mediated (BatiAI Qwen3.6-27B iq3)" },
+  { id: "mediated:qwen3.5:27b", label: "Mediated (qwen3.5:27b)" },
+  { id: "qwen3.5:9b", label: "Ollama (qwen3.5:9b)" },
+] as const;
 
 export function App() {
   const [data, setData] = useState<Dashboard>({ epics: [], tickets: [], runs: [], agentEvents: [] });
   const [modelsConfig, setModelsConfig] = useState<AgentModelsConfig>({});
+  const [knowledgeConfig, setKnowledgeConfig] = useState<KnowledgePipelineConfig | null>(null);
+  const [knowledgeDraft, setKnowledgeDraft] = useState<KnowledgePipelineConfig | null>(null);
+  const [knowledgeStatus, setKnowledgeStatus] = useState<KnowledgeStatusResponse | null>(null);
   const [ollamaPs, setOllamaPs] = useState<OllamaPsSnapshot>({ ok: false, status: "idle", models: [] });
   const [modelOverrides, setModelOverrides] = useState<Record<string, string>>({});
   const [remoteOverrideEnabled, setRemoteOverrideEnabled] = useState(false);
@@ -94,25 +108,44 @@ export function App() {
     }
   }
 
+  async function refreshWorkspaceConfig() {
+    const cfg = await fetchJson<Record<string, unknown>>("/api/config");
+    if (typeof cfg.targetDir === "string") setTargetDir(cfg.targetDir);
+    if (typeof cfg.currentBranch === "string" && cfg.currentBranch) {
+      setTargetBranch(cfg.currentBranch);
+    }
+    if (typeof cfg.remoteOverrideEnabled === "boolean") {
+      setRemoteOverrideEnabled(cfg.remoteOverrideEnabled);
+    }
+    if (cfg.models && typeof cfg.models === "object" && !Array.isArray(cfg.models)) {
+      setModelsConfig(cfg.models as AgentModelsConfig);
+    }
+    if (cfg.epicDecoderKnowledge && typeof cfg.epicDecoderKnowledge === "object" && !Array.isArray(cfg.epicDecoderKnowledge)) {
+      const nextKnowledgeConfig = cfg.epicDecoderKnowledge as KnowledgePipelineConfig;
+      setKnowledgeConfig(nextKnowledgeConfig);
+      setKnowledgeDraft(nextKnowledgeConfig);
+    }
+  }
+
+  async function refreshKnowledgeStatus() {
+    try {
+      const nextStatus = await fetchJson<KnowledgeStatusResponse>("/api/knowledge/status");
+      setKnowledgeStatus(nextStatus);
+    } catch {
+      // Keep the previous snapshot visible if the endpoint is temporarily unavailable.
+    }
+  }
+
   useEffect(() => {
-    fetchJson<Record<string, unknown>>("/api/config")
-      .then((cfg) => {
-        if (typeof cfg.targetDir === "string") setTargetDir(cfg.targetDir);
-        if (typeof cfg.currentBranch === "string" && cfg.currentBranch)
-          setTargetBranch(cfg.currentBranch);
-        if (typeof cfg.remoteOverrideEnabled === "boolean") setRemoteOverrideEnabled(cfg.remoteOverrideEnabled);
-        if (cfg.models && typeof cfg.models === "object" && !Array.isArray(cfg.models)) {
-          setModelsConfig(cfg.models as AgentModelsConfig);
-        }
-      })
-      .catch(() => {});
+    refreshWorkspaceConfig().catch(() => {});
     void refreshModels();
+    void refreshKnowledgeStatus();
   }, []);
 
   async function refresh() {
     try {
       setLoading(true);
-      const [epicResult, tickets, runs, fetchedAgentEvents, ollamaSnapshot] = await Promise.all([
+      const [epicResult, tickets, runs, fetchedAgentEvents, ollamaSnapshot, nextKnowledgeStatus] = await Promise.all([
         fetchJson<{ epics: Epic[]; total: number }>("/api/epics?limit=" + epicPageSize + "&offset=" + (epicPage * epicPageSize)),
         fetchJson<Ticket[]>("/api/tickets"),
         fetchJson<Run[]>("/api/runs"),
@@ -123,10 +156,12 @@ export function App() {
           models: [],
           error: "Failed to load Ollama process list.",
         })),
+        fetchJson<KnowledgeStatusResponse>("/api/knowledge/status").catch(() => knowledgeStatus),
       ]);
       
       setEpicTotal(epicResult.total);
       setOllamaPs(ollamaSnapshot);
+      if (nextKnowledgeStatus) setKnowledgeStatus(nextKnowledgeStatus);
 
       // Merge fetched events with any SSE-captured events to avoid losing recent ones
       setData((current) => {
@@ -172,6 +207,82 @@ export function App() {
     });
   };
 
+  const knowledgeDraftDirty = useMemo(() => {
+    if (!knowledgeConfig || !knowledgeDraft) return false;
+    return JSON.stringify(knowledgeConfig) !== JSON.stringify(knowledgeDraft);
+  }, [knowledgeConfig, knowledgeDraft]);
+
+  const decoderModelInfo = modelsConfig.epicDecoder;
+  const hardenerModelInfo = modelsConfig.ticketHardener;
+  const judgeModelInfo = modelsConfig.decompositionJudge;
+  const repairModelInfo = modelsConfig.ticketRepair;
+
+  const decoderEffectiveModel = decoderModelInfo?.effectiveModel ?? "unavailable";
+  const hardenerModeLabel = knowledgeDraft?.enableModelBackedHardener
+    ? knowledgeDraft?.strictModelPlanningStages ? "LLM strict" : "LLM preferred"
+    : knowledgeDraft?.allowDeterministicPlanningFallback ? "deterministic fallback" : "disabled";
+  const judgeModeLabel = knowledgeDraft?.enableModelBackedJudge
+    ? knowledgeDraft?.strictModelPlanningStages ? "LLM strict" : "LLM preferred"
+    : knowledgeDraft?.allowDeterministicPlanningFallback ? "deterministic fallback" : "disabled";
+  const repairModeLabel = knowledgeDraft?.enableModelBackedRepair
+    ? knowledgeDraft?.strictModelPlanningStages ? "LLM strict" : "LLM preferred"
+    : knowledgeDraft?.allowDeterministicPlanningFallback ? "deterministic fallback" : "disabled";
+
+  function updateKnowledgeDraft<K extends keyof KnowledgePipelineConfig>(key: K, value: KnowledgePipelineConfig[K]) {
+    setKnowledgeDraft((current) => {
+      if (!current) return current;
+      return { ...current, [key]: value };
+    });
+  }
+
+  function parsePositiveInt(value: string, fallback: number): number {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  }
+
+  async function saveKnowledgeConfig() {
+    if (!knowledgeDraft) return;
+    const toastId = toast.loading("Saving decoder operations...");
+    try {
+      await fetchJson("/api/config", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ epicDecoderKnowledge: knowledgeDraft }),
+      });
+      await refreshWorkspaceConfig();
+      await refreshKnowledgeStatus();
+      toast.success("Decoder operations saved.", { id: toastId });
+    } catch (err) {
+      toast.error(`Failed to save decoder operations: ${(err as Error).message}`, { id: toastId });
+    }
+  }
+
+  async function triggerKnowledgeRefresh(force = false) {
+    const toastId = toast.loading("Queueing knowledge refresh...");
+    try {
+      const response = await fetchJson<{ skipped?: boolean; queued?: boolean; reason?: string }>("/api/knowledge/refresh", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ force }),
+      });
+      await refreshKnowledgeStatus();
+      if (response.skipped) {
+        toast.success("Knowledge refresh already queued.", { id: toastId });
+      } else {
+        toast.success("Knowledge refresh queued.", { id: toastId });
+      }
+    } catch (err) {
+      toast.error(`Failed to queue knowledge refresh: ${(err as Error).message}`, { id: toastId });
+    }
+  }
+
+  function plannerTargetTokens(profile: PlannerProfile | undefined, config: KnowledgePipelineConfig | null): number | null {
+    if (!profile || !config) return null;
+    if (profile === "small-local") return config.smallLocalPlannerTargetTokens;
+    if (profile === "medium-local") return config.mediumLocalPlannerTargetTokens;
+    return config.remoteStrongPlannerTargetTokens;
+  }
+
   const eventsByRole = useMemo(() => {
     const grouped = new Map<string, AgentEvent[]>();
     for (const item of data.agentEvents) {
@@ -191,7 +302,11 @@ export function App() {
   useEffect(() => {
     if (!selectedTicket) return;
     const fresh = data.tickets.find(t => t.id === selectedTicket.id);
-    if (fresh && (fresh.status !== selectedTicket.status || fresh.currentRunId !== selectedTicket.currentRunId)) {
+    if (fresh && (
+      fresh.status !== selectedTicket.status
+      || fresh.currentRunId !== selectedTicket.currentRunId
+      || fresh.updatedAt !== selectedTicket.updatedAt
+    )) {
       setSelectedTicket(fresh);
     }
   }, [data.tickets]);
@@ -295,9 +410,13 @@ export function App() {
     const all = new Set([...fromConfig, ...fromEvents]);
     return [...all].sort((a, b) => {
       const order = [
+        "system",
         "playWriter",
         "playTester",
         "epicDecoder",
+        "ticketHardener",
+        "decompositionJudge",
+        "ticketRepair",
         "explorer",
         "coder",
         "reviewer",
@@ -317,6 +436,23 @@ export function App() {
     const build = agentRoles.filter((r) => !buildAgents.includes(r));
     return { test, build };
   }, [agentRoles]);
+
+  const agentStreamCards = useMemo(
+    () => [
+      ...agentSections.build.map((role) => ({ role, lane: "build" as const })),
+      ...agentSections.test.map((role) => ({ role, lane: "test" as const })),
+    ],
+    [agentSections],
+  );
+
+  const knowledgeRefreshEvents = useMemo(
+    () =>
+      [...data.agentEvents]
+        .filter((event) => Boolean(event.payload?.metadata?.knowledgeRefresh))
+        .slice(-20)
+        .reverse(),
+    [data.agentEvents],
+  );
 
   const agentStatusByRole = useMemo(() => {
     const status = new Map<string, AgentStreamStatus>();
@@ -810,6 +946,37 @@ export function App() {
     }
   }
 
+  async function updateTicketDetails(ticketId: string, input: {
+    title: string;
+    description: string;
+    acceptanceCriteria: string[];
+    dependencies: string[];
+    allowedPaths: string[];
+    priority: string;
+  }) {
+    if (actionBusy) return;
+    const toastId = toast.loading("Saving ticket changes...");
+    try {
+      setActionBusy(ticketId);
+      const updated = await fetchJson<Ticket>(`/api/tickets/${encodeURIComponent(ticketId)}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input),
+      });
+      setData((current) => ({
+        ...current,
+        tickets: current.tickets.map((ticket) => (ticket.id === updated.id ? updated : ticket)),
+      }));
+      setSelectedTicket(updated);
+      toast.success("Ticket updated.", { id: toastId });
+    } catch (err) {
+      setError((err as Error).message);
+      toast.error(`Failed to update ticket: ${(err as Error).message}`, { id: toastId });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
   async function updateAgentModel(role: string, model: string) {
     const current = modelsConfig[role]?.currentModel;
     if (!current || current === model) return;
@@ -826,6 +993,39 @@ export function App() {
     } catch (err) {
       toast.error(`Failed to update ${role}: ${(err as Error).message}`, { id: toastId });
     }
+  }
+
+  function renderDecoderModelField(
+    role: string,
+    label: string,
+    info: AgentModelsConfig[string] | undefined,
+    note: string,
+  ) {
+    const adapters = info?.adapters ?? [];
+    return (
+      <label className="decoder-op-field">
+        <span>{label}</span>
+        <select
+          value={info?.currentModel ?? ""}
+          onChange={(e) => void updateAgentModel(role, e.target.value)}
+          disabled={!info?.switchable || adapters.length === 0}
+        >
+          {adapters.length === 0 ? (
+            <option value="">No adapters</option>
+          ) : (
+            adapters.map((adapter) => (
+              <option key={adapter.id} value={adapter.id}>
+                {adapter.label}
+              </option>
+            ))
+          )}
+        </select>
+        <span className="decoder-op-subtle">
+          Effective: <code>{info?.effectiveModel ?? "unavailable"}</code>
+        </span>
+        <span className="decoder-op-subtle">{note}</span>
+      </label>
+    );
   }
 
   async function mergeEpicToMain(epicId: string) {
@@ -868,6 +1068,8 @@ export function App() {
       } else {
         setRemoteOverrideEnabled(next);
       }
+      await refreshWorkspaceConfig();
+      await refreshKnowledgeStatus();
       toast.success(next ? "Remote Override enabled." : "Remote Override disabled.", { id: toastId });
       void refreshModels();
     } catch (err) {
@@ -995,6 +1197,337 @@ export function App() {
         </div>
       </div>
 
+      <div className="win-panel decoder-ops-panel">
+        <div className="win-titlebar">
+          <div className="win-titlebar-text">
+            <span>⚙️</span>
+            <span>Decoder Ops</span>
+            {knowledgeStatus && (
+              <span className={`filter-badge knowledge-badge state-${knowledgeStatus.freshness.state}`}>
+                {knowledgeStatus.freshness.state}
+              </span>
+            )}
+          </div>
+          <div className="win-titlebar-buttons">
+            <div className="win-btn-box" onClick={() => togglePanel("decoderOps")}>
+              _
+            </div>
+            <div className="win-btn-box">×</div>
+          </div>
+        </div>
+        <div className={`win-content ${collapsedPanels.has("decoderOps") ? "collapsed" : ""}`}>
+          <div className="decoder-ops-grid">
+            <div className="decoder-op-card win-inset">
+              <div className="decoder-op-heading">
+                <span>Model Routing</span>
+                {remoteOverrideEnabled && <span className="decoder-op-chip">Remote Override</span>}
+              </div>
+              <div className="decoder-op-form">
+                {renderDecoderModelField(
+                  "epicDecoder",
+                  "Epic decoder",
+                  decoderModelInfo,
+                  "Primary draft planner for the staged epic decomposition.",
+                )}
+                {renderDecoderModelField(
+                  "ticketHardener",
+                  "Ticket hardener",
+                  hardenerModelInfo,
+                  "Compact rewrite pass for turning draft tickets into stricter builder-ready tasks.",
+                )}
+                {renderDecoderModelField(
+                  "decompositionJudge",
+                  "Decomposition judge",
+                  judgeModelInfo,
+                  "Focused evaluation pass that approves or rejects hardened tickets before builders see them.",
+                )}
+                {renderDecoderModelField(
+                  "ticketRepair",
+                  "Ticket repair",
+                  repairModelInfo,
+                  "Single bounded rewrite/split pass used only when the judge rejects tickets.",
+                )}
+              </div>
+              <div className="decoder-op-kv">
+                <span>Refresh agent</span>
+                <code>{knowledgeDraft?.remoteKnowledgeModel ?? "zai:glm-5.1"}</code>
+              </div>
+              <div className="decoder-op-kv">
+                <span>Hardener mode</span>
+                <code>{hardenerModeLabel}</code>
+              </div>
+              <div className="decoder-op-kv">
+                <span>Judge mode</span>
+                <code>{judgeModeLabel}</code>
+              </div>
+              <div className="decoder-op-kv">
+                <span>Repair mode</span>
+                <code>{repairModeLabel}</code>
+              </div>
+              <p className="decoder-op-note">
+                Decoder, hardener, judge, and repair are model-backed planning stages now. Deterministic code still runs after them as schema validation, readiness scoring, and final safety gates.
+              </p>
+              <p className="decoder-op-note">
+                {remoteOverrideEnabled
+                  ? "Remote Override only takes over planning when cached knowledge is missing or critically stale. With valid knowledge, the local planning stages stay on their configured models."
+                  : "With valid cached knowledge, planning stays local-first. Missing or critically stale knowledge will not silently invent repo context."}
+              </p>
+            </div>
+
+            <div className="decoder-op-card win-inset">
+              <div className="decoder-op-heading">
+                <span>Pipeline Controls</span>
+                {knowledgeDraftDirty && <span className="decoder-op-chip dirty">unsaved</span>}
+              </div>
+              <div className="decoder-op-form">
+                <label className="decoder-op-field">
+                  <span>Planner profile</span>
+                  <select
+                    value={knowledgeDraft?.plannerProfile ?? "small-local"}
+                    onChange={(e) => updateKnowledgeDraft("plannerProfile", e.target.value as PlannerProfile)}
+                  >
+                    <option value="small-local">small-local</option>
+                    <option value="medium-local">medium-local</option>
+                    <option value="remote-strong">remote-strong</option>
+                  </select>
+                </label>
+                <label className="decoder-op-field">
+                  <span>Remote knowledge model</span>
+                  <select
+                    value={knowledgeDraft?.remoteKnowledgeModel ?? ""}
+                    onChange={(e) => updateKnowledgeDraft("remoteKnowledgeModel", e.target.value)}
+                  >
+                    {REMOTE_KNOWLEDGE_MODEL_OPTIONS.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="decoder-op-field">
+                  <span>Approved epic refresh interval</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={knowledgeDraft?.approvedEpicRefreshInterval ?? 10}
+                    onChange={(e) =>
+                      updateKnowledgeDraft(
+                        "approvedEpicRefreshInterval",
+                        parsePositiveInt(e.target.value, knowledgeDraft?.approvedEpicRefreshInterval ?? 10),
+                      )
+                    }
+                  />
+                </label>
+                <label className="decoder-op-field">
+                  <span>Context budget (tokens)</span>
+                  <input
+                    type="number"
+                    min={1000}
+                    value={knowledgeDraft?.maxSelectedKnowledgeTokens ?? 6000}
+                    onChange={(e) =>
+                      updateKnowledgeDraft(
+                        "maxSelectedKnowledgeTokens",
+                        parsePositiveInt(e.target.value, knowledgeDraft?.maxSelectedKnowledgeTokens ?? 6000),
+                      )
+                    }
+                  />
+                </label>
+              </div>
+              <div className="decoder-op-toggle-grid">
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={knowledgeDraft?.enableKnowledgePipeline ?? true}
+                    onChange={(e) => updateKnowledgeDraft("enableKnowledgePipeline", e.target.checked)}
+                  />
+                  Knowledge pipeline
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={knowledgeDraft?.enableModelBackedHardener ?? true}
+                    onChange={(e) => updateKnowledgeDraft("enableModelBackedHardener", e.target.checked)}
+                  />
+                  Model-backed hardener
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={knowledgeDraft?.enableModelBackedJudge ?? true}
+                    onChange={(e) => updateKnowledgeDraft("enableModelBackedJudge", e.target.checked)}
+                  />
+                  Model-backed judge
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={knowledgeDraft?.enableModelBackedRepair ?? true}
+                    onChange={(e) => updateKnowledgeDraft("enableModelBackedRepair", e.target.checked)}
+                  />
+                  Model-backed repair
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={knowledgeDraft?.enableRemoteKnowledgeRefresh ?? true}
+                    onChange={(e) => updateKnowledgeDraft("enableRemoteKnowledgeRefresh", e.target.checked)}
+                  />
+                  Async refresh jobs
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={knowledgeDraft?.requireFreshKnowledgeForLargeEpics ?? false}
+                    onChange={(e) => updateKnowledgeDraft("requireFreshKnowledgeForLargeEpics", e.target.checked)}
+                  />
+                  Fresh knowledge for large epics
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={knowledgeDraft?.strictModelPlanningStages ?? true}
+                    onChange={(e) => updateKnowledgeDraft("strictModelPlanningStages", e.target.checked)}
+                  />
+                  Strict LLM stages
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={knowledgeDraft?.remoteOverrideForMissingKnowledge ?? true}
+                    onChange={(e) => updateKnowledgeDraft("remoteOverrideForMissingKnowledge", e.target.checked)}
+                  />
+                  Remote fallback for missing knowledge
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={knowledgeDraft?.allowDeterministicPlanningFallback ?? false}
+                    onChange={(e) => updateKnowledgeDraft("allowDeterministicPlanningFallback", e.target.checked)}
+                  />
+                  Allow deterministic fallback
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={knowledgeDraft?.allowRawRepoContext ?? false}
+                    onChange={(e) => updateKnowledgeDraft("allowRawRepoContext", e.target.checked)}
+                  />
+                  Allow raw repo context
+                </label>
+              </div>
+              <div className="decoder-op-actions">
+                <button className="btn" onClick={() => void saveKnowledgeConfig()} disabled={!knowledgeDraftDirty}>
+                  Save Decoder Ops
+                </button>
+                <button
+                  className="btn"
+                  onClick={() => {
+                    if (knowledgeConfig) setKnowledgeDraft(knowledgeConfig);
+                  }}
+                  disabled={!knowledgeDraftDirty}
+                >
+                  Reset Draft
+                </button>
+              </div>
+            </div>
+
+            <div className="decoder-op-card win-inset">
+              <div className="decoder-op-heading">
+                <span>Knowledge Status</span>
+                <span className={`decoder-op-chip state-${knowledgeStatus?.freshness.state ?? "missing"}`}>
+                  {knowledgeStatus?.refreshState?.refreshStatus ?? "idle"}
+                </span>
+              </div>
+              <div className="decoder-op-kv">
+                <span>Snapshot</span>
+                <code>{knowledgeStatus?.status.version ?? "none"}</code>
+              </div>
+              <div className="decoder-op-kv">
+                <span>Availability</span>
+                <code>{knowledgeStatus?.status.available ? "available" : "missing"}</code>
+              </div>
+              <div className="decoder-op-kv">
+                <span>Freshness</span>
+                <code>{knowledgeStatus?.freshness.state ?? "unknown"}</code>
+              </div>
+              <div className="decoder-op-kv">
+                <span>Approved epics since refresh</span>
+                <code>{knowledgeStatus?.refreshState?.approvedEpicsSinceKnowledgeRefresh ?? knowledgeStatus?.freshness.approvedEpicsSinceRefresh ?? 0}</code>
+              </div>
+              <div className="decoder-op-kv">
+                <span>Planner target</span>
+                <code>{plannerTargetTokens(knowledgeDraft?.plannerProfile, knowledgeDraft) ?? "n/a"} tokens</code>
+              </div>
+              {knowledgeStatus?.freshness.reasonCodes?.length ? (
+                <div className="decoder-op-list">
+                  {knowledgeStatus.freshness.reasonCodes.slice(0, 4).map((reason) => (
+                    <span key={reason} className="decoder-op-list-item">
+                      {reason}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+              {knowledgeStatus?.status.warnings?.length ? (
+                <p className="decoder-op-warning">{knowledgeStatus.status.warnings[0]}</p>
+              ) : null}
+              <div className="decoder-op-actions">
+                <button className="btn" onClick={() => void triggerKnowledgeRefresh(false)}>
+                  Queue Refresh
+                </button>
+                <button className="btn" onClick={() => void triggerKnowledgeRefresh(true)}>
+                  Force Refresh
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="win-panel">
+        <div className="win-titlebar">
+          <div className="win-titlebar-text">
+            <span>📡</span>
+            <span>Knowledge Refresh Stream</span>
+            <span className="win-titlebar-count">{knowledgeRefreshEvents.length}</span>
+          </div>
+          <div className="win-titlebar-buttons">
+            <div className="win-btn-box" onClick={() => togglePanel("knowledgeRefreshStream")}>
+              _
+            </div>
+            <div className="win-btn-box">×</div>
+          </div>
+        </div>
+        <div className={`win-content ${collapsedPanels.has("knowledgeRefreshStream") ? "collapsed" : ""}`}>
+          <div className="preview-content">
+            {knowledgeRefreshEvents.length ? (
+              knowledgeRefreshEvents.map((item) => {
+                const role = normalizeAgentRole(item.payload?.agentRole);
+                const source = item.payload?.source ?? "unknown";
+                const model = typeof item.payload?.metadata?.model === "string"
+                  ? item.payload?.metadata?.model
+                  : typeof item.payload?.metadata?.remoteKnowledgeModel === "string"
+                    ? item.payload?.metadata?.remoteKnowledgeModel
+                    : null;
+                return (
+                  <div className="preview-item" key={item.id}>
+                    <span className="preview-role">
+                      {role}
+                      {source ? ` · ${source}` : ""}
+                      {model ? ` · ${model}` : ""}
+                    </span>
+                    <span className="preview-msg">
+                      {item.payload?.content || item.message || "..."}
+                    </span>
+                  </div>
+                );
+              })
+            ) : (
+              <span className="preview-empty">No knowledge refresh stream yet.</span>
+            )}
+          </div>
+        </div>
+      </div>
+
       {/* Agent Stats */}
       <div className="win-panel agent-stats-panel">
         <div className="win-titlebar">
@@ -1012,68 +1545,42 @@ export function App() {
           </div>
         </div>
         <div className={`win-content ${collapsedPanels.has("agents") ? "collapsed" : ""}`}>
-          <div className="agent-sections-row">
-            {/* BUILD Section */}
-            <div className="agent-section-box build-section">
-              <div className="agent-section-header">
-                <span className="agent-section-icon">🔧</span>
-                <span className="agent-section-title">BUILD</span>
-              </div>
-              <div className="agent-stats-grid">
-                {agentSections.build.map((role) => (
-                  <button key={role} className="agent-stat-box" onClick={() => setOpenRole(role)}>
-                    <span className={`agent-stat-icon ${isAgentActive.get(role) ? "active" : ""}`}>
-                      ◆
-                    </span>
-                    <span className="agent-stat-name">{role}</span>
-                    <span
-                      className={`agent-stat-status status-${
-                        agentStatusByRole.get(role) || "idle"
-                      }`}
-                    >
-                      {agentStatusByRole.get(role) || "idle"}
-                    </span>
-                    <span className="agent-stat-glyph">
-                      {AGENT_GLYPHS[role] || AGENT_GLYPHS.unknown}
-                    </span>
-                    <span className="agent-stat-count">{eventsByRole.get(role)?.length ?? 0}</span>
-                    <span className="agent-stat-label">msgs</span>
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* TEST Section */}
-            <div className="agent-section-box test-section">
-              <div className="agent-section-header">
-                <span className="agent-section-icon">🧪</span>
-                <span className="agent-section-title">TEST</span>
-              </div>
-              <div className="agent-stats-grid">
-                {agentSections.test.map((role) => (
-                  <button key={role} className="agent-stat-box" onClick={() => setOpenRole(role)}>
-                    <span className={`agent-stat-icon ${isAgentActive.get(role) ? "active" : ""}`}>
-                      ◆
-                    </span>
-                    <span className="agent-stat-name">{role}</span>
-                    <span
-                      className={`agent-stat-status status-${
-                        agentStatusByRole.get(role) || "idle"
-                      }`}
-                    >
-                      {agentStatusByRole.get(role) || "idle"}
-                    </span>
-                    <span className="agent-stat-glyph">
-                      {AGENT_GLYPHS[role] || AGENT_GLYPHS.unknown}
-                    </span>
-                    <span className="agent-stat-count">{eventsByRole.get(role)?.length ?? 0}</span>
-                    <span className="agent-stat-label">msgs</span>
-                  </button>
-                ))}
-              </div>
-            </div>
+          <div className="agent-streams-summary">
+            <span className="agent-streams-pill build">BUILD {agentSections.build.length}</span>
+            <span className="agent-streams-pill test">TEST {agentSections.test.length}</span>
           </div>
-          {agentSections.test.length + agentSections.build.length === 0 && (
+          <div className="agent-streams-grid">
+            {agentStreamCards.map(({ role, lane }) => (
+              <button
+                key={role}
+                className={`agent-stream-row ${lane}`}
+                onClick={() => setOpenRole(role)}
+              >
+                <span className={`agent-stream-lane ${lane}`}>{lane}</span>
+                <span className={`agent-stat-icon ${isAgentActive.get(role) ? "active" : ""}`}>
+                  ◆
+                </span>
+                <div className="agent-stream-main">
+                  <span className="agent-stat-name">{role}</span>
+                  <span
+                    className={`agent-stat-status status-${
+                      agentStatusByRole.get(role) || "idle"
+                    }`}
+                  >
+                    {agentStatusByRole.get(role) || "idle"}
+                  </span>
+                </div>
+                <span className="agent-stat-glyph">
+                  {AGENT_GLYPHS[role] || AGENT_GLYPHS.unknown}
+                </span>
+                <div className="agent-stream-count">
+                  <span className="agent-stat-count">{eventsByRole.get(role)?.length ?? 0}</span>
+                  <span className="agent-stat-label">msgs</span>
+                </div>
+              </button>
+            ))}
+          </div>
+          {agentStreamCards.length === 0 && (
             <p className="no-agents">📭 No agent stream yet.</p>
           )}
         </div>
@@ -1871,6 +2378,7 @@ export function App() {
           onForceRerunInPlace={() => void forceRerunTicketInPlace(selectedTicket.id)}
           onRerunDirect={() => void rerunDirectTicket(selectedTicket.id)}
           onForceRescue={() => void forceRescueTicket(selectedTicket.id)}
+          onUpdate={(input) => updateTicketDetails(selectedTicket.id, input)}
           onDelete={() => void deleteTicket(selectedTicket.id)}
           actionBusy={actionBusy !== null}
         />

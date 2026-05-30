@@ -1,5 +1,5 @@
 import path from "node:path";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import type { AgentRole, CommandCatalog } from "./types.ts";
 
 export type AppConfig = {
@@ -44,7 +44,37 @@ export type WorkspaceConfig = {
   role?: string;
   modelId?: string;
   remoteOverrideEnabled?: boolean;
+  epicDecoderKnowledge?: Partial<KnowledgePipelineConfig>;
   [key: string]: unknown;
+};
+
+export type PlannerProfile = "small-local" | "medium-local" | "remote-strong";
+
+export type KnowledgePipelineConfig = {
+  enableKnowledgePipeline: boolean;
+  enableRemoteKnowledgeRefresh: boolean;
+  enableModelBackedHardener: boolean;
+  enableModelBackedJudge: boolean;
+  enableModelBackedRepair: boolean;
+  strictModelPlanningStages: boolean;
+  remoteOverrideForMissingKnowledge: boolean;
+  allowDeterministicPlanningFallback: boolean;
+  approvedEpicRefreshInterval: number;
+  remoteKnowledgeModel: string;
+  plannerProfile: PlannerProfile;
+  requireFreshKnowledgeForLargeEpics: boolean;
+  maxKnowledgeArtifactSize: number;
+  maxSelectedKnowledgeTokens: number;
+  refreshOnPlannerFailureThreshold: number;
+  refreshOnUnknownDomain: boolean;
+  keepKnowledgeHistoryCount: number;
+  allowRawRepoContext: boolean;
+  requireTicketHardener: boolean;
+  requireDecompositionJudge: boolean;
+  smallLocalPlannerTargetTokens: number;
+  mediumLocalPlannerTargetTokens: number;
+  remoteStrongPlannerTargetTokens: number;
+  repairAttemptLimit: number;
 };
 
 export function getModelsFilePath(): string {
@@ -78,8 +108,45 @@ export function writeWorkspaceConfig(config: WorkspaceConfig): WorkspaceConfig {
   return config;
 }
 
+function isWithinRoot(root: string, candidate: string): boolean {
+  const resolvedRoot = path.resolve(root);
+  const resolvedCandidate = path.resolve(candidate);
+  if (resolvedCandidate === resolvedRoot) return true;
+  return resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
+}
+
+export function resolveConstrainedTargetDir(targetDir?: string, workspaceConfig: WorkspaceConfig = readWorkspaceConfig()): string {
+  const configuredRoot = typeof workspaceConfig.targetDir === "string" && workspaceConfig.targetDir.trim().length > 0
+    ? path.resolve(workspaceConfig.targetDir)
+    : null;
+  const requested = path.resolve(targetDir || configuredRoot || process.cwd());
+
+  if (process.env.DISABLE_TARGET_DIR_CONSTRAINT === "1") {
+    return requested;
+  }
+
+  if (configuredRoot && !isWithinRoot(configuredRoot, requested)) {
+    throw new Error(`Target directory must stay inside configured workspace root: ${configuredRoot}`);
+  }
+
+  return requested;
+}
+
+export function normalizeWorkspaceConfigPatch(patch: Partial<WorkspaceConfig>): Partial<WorkspaceConfig> {
+  const nextPatch: Partial<WorkspaceConfig> = { ...patch };
+  if (typeof nextPatch.targetDir === "string") {
+    const resolved = path.resolve(nextPatch.targetDir);
+    const stat = statSync(resolved, { throwIfNoEntry: false });
+    if (!stat?.isDirectory()) {
+      throw new Error(`Configured targetDir does not exist or is not a directory: ${resolved}`);
+    }
+    nextPatch.targetDir = resolved;
+  }
+  return nextPatch;
+}
+
 export function updateWorkspaceConfig(patch: Partial<WorkspaceConfig>): WorkspaceConfig {
-  const next = { ...readWorkspaceConfig(), ...patch };
+  const next = { ...readWorkspaceConfig(), ...normalizeWorkspaceConfigPatch(patch) };
   return writeWorkspaceConfig(next);
 }
 
@@ -88,6 +155,43 @@ export function updateAgentModel(role: AgentRole, model: string): Record<AgentRo
   models[role] = model;
   writeModelsFile(models);
   return models;
+}
+
+export function resolveKnowledgePipelineConfig(workspaceConfig: WorkspaceConfig = readWorkspaceConfig()): KnowledgePipelineConfig {
+  const raw = typeof workspaceConfig.epicDecoderKnowledge === "object" && workspaceConfig.epicDecoderKnowledge
+    ? workspaceConfig.epicDecoderKnowledge
+    : {};
+  const defaultPlannerProfile: PlannerProfile = workspaceConfig.remoteOverrideEnabled ? "remote-strong" : "small-local";
+  const plannerProfile = raw.plannerProfile === "small-local" || raw.plannerProfile === "medium-local" || raw.plannerProfile === "remote-strong"
+    ? raw.plannerProfile
+    : defaultPlannerProfile;
+
+  return {
+    enableKnowledgePipeline: raw.enableKnowledgePipeline ?? true,
+    enableRemoteKnowledgeRefresh: raw.enableRemoteKnowledgeRefresh ?? true,
+    enableModelBackedHardener: raw.enableModelBackedHardener ?? true,
+    enableModelBackedJudge: raw.enableModelBackedJudge ?? true,
+    enableModelBackedRepair: raw.enableModelBackedRepair ?? true,
+    strictModelPlanningStages: raw.strictModelPlanningStages ?? true,
+    remoteOverrideForMissingKnowledge: raw.remoteOverrideForMissingKnowledge ?? true,
+    allowDeterministicPlanningFallback: raw.allowDeterministicPlanningFallback ?? false,
+    approvedEpicRefreshInterval: Number(raw.approvedEpicRefreshInterval ?? 10),
+    remoteKnowledgeModel: String(raw.remoteKnowledgeModel ?? "zai:glm-5.1"),
+    plannerProfile,
+    requireFreshKnowledgeForLargeEpics: raw.requireFreshKnowledgeForLargeEpics ?? false,
+    maxKnowledgeArtifactSize: Number(raw.maxKnowledgeArtifactSize ?? 24_000),
+    maxSelectedKnowledgeTokens: Number(raw.maxSelectedKnowledgeTokens ?? 6_000),
+    refreshOnPlannerFailureThreshold: Number(raw.refreshOnPlannerFailureThreshold ?? 3),
+    refreshOnUnknownDomain: raw.refreshOnUnknownDomain ?? true,
+    keepKnowledgeHistoryCount: Number(raw.keepKnowledgeHistoryCount ?? 5),
+    allowRawRepoContext: raw.allowRawRepoContext ?? false,
+    requireTicketHardener: raw.requireTicketHardener ?? true,
+    requireDecompositionJudge: raw.requireDecompositionJudge ?? true,
+    smallLocalPlannerTargetTokens: Number(raw.smallLocalPlannerTargetTokens ?? 6_000),
+    mediumLocalPlannerTargetTokens: Number(raw.mediumLocalPlannerTargetTokens ?? 5_000),
+    remoteStrongPlannerTargetTokens: Number(raw.remoteStrongPlannerTargetTokens ?? 6_000),
+    repairAttemptLimit: Number(raw.repairAttemptLimit ?? 1),
+  };
 }
 
 export function loadConfig(): AppConfig {
