@@ -76,7 +76,7 @@ function resolveOllamaContextWindow(model: string): number {
   if (model.startsWith("qwen3.5:9b")) return 65536;
   if (model.startsWith("qwen3.5:27b")) return 65536;
   if (model.includes("qwen3.6-35b")) return 8192;
-  if (model.includes("qwen3.6-27b")) return 32768;
+  if (model.includes("qwen3.6-27b")) return 65536;
   if (model.startsWith("ibm/granite4.1:30b-q3")) return 8192;
   if (model.startsWith("ibm/granite4.1")) return 32768;
   if (model.startsWith("devstral-small-2:24b")) return 393216;
@@ -1354,6 +1354,19 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
           metadata: { model },
         });
       }
+      if (event.kind === "status") {
+        input.onStream?.({
+          agentRole: role as any,
+          source: "mediated-harness",
+          streamKind: "status",
+          content: event.text,
+          runId: input.runId,
+          ticketId: input.ticketId,
+          epicId: input.epicId,
+          sequence: 0,
+          metadata: { model },
+        });
+      }
       if (event.kind === "tool_call") {
         const argsPreview = JSON.stringify(event.call.args ?? {}).slice(0, 300);
         input.onStream?.({
@@ -1482,7 +1495,9 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
   private buildHarnessConfig(role: AgentRole, model: string, toolContext: ToolExecutionContext): any {
     const numCtx = role === "coder" || role === "reviewer"
       ? resolveOllamaContextWindow(this.resolveAnthropicMediatedModel(model))
-      : undefined;
+      : role === "epicDecoder"
+        ? 65536
+        : undefined;
     if (this.anthropicOverride) {
       return { ...this.anthropicOverride, braveApiKey: this.braveApiKey, toolContext, ...(numCtx ? { numCtx } : {}) };
     }

@@ -91,7 +91,7 @@ function getEmptyResponseAction(level: StallLevel, reminder: string, role: strin
   switch (level) {
     case "gentle":
       return {
-        nudgeMessage: `${reminder}\nYour last response had no tool call. You MUST call a tool in every response. If you have enough information, call the 'finish' tool now. Otherwise call a tool to continue working.`,
+        nudgeMessage: `continue\n\n${reminder}\nYour last response had no tool call. You MUST call a tool in every response. If you have enough information, call the 'finish' tool now. Otherwise call a tool to continue working.`,
         allowRetry: true,
         forceFinish: false,
         forceXmlMode: false,
@@ -128,7 +128,7 @@ function getRepeatedCallAction(level: StallLevel, reminder: string): RecoveryAct
   switch (level) {
     case "gentle":
       return {
-        nudgeMessage: `${reminder}\nYou are repeating the same tool call. Try a different approach — use different arguments, a different tool, or call finish with what you have.`,
+        nudgeMessage: `continue\n\n${reminder}\nYou are repeating the same tool call. Try a different approach — use different arguments, a different tool, or call finish with what you have.`,
         allowRetry: true,
         forceFinish: false,
         forceXmlMode: false,
@@ -165,7 +165,7 @@ function getConsecutiveErrorAction(level: StallLevel, reminder: string): Recover
   switch (level) {
     case "gentle":
       return {
-        nudgeMessage: `${reminder}\nYou have had several tool errors. Review the error messages above. Try a simpler call or use different arguments. If you cannot proceed, call finish.`,
+        nudgeMessage: `continue\n\n${reminder}\nYou have had several tool errors. Review the error messages above. Try a simpler call or use different arguments. If you cannot proceed, call finish.`,
         allowRetry: true,
         forceFinish: false,
         forceXmlMode: false,

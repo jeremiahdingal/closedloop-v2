@@ -5,6 +5,7 @@ import type { KnowledgePipelineConfig } from "../../config.ts";
 import type { AppDatabase } from "../../db/database.ts";
 import type { AgentStreamPayload, Json } from "../../types.ts";
 import { parseJsonText } from "../validation.ts";
+import { tryExtractJson } from "../zai.ts";
 import { createGateway, type ModelGateway } from "../models.ts";
 import { remoteKnowledgeRefreshPrompt } from "../prompts.ts";
 import { CodexRunner } from "../codex.ts";
@@ -100,19 +101,20 @@ function normalizeArtifactDrafts(drafts: RemoteRefreshArtifactDraft[], version: 
 function validateRemoteRefreshPayload(value: unknown): RemoteRefreshPayload {
   if (!value || typeof value !== "object") throw new Error("Remote refresh payload is not an object.");
   const record = value as Record<string, unknown>;
-  if (
-    typeof record.summaryOfChanges !== "string"
-    || !Array.isArray(record.domainsRefreshed)
-    || !Array.isArray(record.importantArchitectureRules)
-    || !Array.isArray(record.updatedTicketPatterns)
-    || !Array.isArray(record.knownFailureModes)
-    || typeof record.stalenessStatus !== "string"
-    || typeof record.confidenceScore !== "number"
-    || !Array.isArray(record.artifacts)
-  ) {
-    throw new Error("Remote refresh payload shape invalid.");
+  if (!Array.isArray(record.artifacts)) {
+    throw new Error("Remote refresh payload shape invalid: missing or non-array 'artifacts'.");
   }
-  return record as unknown as RemoteRefreshPayload;
+  return {
+    summaryOfChanges: typeof record.summaryOfChanges === "string" ? record.summaryOfChanges : "Knowledge refresh completed.",
+    domainsRefreshed: Array.isArray(record.domainsRefreshed) ? record.domainsRefreshed : [],
+    importantArchitectureRules: Array.isArray(record.importantArchitectureRules) ? record.importantArchitectureRules : [],
+    updatedTicketPatterns: Array.isArray(record.updatedTicketPatterns) ? record.updatedTicketPatterns : [],
+    knownFailureModes: Array.isArray(record.knownFailureModes) ? record.knownFailureModes : [],
+    stalenessStatus: (typeof record.stalenessStatus === "string" ? record.stalenessStatus : "fresh") as RemoteRefreshPayload["stalenessStatus"],
+    confidenceScore: typeof record.confidenceScore === "number" ? record.confidenceScore : 0.7,
+    warnings: Array.isArray(record.warnings) ? record.warnings : [],
+    artifacts: record.artifacts,
+  };
 }
 
 export class KnowledgeRefreshService {
@@ -195,8 +197,9 @@ export class KnowledgeRefreshService {
       return result.rawOutput;
     }
     if (model.startsWith("zai:")) {
-      const result = await this.zai.runBuilder({ role: "builder", cwd: repoRoot, prompt, epicId: repoRoot, modelOverride: model, onStream: refreshStreamHook });
-      return result.rawOutput;
+      const resolvedModel = this.zai.resolveModel(model);
+      this.emit("status", `Knowledge refresh invoking ${resolvedModel} via raw prompt (not agent).`, streamMeta);
+      return this.zai.rawPrompt("epicDecoder", prompt, resolvedModel, refreshStreamHook, { epicId: repoRoot });
     }
 
     const remoteGateway = this.buildRemoteGateway(config);
@@ -269,7 +272,12 @@ export class KnowledgeRefreshService {
     });
 
     const raw = await this.invokeRefreshModel(repoRoot, prompt, config);
-    const parsed = validateRemoteRefreshPayload(parseJsonText(raw));
+    let parsed: RemoteRefreshPayload;
+    try {
+      parsed = validateRemoteRefreshPayload(tryExtractJson(raw));
+    } catch {
+      parsed = validateRemoteRefreshPayload(parseJsonText(raw));
+    }
     const version = randomId("knowledge_artifacts");
     const artifacts = normalizeArtifactDrafts(parsed.artifacts, version);
 
@@ -295,7 +303,22 @@ export class KnowledgeRefreshService {
       metadata: { knowledgeRefresh: true, refreshId, reason, remoteKnowledgeModel: config.remoteKnowledgeModel },
     });
     await this.knowledgebase.markRefreshState(repoRoot, { refreshStatus: "running", lastRefreshReason: reason });
+
+    let originalBranch: string | null = null;
     try {
+      originalBranch = await git(repoRoot, ["branch", "--show-current"]).then((r) => r.stdout.trim()).catch(() => "") || null;
+      const defaultBranch = await git(repoRoot, ["symbolic-ref", "refs/remotes/origin/HEAD"]).then((r) => r.stdout.trim().replace("refs/remotes/origin/", "")).catch(() => null);
+
+      if (defaultBranch && originalBranch && originalBranch !== defaultBranch) {
+        this.emit("status", `Switching ${repoRoot} from ${originalBranch} to ${defaultBranch} for knowledge refresh.`, {
+          epicId: repoRoot,
+          metadata: { knowledgeRefresh: true, refreshId },
+        });
+        await git(repoRoot, ["checkout", defaultBranch]);
+      } else {
+        originalBranch = null;
+      }
+
       const output = await this.buildRefreshOutput(repoRoot, reason, config);
       this.emit("status", `Knowledge refresh generated ${output.artifacts.length} artifact(s); staging snapshot ${refreshId}.`, {
         epicId: repoRoot,
@@ -332,6 +355,21 @@ export class KnowledgeRefreshService {
         lastFailureReason: error instanceof Error ? error.message : String(error),
       });
       throw error;
+    } finally {
+      if (originalBranch) {
+        try {
+          await git(repoRoot, ["checkout", originalBranch]);
+          this.emit("status", `Restored ${repoRoot} to ${originalBranch}.`, {
+            epicId: repoRoot,
+            metadata: { knowledgeRefresh: true, refreshId },
+          });
+        } catch (restoreError) {
+          this.emit("stderr", `Failed to restore branch ${originalBranch} for ${repoRoot}: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`, {
+            epicId: repoRoot,
+            metadata: { knowledgeRefresh: true, refreshId },
+          });
+        }
+      }
     }
   }
 }

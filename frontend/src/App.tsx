@@ -480,8 +480,8 @@ export function App() {
     return status;
   }, [agentRoles, eventsByRole, data.runs, nowTick]);
 
-  const activeItems = useMemo(() =>
-    openRole ? [...(eventsByRole.get(openRole) ?? [])].reverse() : [],
+  const activeItems = useMemo(
+    () => (openRole ? [...(eventsByRole.get(openRole) ?? [])].reverse() : []),
     [openRole, eventsByRole]
   );
 

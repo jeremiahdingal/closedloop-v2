@@ -116,6 +116,7 @@ export interface ToolExecutionContext {
 export type MediatedHarnessEvent =
   | { kind: "thinking"; text: string }
   | { kind: "text"; text: string }
+  | { kind: "status"; text: string }
   | { kind: "streaming_text"; text: string }
   | { kind: "streaming_thinking"; text: string }
   | { kind: "tool_call"; call: ToolCall }

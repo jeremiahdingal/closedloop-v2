@@ -17,6 +17,36 @@ import type {
   SelectedKnowledgeSlice,
 } from "./knowledge/types.ts";
 import { resolveRuntimeProfile } from "../runtime-profile.ts";
+import { StagnationError, LoopTimeoutError } from "../mediated-agent-harness/errors.ts";
+
+async function withStageRecovery<T>(
+  stageName: string,
+  epicId: string,
+  runId: string,
+  onStream: ((event: AgentStreamPayload) => void) | undefined,
+  stage: (hint?: string) => Promise<T>,
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await stage();
+    } catch (err) {
+      const isStall = err instanceof StagnationError || err instanceof LoopTimeoutError;
+      if (!isStall) throw err;
+      const reason = err instanceof StagnationError
+        ? `${err.reason}: ${err.message}`
+        : `Loop timed out after ${err.elapsedMs}ms`;
+      if (attempt === 0) {
+        emitPipelineStream(onStream, runId, epicId, "status",
+          `Pipeline stage ${stageName} stalled. Sending "continue" nudge...`);
+        return await stage("continue");
+      }
+      emitPipelineStream(onStream, runId, epicId, "status",
+        `Pipeline stage ${stageName} stalled again (${reason.slice(0, 100)}). Hot-reset #${attempt} — retrying with stall context...`);
+      console.log(`[EPIC-DECODER-PIPELINE] ${epicId} stage ${stageName} hot-reset #${attempt}. Reason: ${reason.slice(0, 200)}`);
+      return await stage(`STALL RECOVERY: Previous attempt stalled because: ${reason}\nResume from where you left off. Do not restart from the beginning.`);
+    }
+  }
+}
 
 function buildKnowledgePrompt(epic: EpicRecord, selectedKnowledge: SelectedKnowledgeSlice, retryNote?: string | null, assetContext?: string): string {
   const sections = [
@@ -80,7 +110,9 @@ async function runDraftDecoder(
   prompt: string,
   db: AppDatabase,
   onStream?: (event: AgentStreamPayload) => void,
+  stallHint?: string,
 ): Promise<GoalDecomposition> {
+  const effectivePrompt = stallHint ? `${prompt}\n\n${stallHint}` : prompt;
   const configuredModel = gateway.models.epicDecoder;
   if (
     gateway.runEpicDecoderInWorkspace &&
@@ -93,12 +125,12 @@ async function runDraftDecoder(
       || configuredModel.startsWith("mediated:")
     )
   ) {
-    return gateway.runEpicDecoderInWorkspace({ cwd: epic.targetDir, prompt, runId, epicId: epic.id, db, onStream });
+    return gateway.runEpicDecoderInWorkspace({ cwd: epic.targetDir, prompt: effectivePrompt, runId, epicId: epic.id, db, onStream });
   }
   if (gateway.runEpicDecoderOpenCode && configuredModel.startsWith("opencode:")) {
-    return gateway.runEpicDecoderOpenCode({ cwd: epic.targetDir, prompt, runId, epicId: epic.id, onStream });
+    return gateway.runEpicDecoderOpenCode({ cwd: epic.targetDir, prompt: effectivePrompt, runId, epicId: epic.id, onStream });
   }
-  return gateway.getGoalDecomposition(prompt);
+  return gateway.getGoalDecomposition(effectivePrompt);
 }
 
 function emitPipelineStream(
@@ -126,6 +158,7 @@ async function runHardenerStage(
   draftTickets: GoalTicketPlan[],
   config: KnowledgePipelineConfig,
   onStream?: (event: AgentStreamPayload) => void,
+  stallHint?: string,
 ): Promise<{ tickets: GoalTicketPlan[]; mode: "llm" | "deterministic" }> {
   if (config.enableModelBackedHardener && gateway.runTicketHardener) {
     const prompt = ticketHardenerPrompt({
@@ -135,7 +168,8 @@ async function runHardenerStage(
       knowledgeSections: selectedKnowledge.sections,
       draftTickets,
     });
-    const result = await gateway.runTicketHardener({ cwd: epic.targetDir, prompt, runId, epicId: epic.id, onStream });
+    const effectivePrompt = stallHint ? `${prompt}\n\n${stallHint}` : prompt;
+    const result = await gateway.runTicketHardener({ cwd: epic.targetDir, prompt: effectivePrompt, runId, epicId: epic.id, onStream });
     return { tickets: result.tickets, mode: "llm" };
   }
   if (config.allowDeterministicPlanningFallback || !config.strictModelPlanningStages) {
@@ -198,6 +232,7 @@ async function runJudgeStage(
   tickets: GoalTicketPlan[],
   config: KnowledgePipelineConfig,
   onStream?: (event: AgentStreamPayload) => void,
+  stallHint?: string,
 ): Promise<{ judgement: DecompositionJudgement; mode: "llm" | "deterministic" }> {
   const deterministicJudgement = judgeDecomposition(tickets, config.plannerProfile);
   if (config.enableModelBackedJudge && gateway.runDecompositionJudge) {
@@ -208,7 +243,8 @@ async function runJudgeStage(
       knowledgeSections: selectedKnowledge.sections,
       tickets,
     });
-    const modelJudgement = await gateway.runDecompositionJudge({ cwd: epic.targetDir, prompt, runId, epicId: epic.id, onStream });
+    const effectivePrompt = stallHint ? `${prompt}\n\n${stallHint}` : prompt;
+    const modelJudgement = await gateway.runDecompositionJudge({ cwd: epic.targetDir, prompt: effectivePrompt, runId, epicId: epic.id, onStream });
     return { judgement: combineJudgements(tickets, deterministicJudgement, modelJudgement), mode: "llm" };
   }
   if (config.allowDeterministicPlanningFallback || !config.strictModelPlanningStages) {
@@ -225,6 +261,7 @@ async function runRepairStage(
   judgement: DecompositionJudgement,
   config: KnowledgePipelineConfig,
   onStream?: (event: AgentStreamPayload) => void,
+  stallHint?: string,
 ): Promise<{ tickets: GoalTicketPlan[]; mode: "llm" | "deterministic" }> {
   if (config.enableModelBackedRepair && gateway.runTicketRepair) {
     const prompt = ticketRepairPrompt({
@@ -236,7 +273,8 @@ async function runRepairStage(
       rejectionReasons: judgement.rejectionReasons,
       repairSuggestions: judgement.repairSuggestions,
     });
-    const result = await gateway.runTicketRepair({ cwd: epic.targetDir, prompt, runId, epicId: epic.id, onStream });
+    const effectivePrompt = stallHint ? `${prompt}\n\n${stallHint}` : prompt;
+    const result = await gateway.runTicketRepair({ cwd: epic.targetDir, prompt: effectivePrompt, runId, epicId: epic.id, onStream });
     return { tickets: result.tickets, mode: "llm" };
   }
   if (config.allowDeterministicPlanningFallback || !config.strictModelPlanningStages) {
@@ -291,7 +329,9 @@ export async function decodeEpicWithKnowledgePipeline(input: {
 
   let draftPlan: GoalDecomposition;
   try {
-    draftPlan = await runDraftDecoder(planningGateway, epic, runId, prompt, db, input.onStream);
+    draftPlan = await withStageRecovery("draft-decoder", epic.id, runId, input.onStream, (hint) =>
+      runDraftDecoder(planningGateway, epic, runId, prompt, db, input.onStream, hint)
+    );
   } catch (error) {
     await knowledgebase.recordPlannerFailure(epic.targetDir);
     throw error;
@@ -299,10 +339,14 @@ export async function decodeEpicWithKnowledgePipeline(input: {
 
   emitPipelineStream(input.onStream, runId, epic.id, "status", `Draft planner produced ${draftPlan.tickets.length} ticket(s).`);
 
-  const hardened = await runHardenerStage(planningGateway, epic, runId, selectedKnowledge, draftPlan.tickets, config, input.onStream);
+  const hardened = await withStageRecovery("hardener", epic.id, runId, input.onStream, (hint) =>
+    runHardenerStage(planningGateway, epic, runId, selectedKnowledge, draftPlan.tickets, config, input.onStream, hint)
+  );
   emitPipelineStream(input.onStream, runId, epic.id, "status", `Hardened ${hardened.tickets.length} ticket(s) via ${hardened.mode}.`);
 
-  const initialJudgementResult = await runJudgeStage(planningGateway, epic, runId, selectedKnowledge, hardened.tickets, config, input.onStream);
+  const initialJudgementResult = await withStageRecovery("judge", epic.id, runId, input.onStream, (hint) =>
+    runJudgeStage(planningGateway, epic, runId, selectedKnowledge, hardened.tickets, config, input.onStream, hint)
+  );
   emitPipelineStream(input.onStream, runId, epic.id, "status", `Initial judgement passed=${initialJudgementResult.judgement.passed} confidence=${initialJudgementResult.judgement.overallConfidence} via ${initialJudgementResult.mode}.`);
 
   let finalJudgement = initialJudgementResult.judgement;
@@ -312,10 +356,14 @@ export async function decodeEpicWithKnowledgePipeline(input: {
 
   if (!initialJudgementResult.judgement.passed && config.repairAttemptLimit > 0) {
     repairAttempts = 1;
-    const repaired = await runRepairStage(planningGateway, epic, runId, selectedKnowledge, initialJudgementResult.judgement, config, input.onStream);
+    const repaired = await withStageRecovery("repair", epic.id, runId, input.onStream, (hint) =>
+      runRepairStage(planningGateway, epic, runId, selectedKnowledge, initialJudgementResult.judgement, config, input.onStream, hint)
+    );
     repairMode = repaired.mode;
     repairHistory.push(`Repaired ${initialJudgementResult.judgement.rejectedTickets.length} rejected ticket(s) at ${nowIso()} using ${repaired.mode}.`);
-    const finalJudgementResult = await runJudgeStage(planningGateway, epic, runId, selectedKnowledge, repaired.tickets, config, input.onStream);
+    const finalJudgementResult = await withStageRecovery("judge-final", epic.id, runId, input.onStream, (hint) =>
+      runJudgeStage(planningGateway, epic, runId, selectedKnowledge, repaired.tickets, config, input.onStream, hint)
+    );
     finalJudgement = finalJudgementResult.judgement;
     emitPipelineStream(input.onStream, runId, epic.id, "status", `Repair pass complete. Final judgement passed=${finalJudgement.passed} confidence=${finalJudgement.overallConfidence}.`);
   }

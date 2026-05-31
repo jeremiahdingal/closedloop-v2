@@ -52,7 +52,7 @@ export function resolveModelContextWindow(model: string): number {
   else if (model.startsWith("qwen3.5:4b")) result = 65536;
   else if (model.startsWith("qwen3.5:27b")) result = 65536;
   else if (model.includes("qwen3.6-35b")) result = 8192;
-  else if (model.includes("qwen3.6-27b")) result = 32768;
+  else if (model.includes("qwen3.6-27b")) result = 65536;
   else if (model.startsWith("ibm/granite4.1:30b-q3")) result = 8192;
   else if (model.startsWith("ibm/granite4.1")) result = 32768;
   else if (model.startsWith("qwen3:14b")) result = 65536;
@@ -160,8 +160,9 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
         if (action.allowRetry) {
           messages.push({ role: "user", content: action.nudgeMessage });
+          emit({ kind: "status", text: `Stall recovery nudge injected:\n${action.nudgeMessage}` });
           emit({ kind: "text", text: `[stall-recovery] ${stallKind} at ${level} level, nudging model...` });
-          // Don't call the model again immediately — continue to next iteration
+          continue;
         } else {
           throw new StagnationError(
             `Stall recovery exhausted: ${stallKind} at ${level} level`,
@@ -448,12 +449,14 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
           // Not valid JSON — force tool call
           messages.push({ role: "assistant", content: text });
+          const forcedToolNudge = requiresExplicitFinish(config.role)
+            ? "continue\n\nYou produced text/JSON without using the tool interface. STOP. Use tool calls only. If you are done, call the 'finish' tool with 'summary' and 'result' parameters. Do not write any more text."
+            : "continue\n\nYou produced text without a tool call. STOP. Call the 'finish' tool now with 'summary' and 'result' parameters. Do not write any more text.";
           messages.push({
             role: "user",
-            content: requiresExplicitFinish(config.role)
-              ? "You produced text/JSON without using the tool interface. STOP. Use tool calls only. If you are done, call the 'finish' tool with 'summary' and 'result' parameters. Do not write any more text."
-              : "You produced text without a tool call. STOP. Call the 'finish' tool now with 'summary' and 'result' parameters. Do not write any more text.",
+            content: forcedToolNudge,
           });
+          emit({ kind: "status", text: `Stall recovery nudge injected:\n${forcedToolNudge}` });
           continue;
         }
       }
@@ -463,10 +466,12 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         // XML extraction succeeded above; continue to normal tool handling below.
       } else if (iteration === 0) {
         messages.push({ role: "assistant", content: null });
+        const emptyStartNudge = "continue\n\nNo output. Call list_dir to start, then finish with your answer.";
         messages.push({
           role: "user",
-          content: "No output. Call list_dir to start, then finish with your answer.",
+          content: emptyStartNudge,
         });
+        emit({ kind: "status", text: `Stall recovery nudge injected:\n${emptyStartNudge}` });
         continue;
       }
 
@@ -491,6 +496,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
         messages.push({ role: "assistant", content: state.content || "" });
         messages.push({ role: "user", content: action.nudgeMessage });
+        emit({ kind: "status", text: `Stall recovery nudge injected:\n${action.nudgeMessage}` });
         emit({ kind: "text", text: `[stall-recovery] ${kind} at ${level} level, nudging...` });
         continue;
       }

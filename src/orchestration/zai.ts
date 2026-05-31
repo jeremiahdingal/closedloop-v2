@@ -206,7 +206,7 @@ function extractJsonObjectCandidates(raw: string): string[] {
   return candidates;
 }
 
-function tryExtractJson(raw: string): any {
+export function tryExtractJson(raw: string): any {
   const tagged = raw.match(/<FINAL_JSON>([\s\S]*?)<\/FINAL_JSON>/i);
   const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const direct = (tagged?.[1] ?? fenced?.[1] ?? raw).trim();

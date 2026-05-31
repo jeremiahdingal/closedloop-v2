@@ -1,4 +1,30 @@
 {
-  "targetDir": "C:\\Users\\dinga\\AppData\\Local\\Temp\\repo-7appLB",
-  "remoteOverrideEnabled": true
+  "targetDir": "C:\\Users\\dinga\\Projects\\shop-diary-apps",
+  "remoteOverrideEnabled": false,
+  "epicDecoderKnowledge": {
+    "enableKnowledgePipeline": true,
+    "enableRemoteKnowledgeRefresh": true,
+    "enableModelBackedHardener": true,
+    "enableModelBackedJudge": true,
+    "enableModelBackedRepair": true,
+    "strictModelPlanningStages": true,
+    "remoteOverrideForMissingKnowledge": true,
+    "allowDeterministicPlanningFallback": false,
+    "approvedEpicRefreshInterval": 10,
+    "remoteKnowledgeModel": "zai:glm-5.1",
+    "plannerProfile": "remote-strong",
+    "requireFreshKnowledgeForLargeEpics": false,
+    "maxKnowledgeArtifactSize": 24000,
+    "maxSelectedKnowledgeTokens": 6000,
+    "refreshOnPlannerFailureThreshold": 3,
+    "refreshOnUnknownDomain": true,
+    "keepKnowledgeHistoryCount": 5,
+    "allowRawRepoContext": false,
+    "requireTicketHardener": true,
+    "requireDecompositionJudge": true,
+    "smallLocalPlannerTargetTokens": 6000,
+    "mediumLocalPlannerTargetTokens": 5000,
+    "remoteStrongPlannerTargetTokens": 6000,
+    "repairAttemptLimit": 1
+  }
 }

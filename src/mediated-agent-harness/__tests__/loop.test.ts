@@ -85,13 +85,56 @@ const DONE_LINE = JSON.stringify({
   eval_count: 5,
 });
 
-function createMockServer(ndjsonLines: string[]): Promise<{ server: Server; port: number }> {
+function createMockServer(ndjsonLines: string[], requestBodies?: any[]): Promise<{ server: Server; port: number }> {
   return new Promise((resolve) => {
     const server = createServer((req, res) => {
       if (req.method === "POST" && req.url?.endsWith("/api/chat")) {
         let body = "";
         req.on("data", (chunk) => { body += chunk; });
         req.on("end", () => {
+          if (requestBodies) {
+            requestBodies.push(JSON.parse(body));
+          }
+          res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+          let i = 0;
+          const send = () => {
+            if (i < ndjsonLines.length) {
+              res.write(ndjsonLines[i] + "\n");
+              i++;
+              setTimeout(send, 1);
+            } else {
+              res.end();
+            }
+          };
+          send();
+        });
+      } else {
+        res.writeHead(404);
+        res.end("not found");
+      }
+    });
+    server.listen(0, () => {
+      resolve({ server, port: (server.address() as any).port });
+    });
+  });
+}
+
+function createSequencedMockServer(
+  responses: string[][],
+  requestBodies?: any[],
+): Promise<{ server: Server; port: number }> {
+  return new Promise((resolve) => {
+    let requestIndex = 0;
+    const server = createServer((req, res) => {
+      if (req.method === "POST" && req.url?.endsWith("/api/chat")) {
+        let body = "";
+        req.on("data", (chunk) => { body += chunk; });
+        req.on("end", () => {
+          if (requestBodies) {
+            requestBodies.push(JSON.parse(body));
+          }
+          const ndjsonLines = responses[Math.min(requestIndex, responses.length - 1)] ?? [];
+          requestIndex++;
           res.writeHead(200, { "Content-Type": "application/x-ndjson" });
           let i = 0;
           const send = () => {
@@ -207,6 +250,65 @@ test("loop handles model that returns text directly (no tools)", async () => {
     assert.equal(result.iterations, 1);
     const textEvents = events.filter(e => e.kind === "text");
     assert.ok(textEvents.length > 0);
+  } finally {
+    server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("loop injects a visible continue nudge after a no-tool-call stall", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
+  const requestBodies: any[] = [];
+
+  const responses = [
+    [
+      makeTextChunk("I will keep thinking about it."),
+      DONE_LINE,
+    ],
+    [
+      makeToolCallChunk({
+        id: "call_1",
+        name: "finish",
+        args: { summary: "done", result: '{"ok":true}' },
+      }),
+      DONE_LINE,
+    ],
+  ];
+  const { server, port } = await createSequencedMockServer(responses, requestBodies);
+
+  try {
+    const events: any[] = [];
+    const result = await runMediatedLoop({
+      systemPrompt: "Test",
+      userPrompt: "Analyze.",
+      config: {
+        baseURL: `http://localhost:${port}`,
+        apiKey: "",
+        model: "test-model",
+        cwd: tmpDir,
+        role: "builder",
+        temperature: 0,
+        maxIterations: 4,
+        onEvent: (e) => events.push(e),
+      },
+      toolContext: createMockContext(tmpDir),
+    });
+
+    assert.equal(result.iterations, 2);
+    assert.ok(requestBodies.length >= 2);
+    const secondMessages = requestBodies[1]?.messages ?? [];
+    assert.ok(
+      secondMessages.some(
+        (msg: any) => msg.role === "user" && typeof msg.content === "string" && msg.content.startsWith("continue"),
+      ),
+      "expected second model call to include a continue nudge",
+    );
+    assert.ok(
+      events.some(
+        (event) => event.kind === "status" && typeof event.text === "string" && event.text.includes("continue"),
+      ),
+      "expected emitted status event to show injected continue nudge",
+    );
   } finally {
     server.close();
     await rm(tmpDir, { recursive: true, force: true });

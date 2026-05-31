@@ -483,19 +483,14 @@ export class TicketRunner {
           : "";
         const prompt = explorerPrompt(ticket, { reviewBlockers: state.reviewBlockers, priorTestFailures: state.testHistory } as any, seedFiles) + retryNudge;
 
-        const explorerStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "explorer");
         let explorerRaw: string;
         try {
-          explorerRaw = await this.gateway.runExplorerInWorkspace!({
-            cwd: workspace.worktreePath,
-            prompt,
-            runId,
-            ticketId: ticket.id,
-            epicId: ticket.epicId,
-            onStream: explorerStream.onStream,
-          });
-        } finally {
-          this.endScopedAgentStream(runId, "explorer", explorerStream.sessionId);
+          explorerRaw = await this.runExplorerWithStallRecovery(runId, ticket, workspace.worktreePath, prompt);
+        } catch (err) {
+          const isStall = err instanceof StagnationError || err instanceof LoopTimeoutError;
+          if (!isStall) throw err;
+          this.heartbeat(runId, ticket.id, "system", `Explorer stalled: ${err instanceof Error ? err.message : String(err)}`);
+          continue;
         }
         lastExplorerRaw = explorerRaw;
 
@@ -703,6 +698,7 @@ export class TicketRunner {
       }
 
       let coderResult;
+      let coderStallCount = 0;
       while (true) {
         try {
           const coderStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "coder");
@@ -722,9 +718,26 @@ export class TicketRunner {
           break; // Success
         } catch (err) {
           const isStall = err instanceof StagnationError || err instanceof LoopTimeoutError;
-          if (!isStall || hotResets >= maxHotResets) {
-            throw err;
+          if (!isStall) throw err;
+
+          coderStallCount++;
+
+          // First stall: send "continue" nudge and retry with same prompt
+          if (coderStallCount === 1) {
+            this.recordAgentStream({
+              agentRole: "coder",
+              source: "orchestrator",
+              streamKind: "status",
+              content: `Coder stalled. Sending "continue" nudge...`,
+              runId,
+              ticketId: ticket.id,
+              epicId: ticket.epicId,
+            });
+            currentCoderPrompt = currentCoderPrompt + "\n\ncontinue";
+            continue;
           }
+
+          if (hotResets >= maxHotResets) throw err;
 
           hotResets++;
           console.log(`[TICKET ${ticket.id}] Coder stalled, hot-reset #${hotResets}`, err instanceof Error ? err.message : String(err));
@@ -2512,6 +2525,8 @@ export class TicketRunner {
     const reviewerContext = this.buildReviewerContext(ticket, diff, guard, contract);
     const useMediatedReviewer = reviewerMode === "mediated-deep" && Boolean(this.gateway.runReviewerInWorkspace);
     let lastError: unknown = null;
+    let reviewerStallCount = 0;
+    let reviewerPromptOverride: string | null = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         this.recordAgentStream({
@@ -2536,7 +2551,7 @@ export class TicketRunner {
           useMediatedReviewer
             ? this.gateway.runReviewerInWorkspace!({
                 cwd: workspace.worktreePath,
-                prompt: reviewerToolingPrompt(ticket, diff),
+                prompt: reviewerPromptOverride ?? reviewerToolingPrompt(ticket, diff),
                 runId,
                 ticketId: ticket.id,
                 epicId: ticket.epicId,
@@ -2578,6 +2593,44 @@ export class TicketRunner {
         };
       } catch (error) {
         lastError = error;
+        const isStall = error instanceof StagnationError || error instanceof LoopTimeoutError;
+
+        // Two-tier stall recovery for reviewer
+        if (isStall && useMediatedReviewer) {
+          reviewerStallCount++;
+          if (reviewerStallCount === 1) {
+            this.recordAgentStream({
+              agentRole: "reviewer",
+              source: "orchestrator",
+              streamKind: "status",
+              content: `Reviewer stalled. Sending "continue" nudge...`,
+              runId,
+              ticketId: ticket.id,
+              epicId: ticket.epicId,
+              sequence: attempt,
+            });
+            reviewerPromptOverride = reviewerToolingPrompt(ticket, diff) + "\n\ncontinue";
+            attempt--;
+            continue;
+          }
+          const reason = error instanceof StagnationError
+            ? `${error.reason}: ${error.message}`
+            : `Loop timed out after ${error.elapsedMs}ms`;
+          reviewerPromptOverride = reviewerToolingPrompt(ticket, diff) + `\n\nSTALL RECOVERY: Previous attempt stalled because: ${reason}\nResume from where you left off. Do not restart from the beginning.`;
+          this.recordAgentStream({
+            agentRole: "reviewer",
+            source: "orchestrator",
+            streamKind: "status",
+            content: `Reviewer stalled again (${reason.slice(0, 100)}). Hot-reset #${reviewerStallCount - 1} — retrying with stall context...`,
+            runId,
+            ticketId: ticket.id,
+            epicId: ticket.epicId,
+            sequence: attempt,
+          });
+          attempt--;
+          continue;
+        }
+
         const errMsg = error instanceof Error ? error.message : String(error);
         const isShapeError = /shape invalid|contain invalid text|excessively repetitive|look unrelated/i.test(errMsg);
         const isRetryable = reviewerMode === "mediated-deep" && this.isReviewerInfraError(error);
@@ -2758,6 +2811,61 @@ export class TicketRunner {
     } catch (fixupErr) {
       console.warn(`[REVIEWER FIXUP] ${fixupModel} fixup failed: ${fixupErr instanceof Error ? fixupErr.message : String(fixupErr)}`);
       return null;
+    }
+  }
+
+  private async runExplorerWithStallRecovery(
+    runId: string,
+    ticket: TicketRecord,
+    worktreePath: string,
+    prompt: string,
+    stallCount = 0,
+  ): Promise<string> {
+    const explorerStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "explorer");
+    try {
+      return await this.gateway.runExplorerInWorkspace!({
+        cwd: worktreePath,
+        prompt,
+        runId,
+        ticketId: ticket.id,
+        epicId: ticket.epicId,
+        onStream: explorerStream.onStream,
+      });
+    } catch (err) {
+      const isStall = err instanceof StagnationError || err instanceof LoopTimeoutError;
+      if (!isStall) throw err;
+
+      stallCount++;
+      if (stallCount === 1) {
+        this.recordAgentStream({
+          agentRole: "explorer",
+          source: "orchestrator",
+          streamKind: "status",
+          content: `Explorer stalled. Sending "continue" nudge...`,
+          runId,
+          ticketId: ticket.id,
+          epicId: ticket.epicId,
+        });
+        return this.runExplorerWithStallRecovery(runId, ticket, worktreePath, prompt + "\n\ncontinue", stallCount);
+      }
+      const reason = err instanceof StagnationError
+        ? `${err.reason}: ${err.message}`
+        : `Loop timed out after ${err.elapsedMs}ms`;
+      this.recordAgentStream({
+        agentRole: "explorer",
+        source: "orchestrator",
+        streamKind: "status",
+        content: `Explorer stalled again (${reason.slice(0, 100)}). Hot-reset #${stallCount - 1} — retrying with stall context...`,
+        runId,
+        ticketId: ticket.id,
+        epicId: ticket.epicId,
+      });
+      return this.runExplorerWithStallRecovery(runId, ticket, worktreePath,
+        prompt + `\n\nSTALL RECOVERY: Previous attempt stalled because: ${reason}\nResume from where you left off. Do not restart from the beginning.`,
+        stallCount,
+      );
+    } finally {
+      this.endScopedAgentStream(runId, "explorer", explorerStream.sessionId);
     }
   }
 

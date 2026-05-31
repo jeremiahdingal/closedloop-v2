@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useMemo } from "react";
+import React, { useMemo } from "react";
 import { AgentEvent, AgentModelInfo, AgentStreamStatus } from "../types.ts";
 import { getMergedEventKey, mergeStreamingEvents } from "../utils.ts";
 import { AgentEventCard } from "./AgentEventCard.tsx";
@@ -29,12 +29,7 @@ export function AgentModal(props: {
   const hasMultipleAdapters = safeAdapters.length > 1;
   const currentDesc =
     safeAdapters.find((a) => a.id === (info?.currentModel ?? ""))?.description ?? "";
-  const feedEndRef = useRef<HTMLDivElement>(null);
   const cliMode = useMemo(() => isCliSourced(mergedItems), [mergedItems]);
-
-  useEffect(() => {
-    feedEndRef.current?.scrollIntoView({ behavior: "instant" });
-  }, [mergedItems.length]);
 
   return (
     <div className="modal-backdrop" onClick={props.onClose}>
@@ -112,7 +107,6 @@ export function AgentModal(props: {
             ) : (
               <p className="modal-empty">No stream output yet.</p>
             )}
-            <div ref={feedEndRef} />
           </div>
         )}
         <div className="modal-footer">
