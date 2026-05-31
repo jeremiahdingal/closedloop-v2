@@ -12,6 +12,7 @@ import type {
   EpicReviewerLedger,
   KnowledgebaseLedger,
 } from "./role-ledgers.ts";
+import { buildNegativeEvidenceInjection } from "./negative-evidence.ts";
 
 // ─── Cold resume prompt builder ──────────────────────────────────────────────
 // Generates a compact resume instruction from the continuation state,
@@ -90,7 +91,7 @@ function buildDecoderResume(state: AgentContinuationState<EpicDecoderLedger>): s
     .map(([id]) => id);
   const visitedPaths = Object.keys(state.visitedFiles).slice(-10);
 
-  return [
+  const lines: string[] = [
     `DECODER RESUME:`,
     `Ticket skeletons: ${ledger.ticketSkeletons.length} total, ${incompleteTickets.length} incomplete.`,
     incompleteTickets.length > 0
@@ -102,11 +103,23 @@ function buildDecoderResume(state: AgentContinuationState<EpicDecoderLedger>): s
     ``,
     `Visited files (last 10): ${visitedPaths.length > 0 ? visitedPaths.join(", ") : "none"}`,
     ``,
+  ];
+
+  // Inject negative evidence if available
+  const negativeInjection = buildNegativeEvidenceInjection(ledger.discoveryLedger);
+  if (negativeInjection) {
+    lines.push(negativeInjection);
+    lines.push(``);
+  }
+
+  lines.push(
     `Current phase: ${state.phase}`,
     state.phase === "evidence" ? `Next action: call glob_files, grep_files, semantic_search, read_file, or read_files for a missing evidence slot; call finish_looplet only if enough evidence is gathered.` : "",
     state.phase === "fill_tickets" ? `Next action: fill ticket descriptions using gathered evidence, then call finish_looplet.` : "",
     `Do not re-read files already recorded. Do not re-read filled evidence slots.`,
-  ].filter(Boolean).join("\n");
+  );
+
+  return lines.filter(Boolean).join("\n");
 }
 
 function buildHardenerResume(state: AgentContinuationState<TicketHardenerLedger>): string {

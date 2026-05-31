@@ -13,9 +13,90 @@ import { buildColdResumePrompt } from "./resume.ts";
 import { buildPhasePrompt, getNextPhase, getAllowedToolsForPhase, buildEpicDecoderContinuationPrompt, ROLE_PHASES } from "./prompts.ts";
 import { persistState, loadState, persistHandoff } from "./persistence.ts";
 import { createDefaultLedger } from "./role-ledgers.ts";
+import type { EpicDecoderLedger } from "./role-ledgers.ts";
+import {
+  inferSearchTarget,
+  isUsefulProjectFile,
+  isWeakOrIrrelevantResult,
+  recordNegativeEvidence,
+  recordPositiveEvidence,
+  shouldBlockSearch,
+  shouldForceFinishDiscovery,
+  buildNegativeEvidenceInjection,
+} from "./negative-evidence.ts";
 import type { ModelGateway, StreamHook } from "../models.ts";
 import type { ToolExecutionContext, MediatedHarnessEvent } from "../../mediated-agent-harness/types.ts";
 import { parseJsonText } from "../validation.ts";
+
+// ─── Negative evidence tracking helpers ──────────────────────────────────────
+
+function extractFileListFromResult(resultText: string): string[] {
+  const fileMatches = resultText.match(/^[\w\-./]+\.\w+$/gm) ?? [];
+  return fileMatches.filter(isUsefulProjectFile);
+}
+
+function classifyToolResultForEvidence(
+  toolName: string,
+  args: Record<string, unknown>,
+  resultText: string
+): { target: string | null; isNegative: boolean; isWeak: boolean; files: string[] } {
+  const pattern = (args.pattern ?? args.query ?? "") as string;
+  const target = inferSearchTarget(pattern);
+  const files = extractFileListFromResult(resultText);
+  const isWeak = isWeakOrIrrelevantResult(resultText, files);
+  const isNegative = isWeak || files.length === 0;
+
+  return { target, isNegative, isWeak, files };
+}
+
+function updateDiscoveryLedgerFromToolResult<TLedger, TOutput>(
+  state: AgentContinuationState<TLedger, TOutput>,
+  toolName: string,
+  args: Record<string, unknown>,
+  resultText: string
+): AgentContinuationState<TLedger, TOutput> {
+  if (state.role !== "epicDecoder") return state;
+
+  const ledger = state.ledger as EpicDecoderLedger;
+  const discovery = ledger.discoveryLedger;
+
+  const { target, isNegative, isWeak, files } = classifyToolResultForEvidence(toolName, args, resultText);
+
+  if (!target) return state;
+
+  const pattern = (args.pattern ?? args.query ?? "") as string;
+
+  if (isNegative) {
+    const updatedDiscovery = recordNegativeEvidence(
+      discovery,
+      target,
+      state.phase,
+      pattern,
+      resultText,
+      isWeak
+    );
+    return {
+      ...state,
+      ledger: { ...ledger, discoveryLedger: updatedDiscovery } as TLedger,
+    };
+  }
+
+  if (files.length > 0) {
+    const updatedDiscovery = recordPositiveEvidence(
+      discovery,
+      target,
+      state.phase,
+      files,
+      [resultText.slice(0, 200)]
+    );
+    return {
+      ...state,
+      ledger: { ...ledger, discoveryLedger: updatedDiscovery } as TLedger,
+    };
+  }
+
+  return state;
+}
 
 // ─── Controller config ───────────────────────────────────────────────────────
 
@@ -169,38 +250,51 @@ export async function runContinuableAgent<TLedger, TOutput>(
       metadata: {},
     });
 
-    // Run the model through the gateway
-    let result: unknown;
-    let toolCallCount = 0;
-    try {
-      result = await callGateway(gateway, gatewayMethod, {
-        cwd,
-        prompt,
-        runId,
-        ticketId: config.ticketId,
-        epicId: config.epicId,
-        ...config.gatewayExtraArgs,
-        continuation: {
-          enabled: true,
-          phase: state.phase,
-          maxIterations: loopletIterations,
-          allowedToolsOverride: allowedTools,
-        },
-        onStream: (event: any) => {
-          // Track visited files and tool calls from stream events
-          if (event.kind === "tool_call" && event.call?.name === "read_file") {
-            const path = event.call?.args?.path ?? event.call?.args?.paths?.[0];
-            if (path && typeof path === "string") {
-              state = recordVisitedFile(state, path);
+      // Run the model through the gateway
+      let result: unknown;
+      let toolCallCount = 0;
+      const toolResultsToProcess: Array<{ name: string; args: Record<string, unknown>; resultText: string }> = [];
+
+      try {
+        result = await callGateway(gateway, gatewayMethod, {
+          cwd,
+          prompt,
+          runId,
+          ticketId: config.ticketId,
+          epicId: config.epicId,
+          ...config.gatewayExtraArgs,
+          continuation: {
+            enabled: true,
+            phase: state.phase,
+            maxIterations: loopletIterations,
+            allowedToolsOverride: allowedTools,
+          },
+          onStream: (event: any) => {
+            // Track visited files and tool calls from stream events
+            if (event.kind === "tool_call" && event.call?.name === "read_file") {
+              const path = event.call?.args?.path ?? event.call?.args?.paths?.[0];
+              if (path && typeof path === "string") {
+                state = recordVisitedFile(state, path);
+              }
             }
-          }
-          if (event.kind === "tool_call") {
-            toolCallCount++;
-          }
-          onStream?.(event);
-        },
-      });
-    } catch (err) {
+            if (event.kind === "tool_call") {
+              toolCallCount++;
+            }
+            // Track search tool results for negative evidence
+            if (event.kind === "tool_result" && event.result?.name) {
+              const searchTools = ["glob_files", "grep_files", "semantic_search"];
+              if (searchTools.includes(event.result.name)) {
+                toolResultsToProcess.push({
+                  name: event.result.name,
+                  args: event.call?.args ?? {},
+                  resultText: event.result.output ?? "",
+                });
+              }
+            }
+            onStream?.(event);
+          },
+        });
+      } catch (err) {
      // Model call failed — record and try recovery
        state = recordProgressEvent(state, "model_call_failed", err instanceof Error ? err.message : String(err));
        state = incrementNoProgressStreak(state);
@@ -231,10 +325,15 @@ export async function runContinuableAgent<TLedger, TOutput>(
        throw err;
      }
 
-     // Update state after successful call
-     state = bumpModelCalls(state, toolCallCount) as AgentContinuationState<TLedger, TOutput>;
-     state = resetNoProgressStreak(state) as AgentContinuationState<TLedger, TOutput>;
-     state = recordProgressEvent(state, "looplet_completed", `phase=${state.phase}, tools=${toolCallCount}`) as AgentContinuationState<TLedger, TOutput>;
+      // Update state after successful call
+      state = bumpModelCalls(state, toolCallCount) as AgentContinuationState<TLedger, TOutput>;
+      state = resetNoProgressStreak(state) as AgentContinuationState<TLedger, TOutput>;
+      state = recordProgressEvent(state, "looplet_completed", `phase=${state.phase}, tools=${toolCallCount}`) as AgentContinuationState<TLedger, TOutput>;
+
+      // Process collected tool results for negative evidence tracking
+      for (const toolResult of toolResultsToProcess) {
+        state = updateDiscoveryLedgerFromToolResult(state, toolResult.name, toolResult.args, toolResult.resultText);
+      }
 
     // Try to extract output from result
     let loopletPhaseAdvanced = false;

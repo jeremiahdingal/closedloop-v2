@@ -64,15 +64,48 @@ export type DependencyEdge = {
   reason: string;
 };
 
+export type NegativeEvidence = {
+  target: string;
+  phase: string;
+  failedPatterns: string[];
+  weakMatches: string[];
+  proxyFiles: string[];
+  searchCount: number;
+  lastSummary?: string;
+  exhausted: boolean;
+};
+
+export type PositiveEvidence = {
+  target: string;
+  files: string[];
+  facts: string[];
+  phase: string;
+};
+
+export type DiscoveryLedger = {
+  negativeEvidence: NegativeEvidence[];
+  successfulEvidence: PositiveEvidence[];
+};
+
 export type EpicDecoderLedger = {
   evidenceSlots: Record<string, EvidenceSlot>;
   ticketSkeletons: TicketSkeleton[];
   dependencyGraph: DependencyEdge[];
   finalCandidate: Json | null;
+  discoveryLedger: DiscoveryLedger;
 };
 
 export function createEpicDecoderLedger(): EpicDecoderLedger {
-  return { evidenceSlots: {}, ticketSkeletons: [], dependencyGraph: [], finalCandidate: null };
+  return {
+    evidenceSlots: {},
+    ticketSkeletons: [],
+    dependencyGraph: [],
+    finalCandidate: null,
+    discoveryLedger: {
+      negativeEvidence: [],
+      successfulEvidence: [],
+    },
+  };
 }
 
 // ─── Ticket Hardener ─────────────────────────────────────────────────────────

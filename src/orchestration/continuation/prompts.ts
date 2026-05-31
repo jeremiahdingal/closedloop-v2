@@ -1,4 +1,5 @@
 import type { LocalAgentRole } from "./agent-state.ts";
+import { buildNegativeEvidenceInjection } from "./negative-evidence.ts";
 
 // ─── Role phase definitions ──────────────────────────────────────────────────
 
@@ -249,11 +250,22 @@ export function buildEpicDecoderContinuationPrompt({
             .map((ticket: any) => `${ticket.id}: ${ticket.responsibility ?? "(no responsibility)"} [${ticket.status ?? "skeleton"}]`)
             .join("\n")
         : "";
+
+      // Build negative evidence injection if available
+      const discoveryLedger = state.ledger?.discoveryLedger;
+      const negativeInjection = discoveryLedger ? buildNegativeEvidenceInjection(discoveryLedger) : "";
+
       return [
         `You are in phase: evidence.`,
         ``,
         `Use the listed ticket skeletons below to decide which files need evidence.`,
         ticketSkeletons ? `Ticket skeletons:\n${ticketSkeletons}` : `Ticket skeletons are not available in the prompt; infer the next narrow evidence target from the epic and current phase.`,
+        ``,
+        negativeInjection ? negativeInjection : "",
+        ``,
+        `NEGATIVE EVIDENCE RULE:`,
+        `If a target has already been searched and no results found, do NOT search for it again.`,
+        `Treat missing targets as facts and move to the next evidence slot.`,
         ``,
         `Call one allowed evidence tool immediately: glob_files, grep_files, semantic_search, read_file, or read_files.`,
         `Do not narrate your plan in prose. Do not call finish in this phase.`,

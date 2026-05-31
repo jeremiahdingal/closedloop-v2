@@ -703,3 +703,125 @@ test("state update functions return new objects (immutability)", () => {
   assert.equal(updated3.loopletIndex, 1);
   assert.equal(updated4.totalModelCalls, 1);
 });
+
+// ─── Negative Evidence Tracking ──────────────────────────────────────────────
+
+import {
+  inferSearchTarget,
+  isUsefulProjectFile,
+  isWeakOrIrrelevantResult,
+  recordNegativeEvidence,
+  recordPositiveEvidence,
+  isTargetExhausted,
+  shouldBlockSearch,
+  buildNegativeEvidenceInjection,
+} from "../src/orchestration/continuation/negative-evidence.ts";
+import type { DiscoveryLedger } from "../src/orchestration/continuation/role-ledgers.ts";
+
+test("inferSearchTarget extracts target from pattern", () => {
+  assert.equal(inferSearchTarget("**/*contact*.tsx"), "contact");
+  assert.equal(inferSearchTarget("**/checkout-flow.spec.ts"), "checkout");
+  assert.equal(inferSearchTarget("**/auth/middleware.ts"), "auth");
+  assert.equal(inferSearchTarget("**/routing/*.ts"), "routing");
+  assert.equal(inferSearchTarget("**/payment*.ts"), "payment");
+  assert.equal(inferSearchTarget("random file"), null);
+});
+
+test("isUsefulProjectFile filters out dependency files", () => {
+  assert.equal(isUsefulProjectFile("src/components/Button.tsx"), true);
+  assert.equal(isUsefulProjectFile("node_modules/lodash/index.js"), false);
+  assert.equal(isUsefulProjectFile("dist/bundle.js"), false);
+  assert.equal(isUsefulProjectFile("build/output.js"), false);
+  assert.equal(isUsefulProjectFile(".next/server/index.js"), false);
+});
+
+test("isWeakOrIrrelevantResult detects empty results", () => {
+  assert.equal(isWeakOrIrrelevantResult("No files matched"), true);
+  assert.equal(isWeakOrIrrelevantResult(""), true);
+  assert.equal(isWeakOrIrrelevantResult("src/components/Button.tsx", ["src/components/Button.tsx"]), false);
+  assert.equal(isWeakOrIrrelevantResult("node_modules/lodash/index.js", ["node_modules/lodash/index.js"]), true);
+});
+
+test("recordNegativeEvidence tracks failed searches", () => {
+  const ledger: DiscoveryLedger = {
+    negativeEvidence: [],
+    successfulEvidence: [],
+  };
+
+  const updated = recordNegativeEvidence(ledger, "contact", "evidence", "**/*contact*", "No files matched", true);
+  assert.equal(updated.negativeEvidence.length, 1);
+  assert.equal(updated.negativeEvidence[0].target, "contact");
+  assert.equal(updated.negativeEvidence[0].searchCount, 1);
+  assert.equal(updated.negativeEvidence[0].exhausted, false);
+
+  const updated2 = recordNegativeEvidence(updated, "contact", "evidence", "**/*Contact*.tsx", "No files matched", true);
+  assert.equal(updated2.negativeEvidence[0].searchCount, 2);
+
+  const updated3 = recordNegativeEvidence(updated2, "contact", "evidence", "**/contact/**", "No files matched", true);
+  assert.equal(updated3.negativeEvidence[0].searchCount, 3);
+  assert.equal(updated3.negativeEvidence[0].exhausted, true);
+});
+
+test("recordPositiveEvidence tracks successful searches", () => {
+  const ledger: DiscoveryLedger = {
+    negativeEvidence: [],
+    successfulEvidence: [],
+  };
+
+  const updated = recordPositiveEvidence(ledger, "checkout", "evidence", ["tests/checkout.spec.ts"], ["Checkout test found"]);
+  assert.equal(updated.successfulEvidence.length, 1);
+  assert.equal(updated.successfulEvidence[0].files.length, 1);
+
+  const updated2 = recordPositiveEvidence(updated, "checkout", "evidence", ["src/checkout.ts"], ["Checkout component found"]);
+  assert.equal(updated2.successfulEvidence[0].files.length, 2);
+});
+
+test("isTargetExhausted detects exhausted targets", () => {
+  const ledger: DiscoveryLedger = {
+    negativeEvidence: [
+      { target: "contact", phase: "evidence", failedPatterns: ["**/*contact*"], weakMatches: ["**/*contact*"], proxyFiles: [], searchCount: 3, exhausted: true },
+      { target: "checkout", phase: "evidence", failedPatterns: ["**/*checkout*"], weakMatches: [], proxyFiles: [], searchCount: 1, exhausted: false },
+    ],
+    successfulEvidence: [],
+  };
+
+  assert.equal(isTargetExhausted(ledger, "contact"), true);
+  assert.equal(isTargetExhausted(ledger, "checkout"), false);
+  assert.equal(isTargetExhausted(ledger, "nonexistent"), false);
+});
+
+test("shouldBlockSearch prevents re-searching exhausted targets", () => {
+  const ledger: DiscoveryLedger = {
+    negativeEvidence: [
+      { target: "contact", phase: "evidence", failedPatterns: ["**/*contact*"], weakMatches: ["**/*contact*"], proxyFiles: [], searchCount: 3, exhausted: true },
+    ],
+    successfulEvidence: [],
+  };
+
+  assert.equal(shouldBlockSearch(ledger, "contact", "**/*Contact*"), true);
+  assert.equal(shouldBlockSearch(ledger, "checkout", "**/*checkout*"), false);
+});
+
+test("buildNegativeEvidenceInjection generates resume prompt", () => {
+  const ledger: DiscoveryLedger = {
+    negativeEvidence: [
+      { target: "contact", phase: "evidence", failedPatterns: ["**/*contact*", "**/*Contact*"], weakMatches: ["**/*contact*"], proxyFiles: ["packages/ui/Button.tsx"], searchCount: 2, exhausted: true },
+    ],
+    successfulEvidence: [
+      { target: "checkout", files: ["tests/checkout.spec.ts"], facts: ["Checkout test found"], phase: "evidence" },
+    ],
+  };
+
+  const injection = buildNegativeEvidenceInjection(ledger, "contact");
+  assert.ok(injection.includes("NEGATIVE EVIDENCE CARRIED FORWARD"));
+  assert.ok(injection.includes('Target "contact" appears missing'));
+  assert.ok(injection.includes("**/*contact*"));
+  assert.ok(injection.includes("Do NOT repeat"));
+});
+
+test("createEpicDecoderLedger includes discovery ledger", () => {
+  const ledger = createEpicDecoderLedger();
+  assert.ok(ledger.discoveryLedger);
+  assert.deepEqual(ledger.discoveryLedger.negativeEvidence, []);
+  assert.deepEqual(ledger.discoveryLedger.successfulEvidence, []);
+});

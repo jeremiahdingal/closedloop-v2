@@ -10,6 +10,7 @@ import type {
   TesterLedger,
   EpicDecoderLedger,
 } from "./role-ledgers.ts";
+import { isTargetExhausted } from "./negative-evidence.ts";
 
 // ─── Stall detection result ──────────────────────────────────────────────────
 
@@ -224,6 +225,22 @@ function detectTesterStall(state: AgentContinuationState<TesterLedger>): StallDe
 
 function detectDecoderStall(state: AgentContinuationState<EpicDecoderLedger>): StallDetectionResult {
   const ledger = state.ledger;
+
+  // Check for search exhaustion - if all targets are exhausted, force finish
+  const discovery = ledger.discoveryLedger;
+  if (discovery.negativeEvidence.length > 0) {
+    const allExhausted = discovery.negativeEvidence.every((ne) => ne.exhausted);
+    const hasExhaustedTarget = discovery.negativeEvidence.some((ne) => ne.exhausted);
+
+    if (hasExhaustedTarget) {
+      return {
+        stalled: true,
+        kind: "busy_no_progress",
+        streak: discovery.negativeEvidence.reduce((sum, ne) => sum + ne.searchCount, 0),
+        action: { kind: "cold_resume" },
+      };
+    }
+  }
 
   // All skeletons filled but no final candidate
   const filledTickets = ledger.ticketSkeletons.filter((t) => t.status === "filled");

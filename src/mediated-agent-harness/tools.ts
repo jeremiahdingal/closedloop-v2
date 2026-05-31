@@ -1066,6 +1066,14 @@ async function execGlobFiles(
       "--glob", pattern,
       "--glob", "!.git/**",
       "--glob", "!node_modules/**",
+      "--glob", "!.yarn/**",
+      "--glob", "!.pnp.*",
+      "--glob", "!.closedloop/**",
+      "--glob", "!.claude/**",
+      "--glob", "!.qwen/**",
+      "--glob", "!.zai/**",
+      "--glob", "!frontend-dist/**",
+      "--glob", "!data/**",
       cwd
     ], { cwd, timeout: 10000, maxBuffer: 1024 * 1024 });
     for (const line of stdout.split("\n")) {
@@ -1074,11 +1082,17 @@ async function execGlobFiles(
     }
   } catch {
     // Fallback to node:fs recursive walk
+    const IGNORED_DIRS = new Set([
+      ".git", "node_modules", ".yarn", ".pnp",
+      ".closedloop", ".claude", ".qwen", ".zai",
+      "frontend-dist", "data",
+    ]);
     const entries = await readdir(cwd, { recursive: true, withFileTypes: true });
     for (const entry of entries) {
       const entryPath = path.join(entry.parentPath ?? cwd, entry.name);
       const rel = path.relative(cwd, entryPath);
-      if (rel.startsWith(".git") || rel.startsWith("node_modules") || rel.includes(`${path.sep}.git${path.sep}`)) continue;
+      const parts = rel.split(path.sep);
+      if (parts.some(p => IGNORED_DIRS.has(p))) continue;
       if (matchGlob(rel, pattern)) {
         results.push(rel);
       }
@@ -1087,6 +1101,29 @@ async function execGlobFiles(
 
   // Limit to first 100 results to avoid overwhelming context
   const limited = results.sort().slice(0, 100);
+
+  // If we have many results, provide a compact summary
+  if (results.length > 20) {
+    const usefulFiles = limited.filter(f =>
+      !f.includes("node_modules/") &&
+      !f.includes("dist/") &&
+      !f.includes("build/") &&
+      !f.includes(".next/") &&
+      !f.includes(".expo/") &&
+      !f.includes("coverage/")
+    );
+    const omittedCount = results.length - usefulFiles.length;
+
+    return {
+      callId,
+      name: "glob_files",
+      output: usefulFiles.length > 0
+        ? `Large result: ${results.length} files matched. ${omittedCount > 0 ? `${omittedCount} dependency/build files omitted.` : ""}\nUseful project files:\n${usefulFiles.slice(0, 20).map(p => p.replace(/\\/g, "/")).join("\n")}`
+        : `No useful project files matched the pattern "${pattern}". ${results.length} dependency/build files were excluded.`,
+      isError: false
+    };
+  }
+
   return {
     callId,
     name: "glob_files",
