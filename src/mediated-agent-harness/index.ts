@@ -73,6 +73,7 @@ export class MediatedAgentHarness {
         topK: options?.topK,
         braveApiKey: options?.braveApiKey ?? this.braveApiKey,
         onEvent: options?.onEvent,
+        continuation: options?.continuation,
       },
       toolContext: this.toolContext,
     });
@@ -101,6 +102,7 @@ export class MediatedAgentHarness {
         topK: options?.topK,
         braveApiKey: options?.braveApiKey ?? this.braveApiKey,
         onEvent: options?.onEvent,
+        continuation: options?.continuation,
       },
       toolContext: this.toolContext,
     });

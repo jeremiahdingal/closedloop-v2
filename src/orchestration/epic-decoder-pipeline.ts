@@ -20,6 +20,7 @@ import { resolveRuntimeProfile } from "../runtime-profile.ts";
 import { StagnationError, LoopTimeoutError } from "../mediated-agent-harness/errors.ts";
 import { detectBusyStall } from "./continuation/progress.ts";
 import { recordProgressEvent, incrementNoProgressStreak, resetNoProgressStreak, advanceLooplet, type AgentContinuationState } from "./continuation/agent-state.ts";
+import { runContinuableEpicDecoder } from "./continuation/controller.ts";
 
 async function withStageRecovery<T>(
   stageName: string,
@@ -127,6 +128,20 @@ async function runDraftDecoder(
       || configuredModel.startsWith("mediated:")
     )
   ) {
+    if (configuredModel.startsWith("mediated:") || configuredModel.startsWith("anthropic-mediated:")) {
+      const result = await runContinuableEpicDecoder({
+        epicId: epic.id,
+        runId,
+        cwd: epic.targetDir,
+        prompt: effectivePrompt,
+        gateway,
+        onStream,
+      });
+      if (result.output && typeof result.output === "object" && "tickets" in result.output) {
+        return result.output as GoalDecomposition;
+      }
+      return result.output as GoalDecomposition;
+    }
     return gateway.runEpicDecoderInWorkspace({ cwd: epic.targetDir, prompt: effectivePrompt, runId, epicId: epic.id, db, onStream });
   }
   if (gateway.runEpicDecoderOpenCode && configuredModel.startsWith("opencode:")) {

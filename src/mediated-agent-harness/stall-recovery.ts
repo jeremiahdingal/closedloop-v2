@@ -28,7 +28,7 @@ export interface LoopStallSignals {
 // ─── Stall classification ────────────────────────────────────────────────────
 
 export function classifyStall(signals: LoopStallSignals): StallKind | null {
-  if (signals.consecutiveErrors >= 3) return "consecutive_errors";
+  if (signals.consecutiveErrors >= 5) return "consecutive_errors";
   if (signals.repeatedCallCount >= 3) return "repeated_call";
   if (signals.hasEmptyResponse) return "empty_response";
   if (signals.hasNoToolCalls) return "no_tool_calls";
@@ -91,7 +91,7 @@ function getEmptyResponseAction(level: StallLevel, reminder: string, role: strin
   switch (level) {
     case "gentle":
       return {
-        nudgeMessage: `continue\n\n${reminder}\nYour last response had no tool call. You MUST call a tool in every response. If you have enough information, call the 'finish' tool now. Otherwise call a tool to continue working.`,
+        nudgeMessage: `continue\n\nNo tool call received. Call a tool now. If done, call finish.`,
         allowRetry: true,
         forceFinish: false,
         forceXmlMode: false,
@@ -99,7 +99,7 @@ function getEmptyResponseAction(level: StallLevel, reminder: string, role: strin
       };
     case "moderate":
       return {
-        nudgeMessage: `${reminder}\nNative tool calling seems unreliable. Switching to XML format.\nUse this EXACT format for tool calls:\n<function=tool_name><parameter name="param1">value1</parameter></function>\n\nExample: <function=finish><parameter name="summary">my summary</parameter><parameter name="result">{"key":"value"}</parameter></function>\n\nYou MUST use this XML format for your next response. No prose, no markdown, just one XML function call.`,
+        nudgeMessage: `continue\n\nSwitching to XML tool format. Use: <function=tool_name><parameter name="param">value</parameter></function>`,
         allowRetry: true,
         forceFinish: false,
         forceXmlMode: true,
@@ -107,7 +107,7 @@ function getEmptyResponseAction(level: StallLevel, reminder: string, role: strin
       };
     case "strong":
       return {
-        nudgeMessage: `[SYSTEM] ${reminder}\nYou keep failing to produce tool calls. Call the 'finish' tool NOW with whatever you have. This is your last chance before forced termination.`,
+        nudgeMessage: `continue\n\nCall finish NOW with whatever you have.`,
         allowRetry: true,
         forceFinish: false,
         forceXmlMode: false,
@@ -115,7 +115,7 @@ function getEmptyResponseAction(level: StallLevel, reminder: string, role: strin
       };
     default:
       return {
-        nudgeMessage: "[SYSTEM] Call finish NOW.",
+        nudgeMessage: "Call finish NOW.",
         allowRetry: false,
         forceFinish: true,
         forceXmlMode: false,
@@ -128,7 +128,7 @@ function getRepeatedCallAction(level: StallLevel, reminder: string): RecoveryAct
   switch (level) {
     case "gentle":
       return {
-        nudgeMessage: `continue\n\n${reminder}\nYou are repeating the same tool call. Try a different approach — use different arguments, a different tool, or call finish with what you have.`,
+        nudgeMessage: `continue\n\nYou are repeating the same tool call. Use different arguments or call finish.`,
         allowRetry: true,
         forceFinish: false,
         forceXmlMode: false,
@@ -136,7 +136,7 @@ function getRepeatedCallAction(level: StallLevel, reminder: string): RecoveryAct
       };
     case "moderate":
       return {
-        nudgeMessage: `${reminder}\nYou keep repeating the same call. Either call the 'finish' tool with your current findings, or try a completely different tool. Do not repeat the same call.`,
+        nudgeMessage: `continue\n\nRepeated same call. Call finish or use a different tool.`,
         allowRetry: true,
         forceFinish: false,
         forceXmlMode: false,
@@ -144,7 +144,7 @@ function getRepeatedCallAction(level: StallLevel, reminder: string): RecoveryAct
       };
     case "strong":
       return {
-        nudgeMessage: `[SYSTEM] ${reminder}\nRepeated calls are not making progress. Call finish NOW with whatever you have.`,
+        nudgeMessage: `continue\n\nCall finish NOW with whatever you have.`,
         allowRetry: true,
         forceFinish: false,
         forceXmlMode: false,
@@ -152,7 +152,7 @@ function getRepeatedCallAction(level: StallLevel, reminder: string): RecoveryAct
       };
     default:
       return {
-        nudgeMessage: "[SYSTEM] Call finish NOW.",
+        nudgeMessage: "Call finish NOW.",
         allowRetry: false,
         forceFinish: true,
         forceXmlMode: false,
@@ -165,7 +165,7 @@ function getConsecutiveErrorAction(level: StallLevel, reminder: string): Recover
   switch (level) {
     case "gentle":
       return {
-        nudgeMessage: `continue\n\n${reminder}\nYou have had several tool errors. Review the error messages above. Try a simpler call or use different arguments. If you cannot proceed, call finish.`,
+        nudgeMessage: `continue\n\nTool errors detected. Try simpler arguments or call finish.`,
         allowRetry: true,
         forceFinish: false,
         forceXmlMode: false,
@@ -173,7 +173,7 @@ function getConsecutiveErrorAction(level: StallLevel, reminder: string): Recover
       };
     case "moderate":
       return {
-        nudgeMessage: `${reminder}\nMultiple consecutive errors suggest the current approach isn't working. Try using XML format for your next call:\n<function=tool_name><parameter name="param">value</parameter></function>\nOr call finish if you have enough to proceed.`,
+        nudgeMessage: `continue\n\nSwitching to XML tool format. Use: <function=tool_name><parameter name="param">value</parameter></function>`,
         allowRetry: true,
         forceFinish: false,
         forceXmlMode: true,
@@ -181,7 +181,7 @@ function getConsecutiveErrorAction(level: StallLevel, reminder: string): Recover
       };
     case "strong":
       return {
-        nudgeMessage: `[SYSTEM] ${reminder}\nToo many errors. Call finish NOW with whatever partial results you have.`,
+        nudgeMessage: `continue\n\nCall finish NOW with whatever you have.`,
         allowRetry: true,
         forceFinish: false,
         forceXmlMode: false,
@@ -189,7 +189,7 @@ function getConsecutiveErrorAction(level: StallLevel, reminder: string): Recover
       };
     default:
       return {
-        nudgeMessage: "[SYSTEM] Call finish NOW.",
+        nudgeMessage: "Call finish NOW.",
         allowRetry: false,
         forceFinish: true,
         forceXmlMode: false,

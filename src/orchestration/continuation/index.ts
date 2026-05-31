@@ -19,13 +19,14 @@ export {
   resetNoProgressStreak,
   advanceLooplet,
   bumpModelCalls,
+  getInitialPhaseForRole,
 } from "./agent-state.ts";
 
 export type { StallDetectionResult } from "./progress.ts";
 export { detectBusyStall } from "./progress.ts";
 
 export { buildColdResumePrompt } from "./resume.ts";
-export { buildPhasePrompt, getInitialPhase, getNextPhase, ROLE_PHASES } from "./prompts.ts";
+export { buildPhasePrompt, getInitialPhase, getNextPhase, ROLE_PHASES, getAllowedToolsForPhase, buildEpicDecoderContinuationPrompt } from "./prompts.ts";
 export { persistState, loadState, persistHandoff, stateArtifactName, draftArtifactName, handoffArtifactName } from "./persistence.ts";
 
 export {

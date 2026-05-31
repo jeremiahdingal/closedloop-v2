@@ -10,11 +10,12 @@ import {
 } from "./agent-state.ts";
 import { detectBusyStall, type StallDetectionResult } from "./progress.ts";
 import { buildColdResumePrompt } from "./resume.ts";
-import { buildPhasePrompt, getNextPhase } from "./prompts.ts";
+import { buildPhasePrompt, getNextPhase, getAllowedToolsForPhase, buildEpicDecoderContinuationPrompt, ROLE_PHASES } from "./prompts.ts";
 import { persistState, loadState, persistHandoff } from "./persistence.ts";
 import { createDefaultLedger } from "./role-ledgers.ts";
 import type { ModelGateway, StreamHook } from "../models.ts";
 import type { ToolExecutionContext, MediatedHarnessEvent } from "../../mediated-agent-harness/types.ts";
+import { parseJsonText } from "../validation.ts";
 
 // ─── Controller config ───────────────────────────────────────────────────────
 
@@ -121,10 +122,42 @@ export async function runContinuableAgent<TLedger, TOutput>(
       });
     }
 
+    // Emit continuation looplet start trace marker
+    const allowedTools = getAllowedToolsForPhase(role, state.phase);
+    onStream?.({
+      agentRole: role as any,
+      source: "continuation-controller",
+      streamKind: "continuation_looplet_start",
+      content: JSON.stringify({
+        kind: 'continuation_looplet_start',
+        role,
+        phase: state.phase,
+        loopletIndex: looplet,
+        maxIterations: loopletIterations,
+        allowedTools,
+      }),
+      runId,
+      sequence: 0,
+      metadata: { role, phase: state.phase, loopletIndex: looplet, maxIterations: loopletIterations, allowedTools },
+    });
+
     // Build the prompt for this looplet
     const phasePrompt = buildPhasePrompt(role, state.phase);
     const resumeSuffix = looplet > 0 ? "\n\n" + buildColdResumePrompt(state) : "";
-    const prompt = objective + (phasePrompt ? "\n\n" + phasePrompt : "") + resumeSuffix;
+    
+    // Use continuation-specific prompt for epicDecoder if available
+    let prompt = objective + (phasePrompt ? "\n\n" + phasePrompt : "") + resumeSuffix;
+    if (role === "epicDecoder" && state.phase !== "final_json") {
+      // For epicDecoder in continuation mode, use the continuation-specific prompt
+      // This will be passed through the gateway and override the default prompt
+      const continuationPrompt = buildEpicDecoderContinuationPrompt({
+        epic: objective,
+        state,
+      });
+      if (continuationPrompt) {
+        prompt = continuationPrompt + resumeSuffix;
+      }
+    }
 
     onStream?.({
       agentRole: role as any,
@@ -147,6 +180,12 @@ export async function runContinuableAgent<TLedger, TOutput>(
         ticketId: config.ticketId,
         epicId: config.epicId,
         ...config.gatewayExtraArgs,
+        continuation: {
+          enabled: true,
+          phase: state.phase,
+          maxIterations: loopletIterations,
+          allowedToolsOverride: allowedTools,
+        },
         onStream: (event: any) => {
           // Track visited files and tool calls from stream events
           if (event.kind === "tool_call" && event.call?.name === "read_file") {
@@ -198,23 +237,42 @@ export async function runContinuableAgent<TLedger, TOutput>(
      state = recordProgressEvent(state, "looplet_completed", `phase=${state.phase}, tools=${toolCallCount}`) as AgentContinuationState<TLedger, TOutput>;
 
     // Try to extract output from result
+    let loopletPhaseAdvanced = false;
     if (result !== null && result !== undefined) {
-      state = { ...state, draftOutput: result as TOutput };
-      state = recordProgressEvent(state, "draft_output_updated");
-      onStream?.({
-        agentRole: role as any,
-        source: "continuation-controller",
-        streamKind: "status",
-        content: `Draft output captured in phase ${state.phase}.`,
-        runId,
-        sequence: 0,
-        metadata: { phase: state.phase, looplet: looplet + 1 },
-      });
+      const parsedResult = typeof result === "string" ? parseJsonText(result) : result;
+      if (isLoopletPayload(parsedResult)) {
+        const updated = updateStateFromLooplet(state, parsedResult);
+        state = updated.state;
+        loopletPhaseAdvanced = updated.phaseAdvanced;
+        state = recordProgressEvent(state, "looplet_payload_applied", parsedResult.summary ?? state.phase);
+        onStream?.({
+          agentRole: role as any,
+          source: "continuation-controller",
+          streamKind: "status",
+          content: `Looplet payload captured in phase ${state.phase}.`,
+          runId,
+          sequence: 0,
+          metadata: { phase: state.phase, looplet: looplet + 1 },
+        });
+      } else {
+        state = { ...state, draftOutput: parsedResult as TOutput };
+        state = recordProgressEvent(state, "draft_output_updated");
+        onStream?.({
+          agentRole: role as any,
+          source: "continuation-controller",
+          streamKind: "status",
+          content: `Draft output captured in phase ${state.phase}.`,
+          runId,
+          sequence: 0,
+          metadata: { phase: state.phase, looplet: looplet + 1 },
+        });
+      }
     }
 
     // Advance phase if appropriate
     const nextPhase = getNextPhase(role, state.phase);
-    if (nextPhase && state.draftOutput !== null) {
+    const shouldAdvance = !loopletPhaseAdvanced && (shouldAdvancePhase(role, state) || (nextPhase && state.draftOutput !== null));
+    if (shouldAdvance && nextPhase) {
       state = { ...state, phase: nextPhase };
       state = recordProgressEvent(state, "phase_advanced", nextPhase);
       onStream?.({
@@ -308,6 +366,173 @@ async function callGateway(
    }
    return (gateway as any)[method](args);
  }
+
+type LoopletPayload = {
+  summary?: string;
+  phaseComplete?: boolean;
+  requestedNextPhase?: string;
+  ticketUpdates?: Array<{ id: string; responsibility?: string; status?: string }>;
+  evidenceUpdates?: Array<{ slotId: string; facts?: string[]; files?: string[] }>;
+  finalCandidate?: unknown;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isLoopletPayload(value: unknown): value is LoopletPayload {
+  if (!isRecord(value)) return false;
+  return (
+    "phaseComplete" in value
+    || "requestedNextPhase" in value
+    || "ticketUpdates" in value
+    || "evidenceUpdates" in value
+    || "finalCandidate" in value
+  );
+}
+
+function updateStateFromLooplet<TLedger, TOutput>(
+  state: AgentContinuationState<TLedger, TOutput>,
+  payload: LoopletPayload,
+): { state: AgentContinuationState<TLedger, TOutput>; phaseAdvanced: boolean } {
+  let nextState = state;
+  let phaseAdvanced = false;
+
+  if (state.role === "epicDecoder") {
+    const ledger = { ...(state.ledger as any) };
+    if (Array.isArray(payload.ticketUpdates) && payload.ticketUpdates.length > 0) {
+      const existingTickets = Array.isArray(ledger.ticketSkeletons) ? [...ledger.ticketSkeletons] : [];
+      const byId = new Map(existingTickets.map((ticket: any) => [ticket.id, ticket]));
+      for (const update of payload.ticketUpdates) {
+        if (!update?.id) continue;
+        const current = byId.get(update.id) ?? {};
+        byId.set(update.id, {
+          ...current,
+          id: update.id,
+          responsibility: update.responsibility ?? current.responsibility ?? "",
+          status: update.status ?? current.status ?? "skeleton",
+        });
+      }
+      ledger.ticketSkeletons = [...byId.values()];
+    }
+    if (Array.isArray(payload.evidenceUpdates) && payload.evidenceUpdates.length > 0) {
+      const evidenceSlots = { ...(ledger.evidenceSlots ?? {}) };
+      for (const update of payload.evidenceUpdates) {
+        if (!update?.slotId) continue;
+        const current = evidenceSlots[update.slotId] ?? { status: "missing", files: [], facts: [], ticketImplications: [] };
+        const facts = [...new Set([...(current.facts ?? []), ...(update.facts ?? [])])];
+        const files = [...new Set([...(current.files ?? []), ...(update.files ?? [])])];
+        evidenceSlots[update.slotId] = {
+          ...current,
+          files,
+          facts,
+          status: facts.length > 0 || files.length > 0 ? "filled" : current.status,
+        };
+      }
+      ledger.evidenceSlots = evidenceSlots;
+    }
+    if ("finalCandidate" in payload) {
+      ledger.finalCandidate = payload.finalCandidate ?? null;
+    }
+    nextState = { ...state, ledger: ledger as TLedger };
+  }
+
+  const requestedPhase = typeof payload.requestedNextPhase === "string" && ROLE_PHASES[state.role]?.includes(payload.requestedNextPhase)
+    ? payload.requestedNextPhase
+    : null;
+  if (requestedPhase) {
+    nextState = { ...nextState, phase: requestedPhase };
+    phaseAdvanced = true;
+  } else if (payload.phaseComplete) {
+    const nextPhase = getNextPhase(state.role, nextState.phase);
+    if (nextPhase) {
+      nextState = { ...nextState, phase: nextPhase };
+      phaseAdvanced = true;
+    }
+  }
+
+  return { state: nextState, phaseAdvanced };
+}
+
+// ─── State-progress detection ──────────────────────────────────────────────
+
+function classifyDecoderToolProgress(
+  toolName: string,
+  args: Record<string, unknown>,
+  result: string,
+  state: AgentContinuationState<any>
+): { kind: string; slotId?: string; facts?: string[] }[] {
+  if (toolName === "read_file") {
+    const path = args.path as string;
+    if (!path) return [];
+    
+    // Check if this file maps to an evidence slot
+    const ledger = state.ledger as any;
+    if (!ledger?.evidenceSlots) return [];
+    
+    for (const [slotId, slot] of Object.entries(ledger.evidenceSlots)) {
+      const slotFiles = (slot as any).files ?? [];
+      if (slotFiles.some((f: string) => path.includes(f) || f.includes(path))) {
+        // Extract facts from the result
+        const facts = extractEvidenceFacts(result);
+        if (facts.length > 0) {
+          return [{
+            kind: "evidence_slot_updated",
+            slotId,
+            facts,
+          }];
+        }
+      }
+    }
+  }
+  
+  return [];
+}
+
+function extractEvidenceFacts(result: string): string[] {
+  // Extract facts from file read result - take meaningful lines
+  const lines = result.split("\n")
+    .filter(l => l.trim().length > 10 && !l.trim().startsWith("//") && !l.trim().startsWith("/*"))
+    .slice(0, 10);
+  return lines;
+}
+
+// ─── Deterministic phase transitions ────────────────────────────────────────
+
+function shouldAdvancePhase(role: LocalAgentRole, state: AgentContinuationState<any>): boolean {
+  if (role === "epicDecoder") {
+    const ledger = state.ledger as any;
+    
+    if (state.phase === "skeleton" && ledger.ticketSkeletons?.length >= 5) {
+      return true;
+    }
+    
+    if (state.phase === "evidence") {
+      const totalSlots = Object.keys(ledger.evidenceSlots ?? {}).length;
+      const filledSlots = Object.values(ledger.evidenceSlots ?? {})
+        .filter((s: any) => s.status === "filled").length;
+      if (totalSlots > 0 && filledSlots / totalSlots >= 0.7) {
+        return true;
+      }
+    }
+    
+    if (state.phase === "fill_tickets") {
+      const allPartiallyFilled = (ledger.ticketSkeletons ?? []).every((t: any) => 
+        t.status === "filled" || t.status === "skeleton"
+      );
+      if (allPartiallyFilled && ledger.ticketSkeletons?.length > 0) {
+        return true;
+      }
+    }
+    
+    if (state.phase === "self_check") {
+      // If validation passes or is repairable, advance
+      return true;
+    }
+  }
+  
+  return false;
+}
 
 async function applyRecovery<TLedger, TOutput>(
    state: AgentContinuationState<TLedger, TOutput>,

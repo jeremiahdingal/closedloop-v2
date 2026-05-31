@@ -1,4 +1,4 @@
-﻿import path from "node:path";
+import path from "node:path";
 import { readFile, readdir, stat, writeFile, mkdir, unlink } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -647,7 +647,7 @@ export const WORKSPACE_TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "finish",
-      description: "Signal that the task is complete. Provide a summary and the final result as a JSON string.",
+      description: "Signal that the task is complete. Provide the final result as a JSON string. Example: {\"result\":\"{\\\"summary\\\":\\\"...\\\",\\\"tickets\\\":[...]}\", \"summary\":\"Done\"}",
       parameters: {
         type: "object",
         properties: {
@@ -661,6 +661,60 @@ export const WORKSPACE_TOOLS: ToolDef[] = [
           }
         },
         required: ["result"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "finish_looplet",
+      description: "Signal completion of the current phase. Use this instead of finish when you want to advance to the next phase. Example: {\"summary\":\"Created 3 ticket skeletons\",\"phaseComplete\":true,\"ticketUpdates\":[{\"id\":\"T001\",\"responsibility\":\"Setup routing\",\"status\":\"skeleton\"}]}",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: {
+            type: "string",
+            description: "Brief summary of what was accomplished"
+          },
+          phaseComplete: {
+            type: "boolean",
+            description: "Whether the current phase is complete"
+          },
+          requestedNextPhase: {
+            type: "string",
+            description: "Optional: request a specific next phase"
+          },
+          evidenceUpdates: {
+            type: "array",
+            description: "Updates to evidence slots. Each entry: {\"slotId\":\"T001\",\"facts\":[\"file X does Y\"],\"files\":[\"src/X.ts\"]}",
+            items: {
+              type: "object",
+              properties: {
+                slotId: { type: "string" },
+                facts: { type: "array", items: { type: "string" } },
+                files: { type: "array", items: { type: "string" } },
+              }
+            }
+          },
+          ticketUpdates: {
+            type: "array",
+            description: "Updates to ticket skeletons. Each entry: {\"id\":\"T001\",\"responsibility\":\"Setup routing\",\"status\":\"skeleton\"}",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                responsibility: { type: "string" },
+                status: { type: "string", enum: ["skeleton", "filled", "needs_repair"] },
+              }
+            }
+          },
+          finalCandidate: {
+            type: "object",
+            description: "Final GoalDecomposition candidate"
+          },
+        },
+        required: ["summary", "phaseComplete"],
         additionalProperties: false
       }
     }
@@ -1935,14 +1989,14 @@ export function getCompactToolContract(toolNames: string[]): string {
 
 export function getAvailableToolsList(role: string, options?: { availableCommands?: string[] }): string[] {
   const availableCommands = new Set(options?.availableCommands ?? []);
-  const common = ["explore_mode", "read_file", "read_files", "read_context_packet", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
+  const common = ["explore_mode", "read_file", "read_files", "read_context_packet", "glob_files", "grep_files", "list_dir", "semantic_search", "finish", "finish_looplet"];
   if (role === "builder") {
     return [...common, "write_file", "write_files", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files"];
   }
   if (role === "explorer") {
     return availableCommands.has("install")
       ? [...common, "run_command"]
-      : ["explore_mode", "read_file", "read_files", "read_context_packet", "glob_files", "grep_files", "list_dir", "semantic_search", "finish"];
+      : ["explore_mode", "read_file", "read_files", "read_context_packet", "glob_files", "grep_files", "list_dir", "semantic_search", "finish", "finish_looplet"];
   }
   if (role === "coder") {
     const writeTools = ["write_file", "write_files", "search_replace"];
@@ -1952,13 +2006,13 @@ export function getAvailableToolsList(role: string, options?: { availableCommand
       : [...common, ...writeTools, ...gitTools];
   }
   if (role === "reviewer") {
-    return ["read_file", "list_dir", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files", "finish"];
+    return ["read_file", "list_dir", "remove_file", "git_status", "git_diff", "git_diff_staged", "run_command", "list_changed_files", "finish", "finish_looplet"];
   }
   if (role === "epic-decoder" || role === "epicDecoder") {
-    return ["read_file", "glob_files", "grep_files", "list_dir", "semantic_search", "web_search", "finish"];
+    return ["read_file", "glob_files", "grep_files", "list_dir", "semantic_search", "web_search", "finish", "finish_looplet"];
   }
   if (role === "epic-reviewer" || role === "epicReviewer") {
-    return ["read_file", "read_files", "list_dir", "write_file", "write_files", "search_replace", "remove_file", "glob_files", "grep_files", "run_command", "git_diff", "git_diff_staged", "git_status", "list_changed_files", "finish"];
+    return ["read_file", "read_files", "list_dir", "write_file", "write_files", "search_replace", "remove_file", "glob_files", "grep_files", "run_command", "git_diff", "git_diff_staged", "git_status", "list_changed_files", "finish", "finish_looplet"];
   }
   if (role === "tester") {
     return [...common, "run_command", "git_diff", "git_status"];

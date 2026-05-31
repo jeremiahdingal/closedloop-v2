@@ -114,6 +114,26 @@ export type ContinuationRecoveryAction =
   | { kind: "handoff_to_doctor" }
   | { kind: "handoff_to_repair" };
 
+// ─── Role-aware initial phases ────────────────────────────────────────────────
+
+const ROLE_INITIAL_PHASES: Record<LocalAgentRole, string> = {
+  explorer: "questions",
+  epicDecoder: "skeleton",
+  ticketHardener: "schema_check",
+  decompositionJudge: "atomicity_check",
+  ticketRepair: "load_feedback",
+  builder: "understand_ticket",
+  reviewer: "diff_map",
+  tester: "test_need",
+  epicReviewer: "ticket_outcomes",
+  doctor: "collect_signals",
+  knowledgebaseBuilder: "collect_approved_epics",
+};
+
+export function getInitialPhaseForRole(role: LocalAgentRole): string {
+  return ROLE_INITIAL_PHASES[role] ?? "start";
+}
+
 // ─── Factory ────────────────────────────────────────────────────────────────
 
 export function createContinuationState<TLedger, TOutput>(input: {
@@ -135,7 +155,7 @@ export function createContinuationState<TLedger, TOutput>(input: {
     ticketId: input.ticketId,
     runId: input.runId,
     workspaceId: input.workspaceId,
-    phase: input.phase ?? "init",
+    phase: input.phase ?? getInitialPhaseForRole(input.role),
     loopletIndex: 0,
     totalModelCalls: 0,
     totalToolCalls: 0,

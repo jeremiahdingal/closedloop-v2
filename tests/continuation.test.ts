@@ -21,10 +21,13 @@ import {
 } from "../src/orchestration/continuation/resume.ts";
 import {
   buildPhasePrompt,
+  buildEpicDecoderContinuationPrompt,
   getInitialPhase,
   getNextPhase,
+  getAllowedToolsForPhase,
   ROLE_PHASES,
 } from "../src/orchestration/continuation/prompts.ts";
+import { runContinuableAgent } from "../src/orchestration/continuation/controller.ts";
 import {
   createDefaultLedger,
   createExplorerLedger,
@@ -49,7 +52,7 @@ test("createContinuationState initializes with correct defaults", () => {
   assert.equal(state.version, 1);
   assert.equal(state.role, "explorer");
   assert.equal(state.objective, "Find all API routes");
-  assert.equal(state.phase, "init");
+  assert.equal(state.phase, "questions");
   assert.equal(state.loopletIndex, 0);
   assert.equal(state.totalModelCalls, 0);
   assert.equal(state.totalToolCalls, 0);
@@ -359,6 +362,121 @@ test("buildPhasePrompt returns non-empty string for valid role/phase", () => {
       assert.ok(prompt.length > 0, `Prompt for ${role}/${phase} should not be empty`);
     }
   }
+});
+
+test("runContinuableAgent advances phase after phaseComplete looplet payload", async () => {
+  const gateway = {
+    models: {
+      explorer: "mediated:test",
+      epicDecoder: "mediated:test",
+      ticketHardener: "mediated:test",
+      decompositionJudge: "mediated:test",
+      ticketRepair: "mediated:test",
+      builder: "mediated:test",
+      reviewer: "mediated:test",
+      tester: "mediated:test",
+      doctor: "mediated:test",
+      epicReviewer: "mediated:test",
+      knowledgebaseBuilder: "mediated:test",
+    },
+    runExplorerInWorkspace: async () => JSON.stringify({
+      summary: "questions completed",
+      phaseComplete: true,
+    }),
+  } as any;
+
+  const result = await runContinuableAgent({
+    role: "explorer",
+    objective: "Inspect the repo",
+    cwd: process.cwd(),
+    gateway,
+    gatewayMethod: "runExplorerInWorkspace",
+    maxLooplets: 1,
+    loopletIterations: 1,
+  });
+
+  assert.equal(result.state.phase, "map_files");
+  assert.equal(result.state.draftOutput, null);
+});
+
+test("runContinuableAgent keeps finish_looplet payloads out of final GoalDecomposition parsing", async () => {
+  const gateway = {
+    models: {
+      explorer: "mediated:test",
+      epicDecoder: "mediated:test",
+      ticketHardener: "mediated:test",
+      decompositionJudge: "mediated:test",
+      ticketRepair: "mediated:test",
+      builder: "mediated:test",
+      reviewer: "mediated:test",
+      tester: "mediated:test",
+      doctor: "mediated:test",
+      epicReviewer: "mediated:test",
+      knowledgebaseBuilder: "mediated:test",
+    },
+    runEpicDecoderInWorkspace: async () => JSON.stringify({
+      summary: "decoder handoff",
+      phaseComplete: true,
+      requestedNextPhase: "evidence",
+      ticketUpdates: [
+        { id: "T-1", responsibility: "Create the plan", status: "filled" },
+      ],
+      evidenceUpdates: [
+        { slotId: "slot-1", facts: ["found evidence"], files: ["src/a.ts"] },
+      ],
+      finalCandidate: {
+        summary: "draft",
+        tickets: [],
+      },
+    }),
+  } as any;
+
+  const result = await runContinuableAgent({
+    role: "epicDecoder",
+    objective: "Break down the epic",
+    cwd: process.cwd(),
+    gateway,
+    gatewayMethod: "runEpicDecoderInWorkspace",
+    maxLooplets: 1,
+    loopletIterations: 1,
+  });
+
+  const ledger = result.state.ledger as any;
+  assert.equal(result.state.phase, "evidence");
+  assert.equal(result.state.draftOutput, null);
+  assert.equal(ledger.ticketSkeletons[0]?.id, "T-1");
+  assert.equal(ledger.ticketSkeletons[0]?.status, "filled");
+  assert.equal(ledger.evidenceSlots["slot-1"]?.status, "filled");
+  assert.deepEqual(ledger.finalCandidate, { summary: "draft", tickets: [] });
+});
+
+test("terminal continuation phases use finish, not finish_looplet", () => {
+  assert.deepEqual(getAllowedToolsForPhase("epicReviewer", "epic_verdict"), ["finish"]);
+  assert.deepEqual(getAllowedToolsForPhase("explorer", "explorer_packet"), ["finish"]);
+  assert.deepEqual(getAllowedToolsForPhase("builder", "builder_packet"), ["finish"]);
+  assert.deepEqual(getAllowedToolsForPhase("reviewer", "verdict"), ["finish"]);
+  assert.deepEqual(getAllowedToolsForPhase("tester", "test_summary"), ["finish"]);
+  assert.ok(buildPhasePrompt("epicReviewer", "epic_verdict").includes("Call finish"));
+  assert.ok(!buildPhasePrompt("epicReviewer", "epic_verdict").includes("finish_looplet"));
+});
+
+test("epic decoder evidence continuation prompt includes skeletons and avoids context packet language", () => {
+  const ledger = createEpicDecoderLedger();
+  ledger.ticketSkeletons = [
+    { id: "T-1", responsibility: "Add checkout happy-path Playwright coverage", status: "skeleton" },
+    { id: "T-2", responsibility: "Verify empty-cart checkout behavior", status: "skeleton" },
+  ];
+
+  const prompt = buildEpicDecoderContinuationPrompt({
+    epic: "Improve checkout flow",
+    state: { phase: "evidence", ledger },
+  });
+
+  assert.ok(prompt.includes("T-1: Add checkout happy-path Playwright coverage"));
+  assert.ok(prompt.includes("Call one allowed evidence tool immediately"));
+  assert.ok(prompt.includes("finish_looplet"));
+  assert.ok(!/context packet/i.test(prompt));
+  assert.ok(!prompt.includes("read_context_packet"));
 });
 
 // ─── Role Ledgers ────────────────────────────────────────────────────────────

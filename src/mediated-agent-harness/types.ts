@@ -81,12 +81,38 @@ export interface MediatedHarnessConfig {
   allowedPaths?: string[];
   maxIterations?: number;
   timeoutMs?: number;
+  streamIdleTimeoutMs?: number;
   temperature?: number;
   topP?: number;
   topK?: number;
   numCtx?: number;
   braveApiKey?: string;
   onEvent?: (event: MediatedHarnessEvent) => void;
+  /** Continuation options for phase-controlled execution */
+  continuation?: {
+    enabled: boolean;
+    phase: string;
+    state?: any;
+    maxIterations?: number;
+    allowedToolsOverride?: string[];
+    afterToolResult?: (event: AfterToolResultEvent) => Promise<AfterToolResultUpdate>;
+  };
+}
+
+export interface AfterToolResultEvent {
+  role: string;
+  phase: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  resultText: string;
+  state: any;
+}
+
+export interface AfterToolResultUpdate {
+  state: any;
+  progressEvents: any[];
+  shouldEndLooplet: boolean;
+  nudge?: string;
 }
 
 export interface ToolExecutionContext {
@@ -124,7 +150,9 @@ export type MediatedHarnessEvent =
   | { kind: "tool_error"; call: ToolCall; error: string }
   | { kind: "complete"; result: string; iterations: number }
   | { kind: "error"; error: string }
-  | { kind: "duplicate_recovery"; bannedCall: string; recoveryCount: number };
+  | { kind: "duplicate_recovery"; bannedCall: string; recoveryCount: number }
+  | { kind: "continuation_looplet_start"; role: string; phase: string; loopletIndex: number; maxIterations: number; allowedTools: string[] }
+  | { kind: "mediated_harness_start"; role: string; maxIterations: number; continuationEnabled: boolean; phase: string };
 
 // ─── Result ─────────────────────────────────────────────────────────────────
 

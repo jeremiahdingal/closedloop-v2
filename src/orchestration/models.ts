@@ -52,13 +52,13 @@ export interface ModelGateway {
   runDecompositionJudge?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelDecompositionJudgement>;
   runTicketRepair?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<ModelRepairResult>;
   runBuilderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<OpenCodeBuilderResult>;
-  runReviewerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; timeoutMs?: number; onStream?: StreamHook }): Promise<ReviewerVerdict>;
-  runTesterInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<TesterResult>;
-  runExplorerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string>;
-  runCoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; skipExplorer?: boolean; onStream?: StreamHook }): Promise<CoderRunResult>;
+  runReviewerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; timeoutMs?: number; onStream?: StreamHook; continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] } }): Promise<ReviewerVerdict>;
+  runTesterInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook; continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] } }): Promise<TesterResult>;
+  runExplorerInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook; continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] } }): Promise<string>;
+  runCoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; skipExplorer?: boolean; onStream?: StreamHook; continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] } }): Promise<CoderRunResult>;
   runCoderDirect?(input: { prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string>;
-  runGoalReviewInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any }): Promise<GoalReview>;
-  runEpicDecoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any }): Promise<GoalDecomposition>;
+  runGoalReviewInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any; continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] } }): Promise<GoalReview>;
+  runEpicDecoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any; continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] } }): Promise<GoalDecomposition>;
   runEpicDecoderOpenCode?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition>;
   runEpicReviewerCodex?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview>;
 }
@@ -77,7 +77,7 @@ function resolveOllamaContextWindow(model: string): number {
   if (model.startsWith("qwen3.5:27b")) return 65536;
   if (model.includes("qwen3.6-35b")) return 8192;
   if (model.includes("qwen3.6-27b")) return 65536;
-  if (model.startsWith("ibm/granite4.1:30b-q3")) return 8192;
+  if (model.startsWith("ibm/granite4.1:30b-q3")) return 65536;
   if (model.startsWith("ibm/granite4.1")) return 32768;
   if (model.startsWith("devstral-small-2:24b")) return 393216;
   if (model.startsWith("qwen2.5-coder:14b")) return 65536;
@@ -523,7 +523,7 @@ export class OpenCodeHybridGateway implements ModelGateway {
     return this.opencode.runEpicReviewer({ role: "epicReviewer", ...input });
   }
 
-  runEpicDecoderInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition> {
+  runEpicDecoderInWorkspace(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] } }): Promise<GoalDecomposition> {
     if (this.models.epicDecoder === "gemini-cli") {
       return this.gemini.runEpicDecoder({ role: "epicDecoder", ...input });
     }
@@ -841,6 +841,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     epicId?: string | null;
     timeoutMs?: number;
     onStream?: StreamHook;
+    continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] };
   }): Promise<ReviewerVerdict> {
     const model = this.resolveHarnessModel("reviewer");
     input.onStream?.({
@@ -859,15 +860,38 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
     if (isOllama) await ensureModelLoaded(model);
+    
+    // Emit mediated harness start trace marker
+    input.onStream?.({
+      agentRole: "reviewer",
+      source: "mediated-harness",
+      streamKind: "mediated_harness_start",
+      content: JSON.stringify({
+        kind: 'mediated_harness_start',
+        role: "reviewer",
+        maxIterations: 80,
+        continuationEnabled: true,
+        phase: "init",
+      }),
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+      metadata: { model },
+    });
+    
     const result = await harness.run("reviewer", input.prompt, {
       maxIterations: 80,
       timeoutMs: input.timeoutMs ?? 300_000,
       toolMode: this.resolveToolMode(model),
       onEvent: this.buildHarnessEventHandler("reviewer", model, input),
+      continuation: input.continuation,
     });
     if (isOllama) markModelLoaded(model);
 
-    return validateReviewerVerdict(parseJsonText(result.text));
+    return input.continuation?.enabled
+      ? (result.text as unknown as ReviewerVerdict)
+      : validateReviewerVerdict(parseJsonText(result.text));
   }
 
   getGoalReview(prompt: string): Promise<GoalReview> {
@@ -886,6 +910,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     onStream?: StreamHook;
     ragIndexId?: number;
     db?: any;
+    continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] };
   }): Promise<GoalDecomposition> {
     const configuredModel = this.models.epicDecoder;
 
@@ -910,8 +935,11 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
         timeoutMs: 900_000,
         toolMode: this.resolveToolMode(model),
         onEvent: this.buildHarnessEventHandler("epicDecoder", model, input),
+        continuation: input.continuation,
       });
-      return validateGoalDecomposition(parseJsonText(result.text));
+      return input.continuation?.enabled
+        ? (result.text as unknown as GoalDecomposition)
+        : validateGoalDecomposition(parseJsonText(result.text));
     }
     if (configuredModel.startsWith("opencode:")) {
       const parsed = await this.opencode.runEpicDecoder({ role: "epicDecoder", ...input });
@@ -934,15 +962,46 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
     if (isOllama) await ensureModelLoaded(model);
+    
+    // Use continuation options if provided
+    const maxIterations = input.continuation?.maxIterations ?? 80;
+    const continuationConfig = input.continuation ? {
+      enabled: input.continuation.enabled,
+      phase: input.continuation.phase,
+      maxIterations: input.continuation.maxIterations,
+      allowedToolsOverride: input.continuation.allowedToolsOverride,
+    } : undefined;
+    
+    // Emit mediated harness start trace marker
+    input.onStream?.({
+      agentRole: "epicDecoder",
+      source: "mediated-harness",
+      streamKind: "mediated_harness_start",
+      content: JSON.stringify({
+        kind: 'mediated_harness_start',
+        role: "epicDecoder",
+        maxIterations,
+        continuationEnabled: continuationConfig?.enabled ?? false,
+        phase: continuationConfig?.phase ?? "init",
+      }),
+      runId: input.runId,
+      epicId: input.epicId,
+      sequence: 0,
+      metadata: { model },
+    });
+    
     const result = await harness.run("epicDecoder", input.prompt, {
-      maxIterations: 80,
+      maxIterations,
       timeoutMs: 900_000,
       toolMode: this.resolveToolMode(model),
       onEvent: this.buildHarnessEventHandler("epicDecoder", model, input),
+      continuation: continuationConfig,
     });
     if (isOllama) markModelLoaded(model);
 
-    return validateGoalDecomposition(parseJsonText(result.text));
+    return input.continuation?.enabled
+      ? (result.text as unknown as GoalDecomposition)
+      : validateGoalDecomposition(parseJsonText(result.text));
   }
 
   async runGoalReviewInWorkspace(input: {
@@ -953,6 +1012,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     onStream?: StreamHook;
     ragIndexId?: number;
     db?: any;
+    continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] };
   }): Promise<GoalReview> {
     const configuredModel = this.models.epicReviewer;
     if (configuredModel === "gemini-cli") {
@@ -976,8 +1036,11 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
         timeoutMs: 900_000,
         toolMode: this.resolveToolMode(model),
         onEvent: this.buildHarnessEventHandler("epicReviewer", model, input),
+        continuation: input.continuation,
       });
-      return validateGoalReview(parseJsonText(result.text));
+      return input.continuation?.enabled
+        ? (result.text as unknown as GoalReview)
+        : validateGoalReview(parseJsonText(result.text));
     }
     if (configuredModel.startsWith("opencode:")) {
       return this.opencode.runEpicReviewer({ role: "epicReviewer", ...input });
@@ -999,15 +1062,46 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
     if (isOllama) await ensureModelLoaded(model);
+    
+    // Use continuation options if provided
+    const maxIterations = input.continuation?.maxIterations ?? 80;
+    const continuationConfig = input.continuation ? {
+      enabled: input.continuation.enabled,
+      phase: input.continuation.phase,
+      maxIterations: input.continuation.maxIterations,
+      allowedToolsOverride: input.continuation.allowedToolsOverride,
+    } : undefined;
+    
+    // Emit mediated harness start trace marker
+    input.onStream?.({
+      agentRole: "epicReviewer",
+      source: "mediated-harness",
+      streamKind: "mediated_harness_start",
+      content: JSON.stringify({
+        kind: 'mediated_harness_start',
+        role: "epicReviewer",
+        maxIterations,
+        continuationEnabled: continuationConfig?.enabled ?? false,
+        phase: continuationConfig?.phase ?? "init",
+      }),
+      runId: input.runId,
+      epicId: input.epicId,
+      sequence: 0,
+      metadata: { model },
+    });
+    
     const result = await harness.run("epicReviewer", input.prompt, {
-      maxIterations: 80,
+      maxIterations,
       timeoutMs: 900_000,
       toolMode: this.resolveToolMode(model),
       onEvent: this.buildHarnessEventHandler("epicReviewer", model, input),
+      continuation: continuationConfig,
     });
     if (isOllama) markModelLoaded(model);
 
-    return validateGoalReview(parseJsonText(result.text));
+    return input.continuation?.enabled
+      ? (result.text as unknown as GoalReview)
+      : validateGoalReview(parseJsonText(result.text));
   }
 
   runTicketHardener(input: {
@@ -1097,6 +1191,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     ticketId?: string | null;
     epicId?: string | null;
     onStream?: StreamHook;
+    continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] };
   }): Promise<string> {
     const model = this.resolveHarnessModel("explorer");
     const allowInstallCommand = promptExplicitlyRequestsDependencyInstall(input.prompt);
@@ -1116,11 +1211,41 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
     if (isOllama) await ensureModelLoaded(model);
+    
+    // Use continuation options if provided
+    const maxIterations = input.continuation?.maxIterations ?? 20;
+    const continuationConfig = input.continuation ? {
+      enabled: input.continuation.enabled,
+      phase: input.continuation.phase,
+      maxIterations: input.continuation.maxIterations,
+      allowedToolsOverride: input.continuation.allowedToolsOverride,
+    } : undefined;
+    
+    // Emit mediated harness start trace marker
+    input.onStream?.({
+      agentRole: "explorer",
+      source: "mediated-harness",
+      streamKind: "mediated_harness_start",
+      content: JSON.stringify({
+        kind: 'mediated_harness_start',
+        role: "explorer",
+        maxIterations,
+        continuationEnabled: continuationConfig?.enabled ?? false,
+        phase: continuationConfig?.phase ?? "init",
+      }),
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+      metadata: { model },
+    });
+    
     const result = await harness.run("explorer", input.prompt, {
-      maxIterations: 20,
+      maxIterations,
       timeoutMs: 900_000,
       toolMode: this.resolveToolMode(model),
       onEvent: this.buildHarnessEventHandler("explorer", model, input),
+      continuation: continuationConfig,
     });
     if (isOllama) markModelLoaded(model);
 
@@ -1135,6 +1260,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     epicId?: string | null;
     skipExplorer?: boolean;
     onStream?: StreamHook;
+    continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] };
   }): Promise<CoderRunResult> {
     const model = this.resolveHarnessModel("coder");
     const allowInstallCommand = promptExplicitlyRequestsDependencyInstall(input.prompt);
@@ -1154,11 +1280,41 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride && !model.startsWith("anthropic-mediated:");
     if (isOllama) await ensureModelLoaded(model);
+    
+    // Use continuation options if provided
+    const maxIterations = input.continuation?.maxIterations ?? 80;
+    const continuationConfig = input.continuation ? {
+      enabled: input.continuation.enabled,
+      phase: input.continuation.phase,
+      maxIterations: input.continuation.maxIterations,
+      allowedToolsOverride: input.continuation.allowedToolsOverride,
+    } : undefined;
+    
+    // Emit mediated harness start trace marker
+    input.onStream?.({
+      agentRole: "coder",
+      source: "mediated-harness",
+      streamKind: "mediated_harness_start",
+      content: JSON.stringify({
+        kind: 'mediated_harness_start',
+        role: "coder",
+        maxIterations,
+        continuationEnabled: continuationConfig?.enabled ?? false,
+        phase: continuationConfig?.phase ?? "init",
+      }),
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+      metadata: { model },
+    });
+    
     const result = await harness.run("coder", input.prompt, {
-      maxIterations: 80,
+      maxIterations,
       timeoutMs: 600_000,
       toolMode: this.resolveToolMode(model),
       onEvent: this.buildHarnessEventHandler("coder", model, input),
+      continuation: continuationConfig,
     });
     if (isOllama) markModelLoaded(model);
 
@@ -1213,6 +1369,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     ticketId?: string | null;
     epicId?: string | null;
     onStream?: StreamHook;
+    continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] };
   }): Promise<OpenCodeBuilderResult> {
     if (this.models.builder === "gemini-cli") {
       return this.gemini.runBuilder({ role: "builder", ...input });
@@ -1265,6 +1422,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     ticketId?: string | null;
     epicId?: string | null;
     onStream?: StreamHook;
+    continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] };
   }): Promise<TesterResult> {
     const model = this.resolveHarnessModel("tester");
     input.onStream?.({
@@ -1284,13 +1442,47 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     // TIGHT LIMITS: Tester must decide within 50 iterations (prompt says 3 tool calls)
     const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
     if (isOllama) await ensureModelLoaded(model);
+    
+    // Use continuation options if provided
+    const maxIterations = input.continuation?.maxIterations ?? 80;
+    const continuationConfig = input.continuation ? {
+      enabled: input.continuation.enabled,
+      phase: input.continuation.phase,
+      maxIterations: input.continuation.maxIterations,
+      allowedToolsOverride: input.continuation.allowedToolsOverride,
+    } : undefined;
+    
+    // Emit mediated harness start trace marker
+    input.onStream?.({
+      agentRole: "tester",
+      source: "mediated-harness",
+      streamKind: "mediated_harness_start",
+      content: JSON.stringify({
+        kind: 'mediated_harness_start',
+        role: "tester",
+        maxIterations,
+        continuationEnabled: continuationConfig?.enabled ?? false,
+        phase: continuationConfig?.phase ?? "init",
+      }),
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+      metadata: { model },
+    });
+    
     const result = await harness.run("tester", input.prompt, {
-      maxIterations: 80,
+      maxIterations,
       timeoutMs: 300_000, // 5 minutes
       toolMode: this.resolveToolMode(model),
       onEvent: this.buildHarnessEventHandler("tester", model, input),
+      continuation: continuationConfig,
     });
     if (isOllama) markModelLoaded(model);
+
+    if (input.continuation?.enabled) {
+      return result.text as unknown as TesterResult;
+    }
 
     const parsed = parseJsonText(result.text) as TesterResult;
     return {
@@ -1459,6 +1651,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
       ticketId?: string | null;
       epicId?: string | null;
       onStream?: StreamHook;
+      continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] };
     },
     model: string,
     toolMode: "native" | "xml"
@@ -1477,11 +1670,41 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
 
     const isOllama = !model.startsWith("openrouter:") && !this.anthropicOverride;
     if (isOllama) await ensureModelLoaded(model);
+    
+    // Use continuation options if provided
+    const maxIterations = input.continuation?.maxIterations ?? 100;
+    const continuationConfig = input.continuation ? {
+      enabled: input.continuation.enabled,
+      phase: input.continuation.phase,
+      maxIterations: input.continuation.maxIterations,
+      allowedToolsOverride: input.continuation.allowedToolsOverride,
+    } : undefined;
+    
+    // Emit mediated harness start trace marker
+    input.onStream?.({
+      agentRole: "builder",
+      source: "mediated-harness",
+      streamKind: "mediated_harness_start",
+      content: JSON.stringify({
+        kind: 'mediated_harness_start',
+        role: "builder",
+        maxIterations,
+        continuationEnabled: continuationConfig?.enabled ?? false,
+        phase: continuationConfig?.phase ?? "init",
+      }),
+      runId: input.runId,
+      ticketId: input.ticketId,
+      epicId: input.epicId,
+      sequence: 0,
+      metadata: { model },
+    });
+    
     const result = await harness.run("builder", mediatedPrompt, {
-      maxIterations: 100,
+      maxIterations,
       timeoutMs: 1_800_000,
       toolMode,
       onEvent: this.buildHarnessEventHandler("builder", model, input),
+      continuation: continuationConfig,
     });
     if (isOllama) markModelLoaded(model);
 

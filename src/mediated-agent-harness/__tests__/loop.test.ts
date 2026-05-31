@@ -5,6 +5,7 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { runMediatedLoop } from "../loop.ts";
+import { MediatedAgentHarness } from "../index.ts";
 import type { MediatedHarnessConfig, ToolExecutionContext } from "../types.ts";
 
 function createMockContext(cwd: string): ToolExecutionContext {
@@ -256,6 +257,47 @@ test("loop handles model that returns text directly (no tools)", async () => {
   }
 });
 
+test("MediatedAgentHarness forwards continuation settings to the loop", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
+  const requestBodies: any[] = [];
+  const { server, port } = await createMockServer([
+    makeToolCallChunk({
+      id: "call_1",
+      name: "finish_looplet",
+      args: { summary: "handoff", phaseComplete: true },
+    }),
+    DONE_LINE,
+  ], requestBodies);
+
+  try {
+    const harness = new MediatedAgentHarness({
+      baseURL: `http://localhost:${port}`,
+      apiKey: "",
+      model: "test-model",
+      toolContext: createMockContext(tmpDir),
+    });
+
+    await harness.run("explorer", "Inspect the repo.", {
+      maxIterations: 1,
+      continuation: {
+        enabled: true,
+        phase: "questions",
+        maxIterations: 1,
+        allowedToolsOverride: ["finish_looplet"],
+      },
+    });
+
+    assert.ok(requestBodies.length > 0);
+    assert.deepEqual(
+      (requestBodies[0]?.tools ?? []).map((tool: any) => tool.function.name),
+      ["finish_looplet"],
+    );
+  } finally {
+    server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("loop injects a visible continue nudge after a no-tool-call stall", async () => {
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
   const requestBodies: any[] = [];
@@ -309,6 +351,131 @@ test("loop injects a visible continue nudge after a no-tool-call stall", async (
       ),
       "expected emitted status event to show injected continue nudge",
     );
+  } finally {
+    server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("continuation no-tool-call nudge uses phase tools and finish_looplet", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
+  const requestBodies: any[] = [];
+
+  const responses = [
+    [
+      makeTextChunk("I need to gather evidence before choosing files."),
+      DONE_LINE,
+    ],
+    [
+      makeToolCallChunk({
+        id: "call_1",
+        name: "finish_looplet",
+        args: { summary: "enough evidence for now", phaseComplete: false },
+      }),
+      DONE_LINE,
+    ],
+  ];
+  const { server, port } = await createSequencedMockServer(responses, requestBodies);
+
+  try {
+    const events: any[] = [];
+    const result = await runMediatedLoop({
+      systemPrompt: "Test",
+      userPrompt: "Gather evidence.",
+      config: {
+        baseURL: `http://localhost:${port}`,
+        apiKey: "",
+        model: "test-model",
+        cwd: tmpDir,
+        role: "epicDecoder",
+        temperature: 0,
+        maxIterations: 4,
+        continuation: {
+          enabled: true,
+          phase: "evidence",
+          maxIterations: 4,
+          allowedToolsOverride: ["read_file", "glob_files", "finish_looplet"],
+        },
+      },
+      toolContext: createMockContext(tmpDir),
+    });
+
+    assert.equal(result.iterations, 2);
+    const secondMessages = requestBodies[1]?.messages ?? [];
+    const nudge = secondMessages.find(
+      (msg: any) => msg.role === "user" && typeof msg.content === "string" && msg.content.includes("Allowed tools now"),
+    )?.content ?? "";
+    assert.ok(nudge.includes("read_file, glob_files, finish_looplet"));
+    assert.ok(nudge.includes("Current phase: evidence"));
+    assert.ok(nudge.includes("finish_looplet"));
+    assert.ok(!nudge.includes("finish tool"));
+    assert.ok(!/context packet/i.test(nudge));
+    assert.ok(!nudge.includes("read_context_packet"));
+  } finally {
+    server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("continuation empty-response nudge lists allowed phase tools", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
+  const requestBodies: any[] = [];
+  const events: any[] = [];
+
+  const responses = [
+    [
+      makeTextChunk(""),
+      DONE_LINE,
+    ],
+    [
+      makeToolCallChunk({
+        id: "call_1",
+        name: "finish_looplet",
+        args: { summary: "empty recovered", phaseComplete: false },
+      }),
+      DONE_LINE,
+    ],
+  ];
+  const { server, port } = await createSequencedMockServer(responses, requestBodies);
+
+  try {
+    const result = await runMediatedLoop({
+      systemPrompt: "Test",
+      userPrompt: "Gather evidence.",
+      config: {
+        baseURL: `http://localhost:${port}`,
+        apiKey: "",
+        model: "test-model",
+        cwd: tmpDir,
+        role: "epicDecoder",
+        temperature: 0,
+        maxIterations: 4,
+        continuation: {
+          enabled: true,
+          phase: "evidence",
+          maxIterations: 4,
+          allowedToolsOverride: ["read_file", "finish_looplet"],
+        },
+        onEvent: (event) => events.push(event),
+      },
+      toolContext: createMockContext(tmpDir),
+    });
+
+    assert.equal(result.iterations, 2);
+    const allMessages = requestBodies.flatMap((body) => body?.messages ?? []);
+    const emittedStatus = events
+      .filter((event) => event.kind === "status")
+      .map((event) => event.text ?? "")
+      .join("\n");
+    const nudge = allMessages.find(
+      (msg: any) => msg.role === "user" && typeof msg.content === "string" && msg.content.includes("Allowed tools now"),
+    )?.content ?? emittedStatus;
+    assert.ok(
+      nudge.includes("Allowed tools now: read_file, finish_looplet"),
+      `Expected phase-aware empty-response nudge, got:\n${nudge}\nrequests:\n${JSON.stringify(requestBodies, null, 2)}\nevents:\n${JSON.stringify(events, null, 2)}`,
+    );
+    assert.ok(!nudge.includes("Call list_dir"));
+    assert.ok(!nudge.includes("finish with your answer"));
   } finally {
     server.close();
     await rm(tmpDir, { recursive: true, force: true });
@@ -747,6 +914,49 @@ test("loop handles model connection error", async () => {
       (err: any) => err.name === "ModelConnectionError"
     );
   } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("loop aborts a silent model stream after idle timeout", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mediated-loop-"));
+  const server = createServer((req, res) => {
+    if (req.method === "POST" && req.url?.endsWith("/api/chat")) {
+      req.resume();
+      res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+      res.flushHeaders();
+      return;
+    }
+    res.writeHead(404);
+    res.end("not found");
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+
+  try {
+    await assert.rejects(
+      () =>
+        runMediatedLoop({
+          systemPrompt: "Test",
+          userPrompt: "Hang forever.",
+          config: {
+            baseURL: `http://localhost:${port}`,
+            apiKey: "",
+            model: "test-model",
+            cwd: tmpDir,
+            temperature: 0,
+            maxIterations: 1,
+            streamIdleTimeoutMs: 50,
+          },
+          toolContext: createMockContext(tmpDir),
+        }),
+      (err: any) =>
+        err.name === "LoopTimeoutError" &&
+        String(err.message).includes("Model stream produced no chunks"),
+    );
+  } finally {
+    server.close();
     await rm(tmpDir, { recursive: true, force: true });
   }
 });

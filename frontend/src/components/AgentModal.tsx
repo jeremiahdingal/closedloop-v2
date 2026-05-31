@@ -24,7 +24,10 @@ export function AgentModal(props: {
 }) {
   if (!props.open) return null;
   const info = props.modelInfo;
-  const mergedItems = mergeStreamingEvents(props.items);
+  const mergedItems = useMemo(
+    () => mergeStreamingEvents([...props.items].reverse()).reverse(),
+    [props.items]
+  );
   const safeAdapters = info?.adapters ?? [];
   const hasMultipleAdapters = safeAdapters.length > 1;
   const currentDesc =

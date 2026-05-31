@@ -31,7 +31,7 @@ const KNOWN_TOOL_NAMES = new Set([
   "explore_mode",
   "glob_files", "grep_files", "list_dir", "read_file", "read_files",
   "write_file", "write_files", "search_replace", "git_diff", "git_diff_staged",
-  "git_status", "list_changed_files", "run_command", "finish",
+  "git_status", "list_changed_files", "run_command", "finish", "finish_looplet",
   "web_search", "semantic_search", "read_artifact", "save_artifact"
 ]);
 
@@ -53,7 +53,7 @@ export function resolveModelContextWindow(model: string): number {
   else if (model.startsWith("qwen3.5:27b")) result = 65536;
   else if (model.includes("qwen3.6-35b")) result = 8192;
   else if (model.includes("qwen3.6-27b")) result = 65536;
-  else if (model.startsWith("ibm/granite4.1:30b-q3")) result = 8192;
+  else if (model.startsWith("ibm/granite4.1:30b-q3")) result = 65536;
   else if (model.startsWith("ibm/granite4.1")) result = 32768;
   else if (model.startsWith("qwen3:14b")) result = 65536;
   else if (model.startsWith("devstral-small-2:24b")) result = 393216;
@@ -73,12 +73,14 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
   const baseURL = config.baseURL ?? "http://localhost:11434";
   const apiBackend = config.apiBackend ?? "ollama";
   const toolMode = config.toolMode ?? "native";
-  const maxIterations = config.maxIterations ?? 80;
+  const maxIterations = config.continuation?.maxIterations ?? config.maxIterations ?? 80;
   const timeoutMs = config.timeoutMs ?? 900_000;
   const temperature = config.temperature ?? 1.0;
   const topP = config.topP ?? 0.95;
   const topK = config.topK ?? 64;
   const numCtx = config.numCtx ?? resolveModelContextWindow(config.model);
+  const idleThresholdMs = config.role === "coder" ? 600_000 : 60_000;
+  const streamIdleTimeoutMs = config.streamIdleTimeoutMs ?? idleThresholdMs;
   const emit = config.onEvent ?? (() => {});
 
   // Augment tool context with braveApiKey from config if not already set
@@ -95,14 +97,23 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
   // Filter tools by role
   const availableToolNames = config.role ? getAvailableToolsList(config.role) : Array.from(KNOWN_TOOL_NAMES);
-  const allowedToolSet = new Set(availableToolNames);
+
+  // Apply phase-aware tool allowlists if continuation is enabled
+  const phaseAllowedTools = config.continuation?.enabled ? config.continuation.allowedToolsOverride : undefined;
+  const effectiveAllowedTools = phaseAllowedTools && phaseAllowedTools.length > 0
+    ? availableToolNames.filter(t => phaseAllowedTools.includes(t))
+    : availableToolNames;
+
+  const allowedToolSet = new Set(effectiveAllowedTools);
+  const buildToolOnlyNudge = (reason: "text" | "empty" | "recovery" = "text") =>
+    buildPhaseAwareToolOnlyNudge(config, effectiveAllowedTools, reason);
 
   // Include browser tools for playTester and tester roles if they are in the allowed list
   const needsBrowser = (role: string) => role === "playTester" || role === "tester";
-  let tools = needsBrowser(config.role ?? "") 
-    ? [...WORKSPACE_TOOLS, ...BROWSER_TOOLS] 
+  let tools = needsBrowser(config.role ?? "")
+    ? [...WORKSPACE_TOOLS, ...BROWSER_TOOLS]
     : WORKSPACE_TOOLS;
-  
+
   tools = tools.filter(t => allowedToolSet.has(t.function.name));
 
   const toolSchemaMap = new Map(tools.map(t => [t.function.name, t]));
@@ -121,7 +132,6 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     const now = Date.now();
     const totalElapsed = now - startTime;
     const idleElapsed = now - lastActivityTime;
-    const idleThresholdMs = config.role === "coder" ? 600_000 : 60_000;
     if (totalElapsed > timeoutMs && idleElapsed > idleThresholdMs) {
       throw new LoopTimeoutError(
         `Loop timed out after ${totalElapsed}ms (limit: ${timeoutMs}ms, idle: ${idleElapsed}ms)`,
@@ -174,27 +184,32 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     }
 
 
-    // Early nudge at 60%: remind explorer about structured JSON
-    if (config.role === "explorer" && iteration >= Math.floor(maxIterations * 0.6)) {
-      const hasNudged = messages.some(m => typeof m.content === 'string' && m.content.includes('[SYSTEM REMINDER] 60%'));
+    // Early nudge at 60%: remind about structured JSON output
+    if (iteration >= Math.floor(maxIterations * 0.6)) {
+      const hasNudged = messages.some(m => typeof m.content === 'string' && m.content.includes('[BUDGET 60%]'));
       if (!hasNudged) {
-        messages.push({
-          role: "user",
-          content: `[SYSTEM REMINDER] You are past 60% of your iteration budget (${iteration + 1}/${maxIterations}). Start wrapping up. When you call finish, the "result" parameter MUST be a raw JSON string with this exact structure:\n\n{"summary":"<brief summary of what was explored>","relevantFiles":["path/to/file1.ts","path/to/file2.ts"],"recommendedFilesForCoding":["path/to/file1.ts"],"keyPatterns":"<describe key patterns and architecture>","unresolvedBlockers":"<any blockers or 'none'>"}\n\nNo markdown, no code fences, no commentary. Just the raw JSON object as a string value for the "result" parameter.`
-        });
-        emit({ kind: "text", text: "[nudge] 60% budget reached, reminding explorer about JSON output..." });
+        const budgetNudge = buildBudgetNudge(config.role, iteration, maxIterations, 0.6);
+        if (budgetNudge) {
+          messages.push({ role: "user", content: budgetNudge });
+          emit({ kind: "text", text: `[nudge] 60% budget reached for ${config.role}...` });
+        }
       }
     }
 
-    // Convergence: at 80% iterations, force explorer to conclude
+    // Convergence: at 80% iterations, force conclusion
     const convergenceThreshold = Math.floor(maxIterations * 0.8);
-    if (config.role === "explorer" && iteration >= convergenceThreshold) {
-      resetExploreModeFiles();
-      messages.push({
-        role: "user",
-        content: `[SYSTEM] You are at iteration ${iteration + 1} of ${maxIterations}. You have used 80% of your iteration budget. STOP exploring. You MUST call the finish tool NOW. The finish tool takes two parameters:\n1. "result" (required): a JSON string with this exact structure:\n{"summary":"<brief summary>","relevantFiles":["path/to/file1.ts","path/to/file2.ts"],"recommendedFilesForCoding":["path/to/file1.ts"],"keyPatterns":"<describe key patterns>","unresolvedBlockers":"<any blockers or none>"}\n2. "summary" (optional): a brief text summary.\n\nCall the finish tool NOW with the result parameter as a raw JSON string. No markdown fences, no extra text.`
-      });
-      emit({ kind: "text", text: `[convergence] Budget at 80%, forcing explorer to conclude...` });
+    if (iteration >= convergenceThreshold) {
+      const hasConverged = messages.some(m => typeof m.content === 'string' && m.content.includes('[BUDGET 80%]'));
+      if (!hasConverged) {
+        if (config.role === "explorer") {
+          resetExploreModeFiles();
+        }
+        const convergenceNudge = buildConvergenceNudge(config.role, iteration, maxIterations);
+        if (convergenceNudge) {
+          messages.push({ role: "user", content: convergenceNudge });
+          emit({ kind: "text", text: `[convergence] Budget at 80%, forcing ${config.role} to conclude...` });
+        }
+      }
     }
 
 
@@ -232,16 +247,17 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     emit({ kind: "text", text: `[iteration ${iteration + 1}/${maxIterations}] Calling model...` });
 
     const effectiveToolMode = stallState.toolModeOverride ?? toolMode;
+    const requestController = new AbortController();
 
     // Make streaming request to model backend
     let response: Response;
     try {
       if (apiBackend === "anthropic") {
-        response = await fetchAnthropic(baseURL, config.apiKey ?? "", config.model, messages, tools, effectiveToolMode, systemPrompt, numCtx);
+        response = await fetchAnthropic(baseURL, config.apiKey ?? "", config.model, messages, tools, effectiveToolMode, systemPrompt, numCtx, requestController.signal);
       } else if (apiBackend === "openrouter") {
-        response = await fetchOpenRouter(baseURL || "https://openrouter.ai/api/v1", config.apiKey ?? "", config.model, messages, tools, effectiveToolMode, temperature, topP, topK, numCtx);
+        response = await fetchOpenRouter(baseURL || "https://openrouter.ai/api/v1", config.apiKey ?? "", config.model, messages, tools, effectiveToolMode, temperature, topP, topK, numCtx, requestController.signal);
       } else {
-        response = await fetchOllama(baseURL, config.model, messages, tools, effectiveToolMode, temperature, topP, topK, numCtx, config.noThink);
+        response = await fetchOllama(baseURL, config.model, messages, tools, effectiveToolMode, temperature, topP, topK, numCtx, config.noThink, requestController.signal);
       }
     } catch (err) {
       throw new ModelConnectionError(
@@ -285,7 +301,11 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await readStreamChunkWithIdleTimeout(
+          reader,
+          streamIdleTimeoutMs,
+          () => requestController.abort(),
+        );
         if (done) break;
         if (spiralDetected) break;
 
@@ -449,9 +469,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
 
           // Not valid JSON — force tool call
           messages.push({ role: "assistant", content: text });
-          const forcedToolNudge = requiresExplicitFinish(config.role)
-            ? "continue\n\nYou produced text/JSON without using the tool interface. STOP. Use tool calls only. If you are done, call the 'finish' tool with 'summary' and 'result' parameters. Do not write any more text."
-            : "continue\n\nYou produced text without a tool call. STOP. Call the 'finish' tool now with 'summary' and 'result' parameters. Do not write any more text.";
+          const forcedToolNudge = buildToolOnlyNudge("text");
           messages.push({
             role: "user",
             content: forcedToolNudge,
@@ -460,13 +478,14 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
           continue;
         }
       }
+      }
 
       // Empty response — force a tool call
       if (state.toolCalls.length > 0) {
         // XML extraction succeeded above; continue to normal tool handling below.
       } else if (iteration === 0) {
         messages.push({ role: "assistant", content: null });
-        const emptyStartNudge = "continue\n\nNo output. Call list_dir to start, then finish with your answer.";
+        const emptyStartNudge = buildToolOnlyNudge("empty");
         messages.push({
           role: "user",
           content: emptyStartNudge,
@@ -494,12 +513,12 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
           );
         }
 
+        const nudgeMessage = config.continuation?.enabled ? buildToolOnlyNudge("recovery") : action.nudgeMessage;
         messages.push({ role: "assistant", content: state.content || "" });
-        messages.push({ role: "user", content: action.nudgeMessage });
-        emit({ kind: "status", text: `Stall recovery nudge injected:\n${action.nudgeMessage}` });
+        messages.push({ role: "user", content: nudgeMessage });
+        emit({ kind: "status", text: `Stall recovery nudge injected:\n${nudgeMessage}` });
         emit({ kind: "text", text: `[stall-recovery] ${kind} at ${level} level, nudging...` });
         continue;
-      }
       }
     }
 
@@ -521,7 +540,7 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
     for (const completeCall of state.toolCalls) {
       // Role-based tool access control
       if (!allowedToolSet.has(completeCall.name)) {
-        const errorMsg = `Unauthorized tool: ${completeCall.name}. Your role (${config.role}) is only allowed to use: ${availableToolNames.join(", ")}`;
+        const errorMsg = `Unauthorized tool: ${completeCall.name}. Your current ${config.continuation?.enabled ? `phase (${config.continuation.phase})` : `role (${config.role})`} is only allowed to use: ${effectiveAllowedTools.join(", ")}`;
         emit({ kind: "tool_error", call: { id: completeCall.id, name: completeCall.name, args: {} }, error: errorMsg });
 
         assistantToolCalls.push({
@@ -673,6 +692,38 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         };
       }
 
+      // Check for finish_looplet
+      if (validated.name === "finish_looplet") {
+        const summary = typeof validated.args.summary === "string" ? validated.args.summary : "";
+        const phaseComplete = typeof validated.args.phaseComplete === "boolean" ? validated.args.phaseComplete : false;
+        const requestedNextPhase = typeof validated.args.requestedNextPhase === "string" ? validated.args.requestedNextPhase : undefined;
+        const evidenceUpdates = Array.isArray(validated.args.evidenceUpdates) ? validated.args.evidenceUpdates : [];
+        const ticketUpdates = Array.isArray(validated.args.ticketUpdates) ? validated.args.ticketUpdates : [];
+        const finalCandidate = validated.args.finalCandidate;
+
+        const loopletResult = JSON.stringify({
+          phaseComplete,
+          requestedNextPhase,
+          evidenceUpdates,
+          ticketUpdates,
+          finalCandidate,
+        });
+
+        collectedToolCalls.push(toolCall);
+        emit({ kind: "tool_call", call: toolCall });
+        emit({ kind: "tool_result", result: { callId: completeCall.id, name: "finish_looplet", output: summary } });
+        emit({ kind: "complete", result: loopletResult, iterations: iteration + 1 });
+
+        console.log(`  [FINISH_LOOPLET] ${summary} (phaseComplete=${phaseComplete})`);
+
+        return {
+          text: loopletResult,
+          toolCalls: collectedToolCalls,
+          iterations: iteration + 1,
+          usage: state.usage,
+        };
+      }
+
       // ── Duplicate recovery: check for banned or duplicate failed calls ──
       if (isCallBanned(validated.name, validated.args, dupRecoveryState)) {
         const bannedMsg = `This exact call (${validated.name} with these arguments) is BANNED because it previously failed with the same arguments. You must use different arguments or a completely different approach. Do NOT repeat this call.`;
@@ -745,6 +796,37 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         stallState = resetStallCounters(stallState);
       }
 
+      // Call afterToolResult hook if continuation is enabled
+      if (config.continuation?.enabled && config.continuation.afterToolResult) {
+        try {
+          const update = await config.continuation.afterToolResult({
+            role: config.role ?? "",
+            phase: config.continuation.phase,
+            toolName: validated.name,
+            args: validated.args,
+            resultText: result.output,
+            state: config.continuation.state,
+          });
+
+          if (update.shouldEndLooplet) {
+            // Return early with continuation state
+            return {
+              text: JSON.stringify(update.state),
+              toolCalls: collectedToolCalls,
+              iterations: iteration + 1,
+              usage: state.usage,
+            };
+          }
+
+          if (update.nudge) {
+            messages.push({ role: "user", content: update.nudge });
+            emit({ kind: "status", text: `Continuation nudge: ${update.nudge}` });
+          }
+        } catch (err) {
+          console.warn(`[Harness] afterToolResult hook failed: ${err}`);
+        }
+      }
+
       // Post-recovery progress tracking
       if (dupRecoveryState.isInRecovery) {
         dupRecoveryState = recordPostRecoveryProgress(dupRecoveryState, result.isError ?? false);
@@ -753,11 +835,14 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         }
         persistDuplicateRecoveryState(duplicateRecoverySessionKey, dupRecoveryState);
         if (shouldForceFinishAfterRecovery(dupRecoveryState)) {
+          const recoveryNudge = config.continuation?.enabled
+            ? buildToolOnlyNudge("recovery")
+            : "[SYSTEM] No progress after recovery. You MUST call the finish tool NOW with whatever you have.";
           messages.push({
             role: "user",
-            content: "[SYSTEM] No progress after recovery. You MUST call the finish tool NOW with whatever you have.",
+            content: recoveryNudge,
           });
-          emit({ kind: "text", text: `[duplicate-recovery] No progress after 3 calls post-recovery, forcing finish...` });
+          emit({ kind: "text", text: `[duplicate-recovery] No progress after 3 calls post-recovery, forcing a valid phase tool...` });
         }
       }
 
@@ -819,25 +904,179 @@ function requiresExplicitFinish(role?: string): boolean {
     || role === "coder";
 }
 
-function buildPostCompactionResumePrompt(role?: string): string {
-  if (role === "coder") {
+async function readStreamChunkWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+  onTimeout: () => void,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      reject(new LoopTimeoutError(
+        `Model stream produced no chunks for ${timeoutMs}ms`,
+        timeoutMs,
+        timeoutMs,
+      ));
+      setTimeout(onTimeout, 0);
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([reader.read(), timeoutPromise]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function buildPhaseAwareToolOnlyNudge(
+  config: MediatedHarnessConfig,
+  effectiveAllowedTools: string[],
+  reason: "text" | "empty" | "recovery",
+): string {
+  const allowedTools = effectiveAllowedTools.length > 0
+    ? effectiveAllowedTools
+    : config.continuation?.allowedToolsOverride ?? [];
+  const toolList = allowedTools.length > 0 ? allowedTools.join(", ") : "the provided tools";
+  const canFinishLooplet = allowedTools.includes("finish_looplet");
+  const canFinish = allowedTools.includes("finish");
+  const completionTool = canFinishLooplet
+    ? "finish_looplet"
+    : canFinish
+      ? "finish"
+      : null;
+  const reasonLine = reason === "empty"
+    ? "No output was produced."
+    : reason === "recovery"
+      ? "Recovery needs one concrete tool call now."
+      : "You produced text without using the tool interface.";
+
+  if (config.continuation?.enabled) {
     return [
-      "[SYSTEM] Context was compacted to free space. Resume from the compacted history and the live workspace state.",
+      "continue",
       "",
-      "Coder resume protocol:",
-      "1. Do not search for .orchestrator/context.json manually. If context is needed, call read_context_packet once; if it is missing, continue without it.",
-      "2. First call git_diff or git_status to recover the current progress already on disk.",
-      "3. Use the compacted history and diff to identify the smallest remaining change.",
-      "4. Read only the specific file you need next, then write or search_replace. Do not restart broad exploration.",
-      "5. If the diff already satisfies the ticket, call finish immediately with the final JSON result.",
+      `${reasonLine} STOP writing prose. Use a tool call only.`,
+      `Current phase: ${config.continuation.phase}.`,
+      `Allowed tools now: ${toolList}.`,
+      completionTool
+        ? `If this phase is complete, call ${completionTool} with valid JSON arguments.`
+        : "Call the next allowed tool with valid JSON arguments.",
+      "Do not narrate the plan. Do not write markdown. Make exactly one valid tool call.",
     ].join("\n");
   }
 
   return [
-    "[SYSTEM] Context was compacted to free space. Resume from the compacted history and live workspace state.",
-    "Do not search for orchestrator bookkeeping files manually. If you need the context packet, call read_context_packet once; if it is missing, continue with the prompt and compacted history.",
-    "Continue with the next concrete tool call needed for your role, or call finish if you already have enough information.",
+    "continue",
+    "",
+    `${reasonLine} STOP writing prose. Use tool calls only.`,
+    canFinish
+      ? "If you are done, call the finish tool with summary and result parameters."
+      : `Call one of these tools now: ${toolList}.`,
+    "Do not write any more text.",
   ].join("\n");
+}
+
+function buildPostCompactionResumePrompt(role?: string): string {
+  if (role === "coder") {
+    return [
+      "[SYSTEM] Context compacted. Resume from compacted history and git state.",
+      "",
+      "1. Call git_diff to see current changes on disk.",
+      "2. Read only the file you need to edit next.",
+      "3. Make the edit, then call finish with the result JSON.",
+      "Do NOT restart exploration. Do NOT search for context files.",
+    ].join("\n");
+  }
+
+  if (role === "epicDecoder") {
+    return [
+      "[SYSTEM] Context compacted. Resume from compacted history.",
+      "Call finish_looplet with ticketUpdates or evidenceUpdates, or call finish with the GoalDecomposition JSON.",
+      "Do NOT re-read files already in compacted history.",
+    ].join("\n");
+  }
+
+  if (role === "builder") {
+    return [
+      "[SYSTEM] Context compacted. Resume from compacted history and git state.",
+      "Call git_diff to check progress, then continue with the next edit or call finish.",
+      "Do NOT restart exploration.",
+    ].join("\n");
+  }
+
+  if (role === "reviewer") {
+    return [
+      "[SYSTEM] Context compacted. Resume from compacted history.",
+      "Produce your verdict now. Call finish with {\"approved\":true/false,\"blockers\":[],\"suggestions\":[],\"riskLevel\":\"low\"}.",
+    ].join("\n");
+  }
+
+  if (role === "explorer") {
+    return [
+      "[SYSTEM] Context compacted. Resume from compacted history.",
+      "Answer the next open question or finalize the explorer packet. Call finish with the JSON result.",
+      "Do NOT re-read files already in compacted history.",
+    ].join("\n");
+  }
+
+  return [
+    "[SYSTEM] Context compacted. Resume from compacted history.",
+    "Call the next tool or finish with your result. Do not restart.",
+  ].join("\n");
+}
+
+// ─── Budget nudge builders ──────────────────────────────────────────────────
+
+function buildBudgetNudge(role: string | undefined, iteration: number, maxIterations: number, fraction: number): string | null {
+  if (!role) return null;
+  const pct = Math.round(fraction * 100);
+
+  if (role === "explorer") {
+    return `[BUDGET ${pct}%] Iteration ${iteration + 1}/${maxIterations}. Start wrapping up. When you call finish, "result" must be raw JSON:\n{"summary":"...","relevantFiles":["..."],"recommendedFilesForCoding":["..."],"keyPatterns":"...","unresolvedBlockers":"..."}\nNo markdown, no code fences.`;
+  }
+
+  if (role === "epicDecoder") {
+    return `[BUDGET ${pct}%] Iteration ${iteration + 1}/${maxIterations}. If you have ticket skeletons, call finish_looplet with ticketUpdates. If all phases are done, call finish with the GoalDecomposition JSON.`;
+  }
+
+  if (role === "builder" || role === "coder") {
+    return `[BUDGET ${pct}%] Iteration ${iteration + 1}/${maxIterations}. If you have made changes, verify them and call finish with the result JSON.`;
+  }
+
+  if (role === "reviewer") {
+    return `[BUDGET ${pct}%] Iteration ${iteration + 1}/${maxIterations}. Produce your verdict now. Call finish with {"approved":true/false,"blockers":[...],"suggestions":[...],"riskLevel":"low|medium|high"}`;
+  }
+
+  return `[BUDGET ${pct}%] Iteration ${iteration + 1}/${maxIterations}. Start wrapping up. Call finish or finish_looplet with your result.`;
+}
+
+function buildConvergenceNudge(role: string | undefined, iteration: number, maxIterations: number): string | null {
+  if (!role) return null;
+
+  if (role === "explorer") {
+    return `[BUDGET 80%] Iteration ${iteration + 1}/${maxIterations}. STOP exploring. Call finish NOW with result as raw JSON:\n{"summary":"...","relevantFiles":["..."],"recommendedFilesForCoding":["..."],"keyPatterns":"...","unresolvedBlockers":"none"}\nNo markdown fences.`;
+  }
+
+  if (role === "epicDecoder") {
+    return `[BUDGET 80%] Iteration ${iteration + 1}/${maxIterations}. STOP iterating. Call finish with the GoalDecomposition JSON NOW:\n{"summary":"...","tickets":[{"id":"...","title":"...","description":"...","acceptanceCriteria":["..."],"dependencies":[],"priority":"high|medium|low"}]}`;
+  }
+
+  if (role === "builder" || role === "coder") {
+    return `[BUDGET 80%] Iteration ${iteration + 1}/${maxIterations}. STOP editing. Call finish NOW with your result JSON.`;
+  }
+
+  if (role === "reviewer") {
+    return `[BUDGET 80%] Iteration ${iteration + 1}/${maxIterations}. Call finish NOW with verdict JSON: {"approved":true/false,"blockers":[],"suggestions":[],"riskLevel":"low"}`;
+  }
+
+  if (role === "epicReviewer") {
+    return `[BUDGET 80%] Iteration ${iteration + 1}/${maxIterations}. Produce epic verdict now. Call finish with {"verdict":"approved|needs_followups|failed","summary":"...","followupTickets":[]}`;
+  }
+
+  if (role === "tester") {
+    return `[BUDGET 80%] Iteration ${iteration + 1}/${maxIterations}. Produce test summary now. Call finish with the test result JSON.`;
+  }
+
+  return `[BUDGET 80%] Iteration ${iteration + 1}/${maxIterations}. Call finish or finish_looplet NOW.`;
 }
 
 // ─── JSON extraction from text ──────────────────────────────────────────────
@@ -918,13 +1157,13 @@ function extractXmlToolCalls(text: string): CompleteToolCall[] {
   // Matches <tag=val>, <tag name=val>, or <tool_name>
   // Extremely permissive closing tag support to handle GLM quirks
   const anchorRegex = /<(function|invoke|function_call|call_tool|tool_name|[\w_-]+)(?:[=\s](?:name|tool_name)="?([\w_-]+)"?|="?([\w_-]+)"?)?([\s\S]*?)>([\s\S]*?)(?:<\/\1(?:=[^>]+)?>|<\/\1>|<\/function>|<\/invoke>|$)/gi;
-  
+
   let match: RegExpExecArray | null;
   while ((match = anchorRegex.exec(text)) !== null) {
     const tagName = match[1].toLowerCase();
     const attrName = (match[2] || match[3] || "").toLowerCase();
     const body = match[5].trim();
-    
+
     let fnName = "";
     let fnBody = body;
 
@@ -946,7 +1185,7 @@ function extractXmlToolCalls(text: string): CompleteToolCall[] {
 
     // Resolve Arguments
     const args: Record<string, unknown> = {};
-    
+
     // Support sequential fragments: look ahead in text if body is short
     let searchSpace = fnBody;
     if (fnBody.length < 50) {
@@ -960,7 +1199,7 @@ function extractXmlToolCalls(text: string): CompleteToolCall[] {
       const pTagName = argMatch[1].toLowerCase();
       const pAttrName = argMatch[2] || argMatch[3];
       const pVal = argMatch[4].trim();
-      
+
       if (KNOWN_TOOL_NAMES.has(pTagName) && pTagName !== fnName) continue;
 
       const pName = pAttrName || (["parameter", "arg", "argument", "args", "arguments"].includes(pTagName) ? null : pTagName);
@@ -1316,10 +1555,12 @@ async function fetchOllama(
   topK: number,
   numCtx: number,
   noThink?: boolean,
+  signal?: AbortSignal,
 ): Promise<Response> {
   return fetch(`${baseURL}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    signal,
     body: JSON.stringify({
       model,
       messages: messages.map(convertToOllamaMessage),
@@ -1349,6 +1590,7 @@ async function fetchAnthropic(
   toolMode: string,
   systemPrompt: string,
   _numCtx: number,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const anthropicMessages = convertToAnthropicMessages(messages);
   const anthropicTools = toolMode === "native" ? tools.map(t => ({
@@ -1359,6 +1601,7 @@ async function fetchAnthropic(
 
   return fetch(`${baseURL}/v1/messages`, {
     method: "POST",
+    signal,
     headers: {
       "x-api-key": apiKey,
       "anthropic-version": "2023-06-01",
@@ -1386,6 +1629,7 @@ async function fetchOpenRouter(
   topP: number,
   _topK: number,
   _numCtx: number,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const url = "https://openrouter.ai/api/v1/chat/completions";
   const body = {
@@ -1396,6 +1640,7 @@ async function fetchOpenRouter(
 
   return fetch(url, {
     method: "POST",
+    signal,
     headers: {
       "Authorization": `Bearer ${apiKey}`,
       "Content-Type": "application/json",

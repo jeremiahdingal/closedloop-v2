@@ -82,15 +82,31 @@ function buildExplorerResume(state: AgentContinuationState<ExplorerLedger>): str
 function buildDecoderResume(state: AgentContinuationState<EpicDecoderLedger>): string {
   const ledger = state.ledger;
   const incompleteTickets = ledger.ticketSkeletons.filter((t) => t.status !== "filled");
+  const filledEvidence = Object.entries(ledger.evidenceSlots)
+    .filter(([, slot]) => slot.status === "filled")
+    .map(([id]) => id);
+  const missingEvidence = Object.entries(ledger.evidenceSlots)
+    .filter(([, slot]) => slot.status !== "filled")
+    .map(([id]) => id);
+  const visitedPaths = Object.keys(state.visitedFiles).slice(-10);
+
   return [
     `DECODER RESUME:`,
     `Ticket skeletons: ${ledger.ticketSkeletons.length} total, ${incompleteTickets.length} incomplete.`,
     incompleteTickets.length > 0
       ? `Next incomplete: ${incompleteTickets[0].responsibility}`
       : `All skeletons filled — produce final GoalDecomposition JSON.`,
-    `Evidence slots: ${Object.keys(ledger.evidenceSlots).length}.`,
-    `Do not reread files already recorded. Fill the next incomplete ticket from existing evidence.`,
-  ].join("\n");
+    ``,
+    `Filled evidence: ${filledEvidence.length > 0 ? filledEvidence.join(", ") : "none"}`,
+    `Missing evidence: ${missingEvidence.length > 0 ? missingEvidence.join(", ") : "none"}`,
+    ``,
+    `Visited files (last 10): ${visitedPaths.length > 0 ? visitedPaths.join(", ") : "none"}`,
+    ``,
+    `Current phase: ${state.phase}`,
+    state.phase === "evidence" ? `Next action: call glob_files, grep_files, semantic_search, read_file, or read_files for a missing evidence slot; call finish_looplet only if enough evidence is gathered.` : "",
+    state.phase === "fill_tickets" ? `Next action: fill ticket descriptions using gathered evidence, then call finish_looplet.` : "",
+    `Do not re-read files already recorded. Do not re-read filled evidence slots.`,
+  ].filter(Boolean).join("\n");
 }
 
 function buildHardenerResume(state: AgentContinuationState<TicketHardenerLedger>): string {

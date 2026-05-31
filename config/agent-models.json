@@ -1,5 +1,5 @@
 {
-  "epicDecoder": "mediated:batiai/qwen3.6-27b:iq3",
+  "epicDecoder": "mediated:ibm/granite4.1:30b-q3_K_M",
   "ticketHardener": "qwen3.5:9b",
   "decompositionJudge": "mediated:batiai/qwen3.6-27b:iq3",
   "ticketRepair": "mediated:batiai/qwen3.6-27b:iq3",

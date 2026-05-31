@@ -142,6 +142,62 @@ test("knowledge selector returns compact relevant sections and judge rejects bro
   assert.equal(judgement.rejectedTickets.length, 1);
 });
 
+test("deterministic hardener narrows weak local-model tickets into builder-friendly scope", async () => {
+  const repoRoot = await makeTempDir("knowledge-repo-");
+  const snapshot = buildSnapshot(repoRoot);
+  const slice = selectKnowledgeSlice({
+    epic: {
+      id: "epic2",
+      title: "Tighten ticket quality",
+      goalText: "Improve deterministic ticket hardening for local models",
+      targetDir: repoRoot,
+      targetBranch: null,
+      status: "planning",
+      pausedFromStatus: null,
+      scheduledDate: null,
+      assetPaths: [],
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    },
+    snapshot,
+    freshness: {
+      state: "fresh",
+      refreshRequired: false,
+      reasonCodes: [],
+      lastRefreshCommit: "abc123",
+      currentCommit: "abc123",
+      approvedEpicsSinceRefresh: 0,
+      warnings: [],
+    },
+    plannerProfile: "small-local",
+    maxSelectedKnowledgeTokens: 6000,
+  });
+
+  const hardened = hardenTickets([{
+    id: "T2",
+    title: "Improve hardener",
+    description: "Update src/orchestration/knowledge/hardener.ts and tests/knowledge-pipeline.test.ts to improve ticket quality.",
+    acceptanceCriteria: ["works correctly"],
+    dependencies: [],
+    allowedPaths: ["*"],
+    priority: "high",
+    testSpecs: ["tests/knowledge-pipeline.test.ts verifies hardenTickets narrows allowed paths and adds verification guidance."],
+  }], slice);
+
+  assert.deepEqual(hardened[0]?.allowedPaths, [
+    "src/orchestration/knowledge/hardener.ts",
+    "tests/knowledge-pipeline.test.ts",
+  ]);
+  assert.match(hardened[0]?.description ?? "", /WHAT:/);
+  assert.match(hardened[0]?.description ?? "", /WHERE:/);
+  assert.equal(hardened[0]?.acceptanceCriteria.some((criterion) => /verify/i.test(criterion)), true);
+  assert.equal(hardened[0]?.localModelNotes?.some((note) => /Stay within these paths/i.test(note)), true);
+
+  const judgement = judgeDecomposition(hardened, "small-local");
+  assert.equal(judgement.passed, true);
+  assert.equal(judgement.rejectedTickets.length, 0);
+});
+
 test("knowledgebase service loads snapshot and reports freshness from on-disk state", async () => {
   const dataDir = await makeTempDir("knowledge-data-");
   const repoRoot = await makeTempDir("knowledge-repo-");
