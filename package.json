@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Production-oriented local-first orchestration starter with LangGraph, SQLite persistence, worktree isolation, typed bridge operations, recovery, tests, and a minimal React UI.",
   "scripts": {
-    "test": "node --experimental-strip-types --test tests/**/*.test.ts",
+    "test": "node --experimental-strip-types --test tests/**/*.test.ts src/**/*.test.ts",
     "api": "nodemon --exec \"node --experimental-strip-types src/apps/api.ts\"",
     "worker": "nodemon --exec \"node --experimental-strip-types src/apps/worker.ts\"",
     "seed": "node --experimental-strip-types src/apps/seed.ts",

@@ -275,7 +275,6 @@ export async function runContinuableAgent<TLedger, TOutput>(
       // Run the model through the gateway
       let result: unknown;
       let toolCallCount = 0;
-      const toolResultsToProcess: Array<{ name: string; args: Record<string, unknown>; resultText: string }> = [];
 
       // Force phase completion if target is exhausted
       let retryNote: string | null = null;
@@ -303,6 +302,9 @@ export async function runContinuableAgent<TLedger, TOutput>(
         });
       }
 
+      // Mutable state ref — afterToolResult hook updates this during loop execution
+      const stateRef = { current: state };
+
       try {
         result = await callGateway(gateway, gatewayMethod, {
           cwd,
@@ -314,11 +316,11 @@ export async function runContinuableAgent<TLedger, TOutput>(
           continuation: {
             enabled: true,
             phase: state.phase,
-            state,
+            state: stateRef.current,
             maxIterations: loopletIterations,
             allowedToolsOverride: allowedTools,
-            beforeToolCall: createEpicDecoderBeforeToolCall(state),
-            afterToolResult: undefined,
+            beforeToolCall: createEpicDecoderBeforeToolCall(stateRef.current),
+            afterToolResult: createEpicDecoderAfterToolResult(stateRef),
           },
           onStream: (event: any) => {
             // Track visited files and tool calls from stream events
@@ -330,17 +332,6 @@ export async function runContinuableAgent<TLedger, TOutput>(
             }
             if (event.kind === "tool_call") {
               toolCallCount++;
-            }
-            // Track search tool results for negative evidence
-            if (event.kind === "tool_result" && event.result?.name) {
-              const discoveryTools = ["glob_files", "grep_files", "semantic_search", "read_file", "read_files", "list_dir"];
-              if (discoveryTools.includes(event.result.name)) {
-                toolResultsToProcess.push({
-                  name: event.result.name,
-                  args: event.call?.args ?? {},
-                  resultText: event.result.output ?? "",
-                });
-              }
             }
             onStream?.(event);
           },
@@ -377,14 +368,11 @@ export async function runContinuableAgent<TLedger, TOutput>(
      }
 
       // Update state after successful call
+      // Sync state from ref — afterToolResult hook may have updated the ledger
+      state = stateRef.current;
       state = bumpModelCalls(state, toolCallCount) as AgentContinuationState<TLedger, TOutput>;
       state = resetNoProgressStreak(state) as AgentContinuationState<TLedger, TOutput>;
       state = recordProgressEvent(state, "looplet_completed", `phase=${state.phase}, tools=${toolCallCount}`) as AgentContinuationState<TLedger, TOutput>;
-
-      // Process collected tool results for negative evidence tracking
-      for (const toolResult of toolResultsToProcess) {
-        state = updateDiscoveryLedgerFromToolResult(state, toolResult.name, toolResult.args, toolResult.resultText);
-      }
 
     // Try to extract output from result
     let loopletPhaseAdvanced = false;
@@ -592,7 +580,19 @@ function updateStateFromLooplet<TLedger, TOutput>(
       ledger.evidenceSlots = evidenceSlots;
     }
     if ("finalCandidate" in payload) {
-      ledger.finalCandidate = payload.finalCandidate ?? null;
+      const candidate = payload.finalCandidate as any;
+      if (candidate && Array.isArray(candidate.tickets)) {
+        for (const ticket of candidate.tickets) {
+          const ticketText = ticket.description ?? ticket.title ?? "";
+          if (ticketText && ledger.discoveryLedger) {
+            const validation = validateTicketPathIntent(ticketText, ledger);
+            if (!validation.ok && validation.rewrittenText) {
+              ticket.description = validation.rewrittenText;
+            }
+          }
+        }
+      }
+      ledger.finalCandidate = candidate ?? null;
     }
     nextState = { ...state, ledger: ledger as TLedger };
   }
@@ -795,6 +795,97 @@ export function createEpicDecoderBeforeToolCall(state: AgentContinuationState<an
         `If the target file is needed, ticket wording must say CREATE, not MODIFY.`,
       ].join("\n"),
     };
+  };
+}
+
+// ─── EpicDecoder afterToolResult hook ────────────────────────────────────────
+
+export function createEpicDecoderAfterToolResult(stateRef: { current: AgentContinuationState<any> }) {
+  return async (input: {
+    role: string;
+    phase: string;
+    toolName: string;
+    args: Record<string, unknown>;
+    resultText: string;
+    state: unknown;
+  }) => {
+    if (input.role !== "epicDecoder") {
+      return { state: input.state, progressEvents: [], shouldEndLooplet: false };
+    }
+
+    const discoveryTools = new Set([
+      "glob_files", "grep_files", "semantic_search",
+      "read_file", "read_files", "list_dir",
+    ]);
+
+    if (!discoveryTools.has(input.toolName)) {
+      return { state: input.state, progressEvents: [], shouldEndLooplet: false };
+    }
+
+    const searchText = extractSearchText(input.toolName, input.args);
+    const target = inferSearchTarget(searchText);
+
+    if (!target) {
+      return { state: input.state, progressEvents: [], shouldEndLooplet: false };
+    }
+
+    const ledger = stateRef.current.ledger as EpicDecoderLedger;
+    const discovery = ledger.discoveryLedger;
+
+    const failed =
+      input.resultText.toLowerCase().includes("no files matched") ||
+      input.resultText.toLowerCase().includes("file not found") ||
+      input.resultText.toLowerCase().includes("0 matches") ||
+      input.resultText.toLowerCase().includes("error:");
+
+    const files = extractFileListFromResult(input.resultText);
+
+    if (failed || files.length === 0) {
+      const updatedDiscovery = recordNegativeEvidence(
+        discovery,
+        target,
+        input.phase,
+        searchText,
+        input.resultText,
+        true
+      );
+      stateRef.current = {
+        ...stateRef.current,
+        ledger: { ...ledger, discoveryLedger: updatedDiscovery },
+      };
+
+      if (isTargetExhausted(updatedDiscovery, target)) {
+        const injection = buildNegativeEvidenceInjection(updatedDiscovery, target);
+        return {
+          state: stateRef.current,
+          progressEvents: [],
+          shouldEndLooplet: true,
+          nudge: [
+            `[DISCOVERY GUARD] Target "${target}" exhausted after this failed ${input.toolName}.`,
+            injection,
+            `Call finish_looplet now. Any ticket for this target must say CREATE, not MODIFY.`,
+          ].join("\n"),
+        };
+      }
+
+      return { state: stateRef.current, progressEvents: [], shouldEndLooplet: false };
+    }
+
+    if (files.length > 0) {
+      const updatedDiscovery = recordPositiveEvidence(
+        discovery,
+        target,
+        input.phase,
+        files,
+        [input.resultText.slice(0, 200)]
+      );
+      stateRef.current = {
+        ...stateRef.current,
+        ledger: { ...ledger, discoveryLedger: updatedDiscovery },
+      };
+    }
+
+    return { state: stateRef.current, progressEvents: [], shouldEndLooplet: false };
   };
 }
 
