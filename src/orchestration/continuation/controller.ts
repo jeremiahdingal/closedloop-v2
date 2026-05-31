@@ -23,12 +23,21 @@ import {
   shouldBlockSearch,
   shouldForceFinishDiscovery,
   buildNegativeEvidenceInjection,
+  isTargetExhausted,
 } from "./negative-evidence.ts";
 import type { ModelGateway, StreamHook } from "../models.ts";
 import type { ToolExecutionContext, MediatedHarnessEvent } from "../../mediated-agent-harness/types.ts";
 import { parseJsonText } from "../validation.ts";
 
 // ─── Negative evidence tracking helpers ──────────────────────────────────────
+
+function extractSearchText(toolName: string, args: Record<string, unknown>): string {
+  if (typeof args.pattern === "string") return args.pattern;
+  if (typeof args.query === "string") return args.query;
+  if (typeof args.path === "string") return args.path;
+  if (Array.isArray(args.paths)) return args.paths.join(" ");
+  return JSON.stringify(args);
+}
 
 function extractFileListFromResult(resultText: string): string[] {
   const fileMatches = resultText.match(/^[\w\-./]+\.\w+$/gm) ?? [];
@@ -40,8 +49,8 @@ function classifyToolResultForEvidence(
   args: Record<string, unknown>,
   resultText: string
 ): { target: string | null; isNegative: boolean; isWeak: boolean; files: string[] } {
-  const pattern = (args.pattern ?? args.query ?? "") as string;
-  const target = inferSearchTarget(pattern);
+  const searchText = extractSearchText(toolName, args);
+  const target = inferSearchTarget(searchText);
   const files = extractFileListFromResult(resultText);
   const isWeak = isWeakOrIrrelevantResult(resultText, files);
   const isNegative = isWeak || files.length === 0;
@@ -60,20 +69,33 @@ function updateDiscoveryLedgerFromToolResult<TLedger, TOutput>(
   const ledger = state.ledger as EpicDecoderLedger;
   const discovery = ledger.discoveryLedger;
 
+  const discoveryTools = new Set([
+    "glob_files", "grep_files", "semantic_search",
+    "read_file", "read_files", "list_dir",
+  ]);
+
+  if (!discoveryTools.has(toolName)) return state;
+
   const { target, isNegative, isWeak, files } = classifyToolResultForEvidence(toolName, args, resultText);
 
   if (!target) return state;
 
-  const pattern = (args.pattern ?? args.query ?? "") as string;
+  const searchText = extractSearchText(toolName, args);
 
-  if (isNegative) {
+  const failed =
+    resultText.toLowerCase().includes("no files matched") ||
+    resultText.toLowerCase().includes("file not found") ||
+    resultText.toLowerCase().includes("0 matches") ||
+    resultText.toLowerCase().includes("error:");
+
+  if (failed || isNegative) {
     const updatedDiscovery = recordNegativeEvidence(
       discovery,
       target,
       state.phase,
-      pattern,
+      searchText,
       resultText,
-      isWeak
+      isWeak || failed
     );
     return {
       ...state,
@@ -255,10 +277,36 @@ export async function runContinuableAgent<TLedger, TOutput>(
       let toolCallCount = 0;
       const toolResultsToProcess: Array<{ name: string; args: Record<string, unknown>; resultText: string }> = [];
 
+      // Force phase completion if target is exhausted
+      let retryNote: string | null = null;
+      if (
+        state.role === "epicDecoder" &&
+        (state.phase === "skeleton" || state.phase === "evidence") &&
+        shouldSkipDiscoveryPhase(state)
+      ) {
+        state = { ...state, phase: "fill_tickets" };
+        state = recordProgressEvent(state, "phase_advanced_forced", "target_exhausted");
+        retryNote = [
+          buildNegativeEvidenceInjection((state.ledger as EpicDecoderLedger).discoveryLedger),
+          "",
+          "Discovery is exhausted. Do not call glob_files, grep_files, semantic_search, list_dir, or read_file for the missing target.",
+          "Fill tickets now. Any missing target path must be described as CREATE, not MODIFY.",
+        ].join("\n");
+        onStream?.({
+          agentRole: role as any,
+          source: "continuation-controller",
+          streamKind: "status",
+          content: `[continuation-guard] Target exhausted, forcing phase to fill_tickets.`,
+          runId,
+          sequence: 0,
+          metadata: { phase: state.phase },
+        });
+      }
+
       try {
         result = await callGateway(gateway, gatewayMethod, {
           cwd,
-          prompt,
+          prompt: retryNote ? `${prompt}\n\n${retryNote}` : prompt,
           runId,
           ticketId: config.ticketId,
           epicId: config.epicId,
@@ -266,8 +314,11 @@ export async function runContinuableAgent<TLedger, TOutput>(
           continuation: {
             enabled: true,
             phase: state.phase,
+            state,
             maxIterations: loopletIterations,
             allowedToolsOverride: allowedTools,
+            beforeToolCall: createEpicDecoderBeforeToolCall(state),
+            afterToolResult: undefined,
           },
           onStream: (event: any) => {
             // Track visited files and tool calls from stream events
@@ -282,8 +333,8 @@ export async function runContinuableAgent<TLedger, TOutput>(
             }
             // Track search tool results for negative evidence
             if (event.kind === "tool_result" && event.result?.name) {
-              const searchTools = ["glob_files", "grep_files", "semantic_search"];
-              if (searchTools.includes(event.result.name)) {
+              const discoveryTools = ["glob_files", "grep_files", "semantic_search", "read_file", "read_files", "list_dir"];
+              if (discoveryTools.includes(event.result.name)) {
                 toolResultsToProcess.push({
                   name: event.result.name,
                   args: event.call?.args ?? {},
@@ -505,6 +556,16 @@ function updateStateFromLooplet<TLedger, TOutput>(
       for (const update of payload.ticketUpdates) {
         if (!update?.id) continue;
         const current = byId.get(update.id) ?? {};
+
+        // Validate ticket path intent against discovery ledger
+        const ticketText = update.responsibility ?? current.responsibility ?? "";
+        if (ticketText && ledger.discoveryLedger) {
+          const validation = validateTicketPathIntent(ticketText, ledger);
+          if (!validation.ok && validation.rewrittenText) {
+            update.responsibility = validation.rewrittenText;
+          }
+        }
+
         byId.set(update.id, {
           ...current,
           id: update.id,
@@ -690,6 +751,164 @@ function isTerminalPhase(role: LocalAgentRole, phase: string): boolean {
     knowledgebaseBuilder: "emit_patch",
   };
   return phases[role] === phase;
+}
+
+// ─── EpicDecoder beforeToolCall guard ────────────────────────────────────────
+
+export function createEpicDecoderBeforeToolCall(state: AgentContinuationState<any>) {
+  return (input: { role: string; phase?: string; toolName: string; args: Record<string, unknown>; state: unknown }) => {
+    if (input.role !== "epicDecoder") return {};
+
+    const discoveryTools = new Set([
+      "glob_files", "grep_files", "semantic_search",
+      "read_file", "read_files", "list_dir",
+    ]);
+
+    if (!discoveryTools.has(input.toolName)) return {};
+
+    const searchText = extractSearchText(input.toolName, input.args);
+    const target = inferSearchTarget(searchText);
+
+    if (!target) return {};
+
+    const ledger = state.ledger as EpicDecoderLedger;
+    const discovery = ledger.discoveryLedger;
+
+    const blocked =
+      shouldBlockSearch(discovery, target, searchText) ||
+      shouldForceFinishDiscovery(discovery, target);
+
+    if (!blocked) return {};
+
+    const injection = buildNegativeEvidenceInjection(discovery, target);
+
+    return {
+      blocked: true,
+      state: input.state,
+      nudge: [
+        `[DISCOVERY GUARD] Do not run that search.`,
+        `Target "${target}" is already missing/exhausted.`,
+        "",
+        injection,
+        "",
+        `You must now call finish_looplet.`,
+        `If the target file is needed, ticket wording must say CREATE, not MODIFY.`,
+      ].join("\n"),
+    };
+  };
+}
+
+// ─── Ticket path validation ──────────────────────────────────────────────────
+
+type PathIntent = "create" | "modify" | "unknown";
+
+function classifyTicketIntent(text: string): PathIntent {
+  const lower = text.toLowerCase();
+
+  if (
+    lower.includes("create ") ||
+    lower.includes("add new ") ||
+    lower.includes("new file") ||
+    lower.includes("because no existing")
+  ) {
+    return "create";
+  }
+
+  if (
+    lower.includes("modify ") ||
+    lower.includes("update ") ||
+    lower.includes("edit ") ||
+    lower.includes("replace ") ||
+    lower.includes("in existing ")
+  ) {
+    return "modify";
+  }
+
+  return "unknown";
+}
+
+function extractMentionedPaths(text: string): string[] {
+  const matches = text.match(/[A-Za-z0-9._/-]+\.(tsx|ts|jsx|js|json|md|css|scss)/g);
+  return [...new Set(matches ?? [])];
+}
+
+function getVerifiedFiles(ledger: EpicDecoderLedger): Set<string> {
+  const files = new Set<string>();
+  for (const ev of ledger.discoveryLedger.successfulEvidence) {
+    for (const file of ev.files) files.add(file);
+  }
+  for (const slot of Object.values(ledger.evidenceSlots)) {
+    for (const file of slot.files ?? []) files.add(file);
+  }
+  return files;
+}
+
+function getNegativelyVerifiedFiles(ledger: EpicDecoderLedger): Set<string> {
+  const files = new Set<string>();
+  for (const ev of ledger.discoveryLedger.negativeEvidence) {
+    for (const pattern of ev.failedPatterns) {
+      if (/\.(tsx|ts|jsx|js|json|md|css|scss)$/.test(pattern)) {
+        files.add(pattern);
+      }
+    }
+  }
+  return files;
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function validateTicketPathIntent(
+  ticketText: string,
+  ledger: EpicDecoderLedger
+): { ok: boolean; reason?: string; rewrittenText?: string } {
+  const intent = classifyTicketIntent(ticketText);
+  const paths = extractMentionedPaths(ticketText);
+
+  if (paths.length === 0) return { ok: true };
+
+  const verified = getVerifiedFiles(ledger);
+  const negative = getNegativelyVerifiedFiles(ledger);
+
+  for (const path of paths) {
+    const isVerified = verified.has(path);
+    const isKnownMissing = negative.has(path);
+
+    if (intent === "modify" && !isVerified) {
+      return {
+        ok: false,
+        reason: `Ticket says modify ${path}, but that file was not verified.`,
+        rewrittenText: ticketText.replace(
+          new RegExp(`(Modify|Update|Edit|Replace)(.*?${escapeRegex(path)})`, "i"),
+          `Create ${path}`
+        ),
+      };
+    }
+
+    if (intent === "modify" && isKnownMissing) {
+      return {
+        ok: false,
+        reason: `Ticket says modify ${path}, but that file was proven missing.`,
+        rewrittenText: ticketText.replace(
+          new RegExp(`(Modify|Update|Edit|Replace)(.*?${escapeRegex(path)})`, "i"),
+          `Create ${path}`
+        ),
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+// ─── Force phase completion after target exhaustion ──────────────────────────
+
+function shouldSkipDiscoveryPhase(state: AgentContinuationState<any>): boolean {
+  if (state.role !== "epicDecoder") return false;
+  const ledger = state.ledger as EpicDecoderLedger;
+  return ledger.discoveryLedger.negativeEvidence.some(
+    (e) => e.exhausted || e.searchCount >= 3
+  );
 }
 
 // ─── Convenience wrappers ────────────────────────────────────────────────────

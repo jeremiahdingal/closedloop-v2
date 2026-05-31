@@ -95,6 +95,7 @@ export interface MediatedHarnessConfig {
     state?: any;
     maxIterations?: number;
     allowedToolsOverride?: string[];
+    beforeToolCall?: (input: ContinuationBeforeToolCallInput) => Promise<ContinuationBeforeToolCallResult> | ContinuationBeforeToolCallResult;
     afterToolResult?: (event: AfterToolResultEvent) => Promise<AfterToolResultUpdate>;
   };
 }
@@ -114,6 +115,29 @@ export interface AfterToolResultUpdate {
   shouldEndLooplet: boolean;
   nudge?: string;
 }
+
+export type ContinuationBeforeToolCallInput = {
+  role: string;
+  phase?: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  state: unknown;
+};
+
+export type ContinuationBeforeToolCallResult = {
+  blocked?: boolean;
+  reason?: string;
+  nudge?: string;
+  state?: unknown;
+  forcedLoopletResult?: {
+    phaseComplete: boolean;
+    requestedNextPhase?: string;
+    evidenceUpdates?: unknown[];
+    ticketUpdates?: unknown[];
+    finalCandidate?: unknown;
+    summary: string;
+  };
+};
 
 export interface ToolExecutionContext {
   cwd: string;

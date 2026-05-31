@@ -227,12 +227,42 @@ export function isEquivalentSearchPattern(
   newPattern: string,
   existingPatterns: string[]
 ): boolean {
-  const normalized = newPattern.toLowerCase().replace(/[*?[\]]/g, "").trim();
+  const normalize = (value: string) =>
+    value
+      .toLowerCase()
+      .replace(/[*?[\]{}()"'`]/g, "")
+      .replace(/\.(tsx|ts|jsx|js|json|md|css|scss)$/g, "")
+      .replace(/[-_/\\]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const next = normalize(newPattern);
 
   for (const existing of existingPatterns) {
-    const existingNorm = existing.toLowerCase().replace(/[*?[\]]/g, "").trim();
-    if (normalized === existingNorm) return true;
-    if (normalized.includes(existingNorm) || existingNorm.includes(normalized)) return true;
+    const prev = normalize(existing);
+
+    if (next === prev) return true;
+    if (next.includes(prev) || prev.includes(next)) return true;
+
+    const contactTerms = ["contact", "contactform", "contact form", "contact-form"];
+    const nextIsContact = contactTerms.some((t) => next.includes(t));
+    const prevIsContact = contactTerms.some((t) => prev.includes(t));
+    if (nextIsContact && prevIsContact) return true;
+
+    const authTerms = ["auth", "login", "signin", "signup", "register", "authentication"];
+    const nextIsAuth = authTerms.some((t) => next.includes(t));
+    const prevIsAuth = authTerms.some((t) => prev.includes(t));
+    if (nextIsAuth && prevIsAuth) return true;
+
+    const checkoutTerms = ["checkout", "check-out", "check out"];
+    const nextIsCheckout = checkoutTerms.some((t) => next.includes(t));
+    const prevIsCheckout = checkoutTerms.some((t) => prev.includes(t));
+    if (nextIsCheckout && prevIsCheckout) return true;
+
+    const paymentTerms = ["payment", "pay", "billing", "invoice"];
+    const nextIsPayment = paymentTerms.some((t) => next.includes(t));
+    const prevIsPayment = paymentTerms.some((t) => prev.includes(t));
+    if (nextIsPayment && prevIsPayment) return true;
   }
 
   return false;
@@ -247,7 +277,15 @@ export function shouldBlockSearch(
   if (!negative) return false;
 
   if (negative.exhausted) return true;
-  if (isEquivalentSearchPattern(newPattern, negative.failedPatterns)) return true;
+
+  if (
+    negative.searchCount >= 2 &&
+    isEquivalentSearchPattern(newPattern, negative.failedPatterns)
+  ) {
+    return true;
+  }
+
+  if (negative.searchCount >= 3) return true;
 
   return false;
 }

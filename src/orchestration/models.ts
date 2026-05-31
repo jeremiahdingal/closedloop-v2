@@ -58,7 +58,7 @@ export interface ModelGateway {
   runCoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; skipExplorer?: boolean; onStream?: StreamHook; continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] } }): Promise<CoderRunResult>;
   runCoderDirect?(input: { prompt: string; runId?: string | null; ticketId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<string>;
   runGoalReviewInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any; continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] } }): Promise<GoalReview>;
-  runEpicDecoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any; continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] } }): Promise<GoalDecomposition>;
+  runEpicDecoderInWorkspace?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook; ragIndexId?: number; db?: any; continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[]; state?: any; beforeToolCall?: any; afterToolResult?: any } }): Promise<GoalDecomposition>;
   runEpicDecoderOpenCode?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalDecomposition>;
   runEpicReviewerCodex?(input: { cwd: string; prompt: string; runId?: string | null; epicId?: string | null; onStream?: StreamHook }): Promise<GoalReview>;
 }
@@ -910,7 +910,7 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     onStream?: StreamHook;
     ragIndexId?: number;
     db?: any;
-    continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[] };
+    continuation?: { enabled: boolean; phase: string; maxIterations?: number; allowedToolsOverride?: string[]; state?: any; beforeToolCall?: any; afterToolResult?: any };
   }): Promise<GoalDecomposition> {
     const configuredModel = this.models.epicDecoder;
 
@@ -1213,12 +1213,16 @@ export class MediatedAgentHarnessGateway implements ModelGateway {
     if (isOllama) await ensureModelLoaded(model);
     
     // Use continuation options if provided
-    const maxIterations = input.continuation?.maxIterations ?? 20;
+    const maxIterations = input.continuation?.maxIterations ?? 80;
+    const cont = input.continuation as any;
     const continuationConfig = input.continuation ? {
       enabled: input.continuation.enabled,
       phase: input.continuation.phase,
       maxIterations: input.continuation.maxIterations,
       allowedToolsOverride: input.continuation.allowedToolsOverride,
+      ...(cont.state ? { state: cont.state } : {}),
+      ...(cont.beforeToolCall ? { beforeToolCall: cont.beforeToolCall } : {}),
+      ...(cont.afterToolResult ? { afterToolResult: cont.afterToolResult } : {}),
     } : undefined;
     
     // Emit mediated harness start trace marker

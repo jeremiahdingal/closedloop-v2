@@ -724,6 +724,79 @@ export async function runMediatedLoop(input: LoopInput): Promise<MediatedHarness
         };
       }
 
+      // ── Continuation beforeToolCall hook ──
+      if (config.continuation?.enabled && config.continuation.beforeToolCall) {
+        try {
+          const decision = await config.continuation.beforeToolCall({
+            role: config.role ?? "",
+            phase: config.continuation.phase,
+            toolName: validated.name,
+            args: validated.args,
+            state: config.continuation.state,
+          });
+
+          if (decision.state) {
+            config.continuation.state = decision.state;
+          }
+
+          if (decision.forcedLoopletResult) {
+            const forced = decision.forcedLoopletResult;
+            const loopletResult = JSON.stringify({
+              phaseComplete: forced.phaseComplete,
+              requestedNextPhase: forced.requestedNextPhase,
+              evidenceUpdates: forced.evidenceUpdates ?? [],
+              ticketUpdates: forced.ticketUpdates ?? [],
+              finalCandidate: forced.finalCandidate,
+            });
+
+            collectedToolCalls.push(toolCall);
+            emit({ kind: "tool_call", call: toolCall });
+            emit({ kind: "status", text: `[continuation-guard] ${forced.summary}` });
+            emit({ kind: "complete", result: loopletResult, iterations: iteration + 1 });
+
+            return {
+              text: loopletResult,
+              toolCalls: collectedToolCalls,
+              iterations: iteration + 1,
+              usage: state.usage,
+            };
+          }
+
+          if (decision.blocked) {
+            const blockedMessage =
+              decision.nudge ??
+              `Blocked by continuation guard: ${decision.reason ?? "repeated missing-target search"}`;
+
+            emit({ kind: "tool_error", call: toolCall, error: blockedMessage });
+            history.record(validated.name, validated.args, true, blockedMessage);
+
+            assistantToolCalls.push({
+              id: completeCall.id,
+              type: "function",
+              function: {
+                name: validated.name,
+                arguments: JSON.stringify(validated.args),
+              },
+            });
+
+            toolResults.push({
+              role: "tool",
+              content: `Error: ${blockedMessage}`,
+              tool_call_id: completeCall.id,
+            });
+
+            messages.push({
+              role: "user",
+              content: blockedMessage,
+            });
+
+            continue;
+          }
+        } catch (hookErr) {
+          console.warn(`[Harness] beforeToolCall hook failed: ${hookErr}`);
+        }
+      }
+
       // ── Duplicate recovery: check for banned or duplicate failed calls ──
       if (isCallBanned(validated.name, validated.args, dupRecoveryState)) {
         const bannedMsg = `This exact call (${validated.name} with these arguments) is BANNED because it previously failed with the same arguments. You must use different arguments or a completely different approach. Do NOT repeat this call.`;
