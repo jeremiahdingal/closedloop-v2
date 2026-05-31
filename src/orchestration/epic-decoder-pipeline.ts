@@ -18,6 +18,8 @@ import type {
 } from "./knowledge/types.ts";
 import { resolveRuntimeProfile } from "../runtime-profile.ts";
 import { StagnationError, LoopTimeoutError } from "../mediated-agent-harness/errors.ts";
+import { detectBusyStall } from "./continuation/progress.ts";
+import { recordProgressEvent, incrementNoProgressStreak, resetNoProgressStreak, advanceLooplet, type AgentContinuationState } from "./continuation/agent-state.ts";
 
 async function withStageRecovery<T>(
   stageName: string,

@@ -23,6 +23,7 @@ import { resolveRuntimeProfile } from "../runtime-profile.ts";
 import { decodeEpicWithKnowledgePipeline } from "./epic-decoder-pipeline.ts";
 import { KnowledgebaseService } from "./knowledge/knowledgebase.ts";
 import type { DecoderPlanningMetadata, LocalEpicMemory } from "./knowledge/types.ts";
+import { runContinuableEpicDecoder, runContinuableGoalReview } from "./continuation/controller.ts";
 
 type GoalGraphState = {
   runId: string;
@@ -889,6 +890,32 @@ export class GoalRunner {
       )
     ) {
       try {
+        // Use continuation controller for mediated decoder (not CLI backends)
+        if (configuredModel.startsWith("mediated:") || configuredModel.startsWith("anthropic-mediated:")) {
+          const result = await runContinuableEpicDecoder({
+            epicId: epic.id,
+            runId,
+            cwd: epic.targetDir,
+            prompt,
+            gateway: this.gateway,
+            onStream: (e) => this.recordAgentStream(e),
+          });
+          this.recordAgentStream({
+            agentRole: "epicDecoder",
+            source: "continuation-controller",
+            streamKind: "status",
+            content: `Epic decoder completed: ${result.totalModelCalls} model calls, ${result.loopletCount} looplets, ${result.recoveredStalls} stall recoveries.`,
+            runId,
+            epicId: epic.id,
+          });
+          const output = result.output;
+          if (output && typeof output === "object" && "tickets" in output) {
+            return output as GoalDecomposition;
+          }
+          // Output might be a GoalDecomposition directly
+          return output as GoalDecomposition;
+        }
+        // CLI backends: use direct gateway call
         const result = await this.gateway.runEpicDecoderInWorkspace({ cwd: epic.targetDir, prompt, runId, epicId: epic.id, onStream: (e) => this.recordAgentStream(e) });
         return result;
       } catch (err) { console.warn(`Decoder failed: ${err}`); }
@@ -1002,17 +1029,41 @@ export class GoalRunner {
         }
 
         // ── 5. Call the reviewer ──
-        const review: GoalReview = useDirectCli
-          ? await this.gateway.runGoalReviewInWorkspace!({
-              cwd: epic.targetDir,
-              prompt: retryPrompt,
-              runId,
-              epicId: epic.id,
-              onStream: (event) => this.recordAgentStream(event),
-              ragIndexId: ragCtx?.indexId ?? undefined,
+        const epicReviewerModel = this.gateway.models.epicReviewer;
+        const useContinuation = useDirectCli && (epicReviewerModel.startsWith("mediated:") || epicReviewerModel.startsWith("anthropic-mediated:"));
+
+        let review: GoalReview;
+        if (useContinuation) {
+          const contResult = await runContinuableGoalReview({
+            epicId: epic.id,
+            runId,
+            cwd: epic.targetDir,
+            prompt: retryPrompt,
+            gateway: this.gateway,
+            onStream: (event) => this.recordAgentStream(event),
+          });
+          this.recordAgentStream({
+            agentRole: "epicReviewer",
+            source: "continuation-controller",
+            streamKind: "status",
+            content: `Epic reviewer completed: ${contResult.totalModelCalls} model calls, ${contResult.loopletCount} looplets, ${contResult.recoveredStalls} stall recoveries.`,
+            runId,
+            epicId: epic.id,
+          });
+          review = contResult.output as GoalReview;
+        } else {
+          review = useDirectCli
+            ? await this.gateway.runGoalReviewInWorkspace!({
+                cwd: epic.targetDir,
+                prompt: retryPrompt,
+                runId,
+                epicId: epic.id,
+                onStream: (event) => this.recordAgentStream(event),
+                ragIndexId: ragCtx?.indexId ?? undefined,
               db: this.db,
             })
-          : await this.gateway.getGoalReview(retryPrompt);
+            : await this.gateway.getGoalReview(retryPrompt);
+        }
 
         lastReview = review;
 
@@ -1093,7 +1144,16 @@ export class GoalRunner {
 
   private async withEpicHeartbeat<T>(runId: string, epicId: string, node: string, message: string, task: () => Promise<T>): Promise<T> {
     const timer = setInterval(() => {
-      this.db.updateRun({ runId, status: "running", currentNode: node, heartbeatAt: nowIso(), lastMessage: message });
+      try {
+        this.db.updateRun({ runId, status: "running", currentNode: node, heartbeatAt: nowIso(), lastMessage: message });
+      } catch (err) {
+        // If the run is not found, it might have been completed or cleared. We can stop the heartbeat.
+        if (err instanceof Error && err.message.includes('Run not found')) {
+          clearInterval(timer);
+        } else {
+          console.warn(`Heartbeat update failed: ${err}`);
+        }
+      }
     }, this.heartbeatIntervalMs);
     try { return await task(); } finally { clearInterval(timer); }
   }

@@ -21,6 +21,7 @@ const SOURCE_SHORT: Record<string, string> = {
   "mediated-harness": "harness",
   opencode: "oc",
   orchestrator: "orch",
+  "continuation-controller": "cont",
 };
 const KIND_LABEL: Record<string, string> = {
   tool_call: "tool",
@@ -35,6 +36,7 @@ const KIND_LABEL: Record<string, string> = {
   system: "sys",
   error: "err",
   duplicate_recovery: "recovery",
+  continuation_state: "continuation",
   streaming_thinking: "think",
   streaming_text: "text",
 };

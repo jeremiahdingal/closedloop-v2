@@ -218,8 +218,8 @@ export type WriteFileInput = {
 
 export type AgentStreamPayload = {
   agentRole: AgentRole;
-  source: "opencode" | "orchestrator" | "mediated-harness" | "zai";
-  streamKind: "stdout" | "stderr" | "thinking" | "assistant" | "system" | "status" | "raw" | "tool_call" | "tool_result" | "tool_error" | "error" | "plan_cleared" | "streaming_text" | "streaming_thinking" | "duplicate_recovery";
+  source: "opencode" | "orchestrator" | "mediated-harness" | "zai" | "continuation-controller";
+  streamKind: "stdout" | "stderr" | "thinking" | "assistant" | "system" | "status" | "raw" | "tool_call" | "tool_result" | "tool_error" | "error" | "plan_cleared" | "streaming_text" | "streaming_thinking" | "duplicate_recovery" | "continuation_state";
   content: string;
   runId?: string | null;
   ticketId?: string | null;

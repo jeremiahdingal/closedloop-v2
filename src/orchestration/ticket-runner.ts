@@ -8,6 +8,7 @@ import type {
   TicketContextPacket,
   TicketRecord
 } from "../types.ts";
+import type { ToolCall } from "../mediated-agent-harness/types.ts";
 import { AppDatabase } from "../db/database.ts";
 import { WorkspaceBridge } from "../bridge/workspace-bridge.ts";
 import { deterministicDoctor } from "../bridge/doctor.ts";
@@ -40,6 +41,12 @@ import { createHash } from "node:crypto";
 import { AgentStreamSessionRegistry } from "./agent-stream-session.ts";
 import { readWorkspaceConfig } from "../config.ts";
 import { resolveRuntimeProfile } from "../runtime-profile.ts";
+import {
+  runContinuableExplorer,
+  runContinuableCoder,
+  runContinuableReviewer,
+  runContinuableTester,
+} from "./continuation/controller.ts";
 
 type TicketLoopResult = {
   runId: string;
@@ -699,102 +706,145 @@ export class TicketRunner {
 
       let coderResult;
       let coderStallCount = 0;
-      while (true) {
+
+      // Use continuuable coder for mediated models (not rescue mode)
+      const useContinuable = !isRescue && this.gateway.runCoderInWorkspace && this.gateway.models.coder.startsWith("mediated:");
+
+      if (useContinuable) {
+        // Continuation controller handles stall recovery via looplets
+        const coderStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "coder");
         try {
-          const coderStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "coder");
+          const contResult = await runContinuableCoder({
+            ticketId: ticket.id,
+            epicId: ticket.epicId,
+            runId,
+            cwd: workspace.worktreePath,
+            prompt: currentCoderPrompt,
+            skipExplorer: state.skipExplorer,
+            gateway: this.gateway,
+            onStream: coderStream.onStream,
+          });
+
+          this.recordAgentStream({
+            agentRole: "coder",
+            source: "continuation-controller",
+            streamKind: "status",
+            content: `Coder completed: ${contResult.totalModelCalls} model calls, ${contResult.loopletCount} looplets, ${contResult.recoveredStalls} stall recoveries.`,
+            runId,
+            ticketId: ticket.id,
+            epicId: ticket.epicId,
+          });
+
+          // Convert ContinuableAgentResult to CoderRunResult format
+          const rawOutput = contResult.output as any;
+          coderResult = {
+            text: rawOutput?.text ?? (typeof rawOutput === "string" ? rawOutput : JSON.stringify(rawOutput ?? "")),
+            toolCalls: rawOutput?.toolCalls ?? [],
+            iterations: contResult.totalModelCalls,
+          };
+        } finally {
+          this.endScopedAgentStream(runId, "coder", coderStream.sessionId);
+        }
+      } else {
+        // Direct path (rescue mode or non-mediated model)
+        while (true) {
           try {
-            coderResult = await activeGateway.runCoderInWorkspace!({
-              cwd: workspace.worktreePath,
-              prompt: currentCoderPrompt,
-              runId,
-              ticketId: ticket.id,
-              epicId: ticket.epicId,
-              skipExplorer: state.skipExplorer,
-              onStream: coderStream.onStream,
-            });
-          } finally {
-            this.endScopedAgentStream(runId, "coder", coderStream.sessionId);
-          }
-          break; // Success
-        } catch (err) {
-          const isStall = err instanceof StagnationError || err instanceof LoopTimeoutError;
-          if (!isStall) throw err;
+            const coderStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "coder");
+            try {
+              coderResult = await activeGateway.runCoderInWorkspace!({
+                cwd: workspace.worktreePath,
+                prompt: currentCoderPrompt,
+                runId,
+                ticketId: ticket.id,
+                epicId: ticket.epicId,
+                skipExplorer: state.skipExplorer,
+                onStream: coderStream.onStream,
+              });
+            } finally {
+              this.endScopedAgentStream(runId, "coder", coderStream.sessionId);
+            }
+            break; // Success
+          } catch (err) {
+            const isStall = err instanceof StagnationError || err instanceof LoopTimeoutError;
+            if (!isStall) throw err;
 
-          coderStallCount++;
+            coderStallCount++;
 
-          // First stall: send "continue" nudge and retry with same prompt
-          if (coderStallCount === 1) {
+            // First stall: send "continue" nudge and retry with same prompt
+            if (coderStallCount === 1) {
+              this.recordAgentStream({
+                agentRole: "coder",
+                source: "orchestrator",
+                streamKind: "status",
+                content: `Coder stalled. Sending "continue" nudge...`,
+                runId,
+                ticketId: ticket.id,
+                epicId: ticket.epicId,
+              });
+              currentCoderPrompt = currentCoderPrompt + "\n\ncontinue";
+              continue;
+            }
+
+            if (hotResets >= maxHotResets) throw err;
+
+            hotResets++;
+            console.log(`[TICKET ${ticket.id}] Coder stalled, hot-reset #${hotResets}`, err instanceof Error ? err.message : String(err));
+
+            // Stage any partial changes so they show up in git diff
+            await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] partial changes before hot-reset #${hotResets}` }).catch(() => {});
+
+            // Build stall context from the error and recent events
+            const stallCtx: StallContext = {
+              stallReason: err instanceof StagnationError
+                ? `${err.reason}: ${err.message}`
+                : err instanceof LoopTimeoutError
+                  ? `Loop timed out after ${err.elapsedMs}ms`
+                  : String(err),
+              stallIteration: err instanceof StagnationError ? err.iterations : undefined,
+              hotResetNumber: hotResets,
+              recentToolCalls: extractRecentToolCalls(runId, this.db),
+            };
+
+            // Build condensed resume prompt with stall context
+            const currentDiff = await this.bridge.gitDiff(workspace.id);
+            currentCoderPrompt = buildCoderResumePrompt(ticket, currentDiff, state.reviewBlockers ?? [], state.explorerOutput, stallCtx);
+
             this.recordAgentStream({
               agentRole: "coder",
               source: "orchestrator",
               streamKind: "status",
-              content: `Coder stalled. Sending "continue" nudge...`,
+              content: `Coder stalled (${stallCtx.stallReason?.slice(0, 100)}). Hot-reset #${hotResets} — restarting with condensed context (${currentDiff.length} chars of diff)...`,
               runId,
               ticketId: ticket.id,
-              epicId: ticket.epicId,
+              epicId: ticket.epicId
             });
-            currentCoderPrompt = currentCoderPrompt + "\n\ncontinue";
+
+            // Re-invoke with fresh harness (condensed prompt)
             continue;
           }
-
-          if (hotResets >= maxHotResets) throw err;
-
-          hotResets++;
-          console.log(`[TICKET ${ticket.id}] Coder stalled, hot-reset #${hotResets}`, err instanceof Error ? err.message : String(err));
-
-          // Stage any partial changes so they show up in git diff
-          await this.bridge.gitCommit({ workspaceId: workspace.id, message: `[${ticket.id}] partial changes before hot-reset #${hotResets}` }).catch(() => {});
-
-          // Build stall context from the error and recent events
-          const stallCtx: StallContext = {
-            stallReason: err instanceof StagnationError
-              ? `${err.reason}: ${err.message}`
-              : err instanceof LoopTimeoutError
-                ? `Loop timed out after ${err.elapsedMs}ms`
-                : String(err),
-            stallIteration: err instanceof StagnationError ? err.iterations : undefined,
-            hotResetNumber: hotResets,
-            recentToolCalls: extractRecentToolCalls(runId, this.db),
-          };
-
-          // Build condensed resume prompt with stall context
-          const currentDiff = await this.bridge.gitDiff(workspace.id);
-          currentCoderPrompt = buildCoderResumePrompt(ticket, currentDiff, state.reviewBlockers ?? [], state.explorerOutput, stallCtx);
-
-          this.recordAgentStream({
-            agentRole: "coder",
-            source: "orchestrator",
-            streamKind: "status",
-            content: `Coder stalled (${stallCtx.stallReason?.slice(0, 100)}). Hot-reset #${hotResets} — restarting with condensed context (${currentDiff.length} chars of diff)...`,
-            runId,
-            ticketId: ticket.id,
-            epicId: ticket.epicId
-          });
-
-          // Re-invoke with fresh harness (condensed prompt)
-          continue;
         }
       }
 
-      // Detect direct writes from tool call history
-      const writeToolNames = new Set(["write_file", "write_files", "search_replace"]);
-      const directWrites = (coderResult.toolCalls ?? []).filter(tc => writeToolNames.has(tc.name));
-      console.log(`[TICKET ${ticket.id}] Coder result: ${coderResult.toolCalls?.length ?? 0} tool calls, ${directWrites.length} direct writes. Tool names: ${(coderResult.toolCalls ?? []).map(tc => tc.name).join(", ")}`);
+        // Detect direct writes from tool call history
+         const writeToolNames = new Set(["write_file", "write_files", "search_replace"]);
+         const toolCalls = coderResult.toolCalls ?? [];
+         const directWrites = toolCalls.filter((tc: ToolCall): tc is ToolCall => writeToolNames.has(tc.name));
+         console.log(`[TICKET ${ticket.id}] Coder result: ${toolCalls.length} tool calls, ${directWrites.length} direct writes. Tool names: ${toolCalls.map((tc: ToolCall) => tc.name).join(", ")}`);
 
-      if (directWrites.length > 0) {
-        const intendedFiles = directWrites.flatMap(tc => {
-          if (tc.name === "write_files" && Array.isArray(tc.args?.files)) {
-            return (tc.args.files as Array<{ path: string }>).map(f => f.path);
-          }
-          return tc.args?.path ? [String(tc.args.path)] : [];
-        });
+         if (directWrites.length > 0) {
+          const intendedFiles = directWrites.flatMap((tc: ToolCall) => {
+            if (tc.name === "write_files" && Array.isArray(tc.args?.files)) {
+              return (tc.args.files as Array<{ path: string }>).map((f: { path: string }) => f.path);
+            }
+            return tc.args?.path ? [String(tc.args.path)] : [];
+          });
         console.log(`[TICKET ${ticket.id}] Coder made ${directWrites.length} direct write calls: ${intendedFiles.join(", ")}`);
 
         // Stage the coder's writes (no commit — keep changes visible for reviewer)
         await this.bridge.stageTicketChanges(workspace.worktreePath);
 
-        // Auto-detect package.json changes and run npm install
-        const touchedPackageJson = intendedFiles.some(f => f.replace(/\\/g, "/").endsWith("package.json"));
+         // Auto-detect package.json changes and run npm install
+         const touchedPackageJson = intendedFiles.some((f: string) => f.replace(/\\/g, "/").endsWith("package.json"));
         if (touchedPackageJson) {
           try {
             this.heartbeat(runId, ticket.id, "coder", "Running npm install (package.json modified)...");
@@ -1225,6 +1275,7 @@ export class TicketRunner {
         const changedFilesDesc = state.intendedFiles.join("\n");
         const buildDiffDesc = state.lastDiff?.slice(0, 2000) || "No diff available";
         const ticketGoalDesc = ticket.description || ticket.title || "No ticket description";
+        const testerPrompt = `Test ONLY the features related to this ticket:\n\nTicket: ${ticketGoalDesc}\n\nChanged files:\n${changedFilesDesc}\n\nBuild diff:\n${buildDiffDesc}`;
 
         // HARD TIMEOUT: 5 minutes max for tester
         let timeoutHandle: NodeJS.Timeout | null = null;
@@ -1245,16 +1296,27 @@ export class TicketRunner {
         });
         const testerStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "tester");
         const result = await Promise.race([
-          this.withHeartbeat(runId, ticket.id, "tester", "Running tests.", () =>
-            this.gateway.runTesterInWorkspace!({
+          this.withHeartbeat(runId, ticket.id, "tester", "Running tests.", async () => {
+            const contResult = await runContinuableTester({
+              ticketId: ticket.id,
+              epicId: ticket.epicId,
+              runId,
               cwd: workspace.worktreePath,
-              prompt: `Test ONLY the features related to this ticket:\n\nTicket: ${ticketGoalDesc}\n\nChanged files:\n${changedFilesDesc}\n\nBuild diff:\n${buildDiffDesc}`,
+              prompt: testerPrompt,
+              gateway: this.gateway,
+              onStream: testerStream.onStream,
+            });
+            this.recordAgentStream({
+              agentRole: "tester",
+              source: "continuation-controller",
+              streamKind: "status",
+              content: `Tester completed: ${contResult.totalModelCalls} model calls, ${contResult.loopletCount} looplets, ${contResult.recoveredStalls} stall recoveries.`,
               runId,
               ticketId: ticket.id,
               epicId: ticket.epicId,
-              onStream: testerStream.onStream
-            })
-          ),
+            });
+            return contResult.output;
+          }),
           timeoutFallback
         ]).finally(() => {
           this.endScopedAgentStream(runId, "tester", testerStream.sessionId);
@@ -1800,20 +1862,23 @@ export class TicketRunner {
           const changedFilesDesc = builderResult.intendedFiles.join("\n");
           const buildDiffDesc = lastDiff.slice(0, 2000) || "No diff available";
           const ticketGoalDesc = ticket.description || ticket.title || "No ticket description";
+          const testerPrompt = `Test ONLY the features related to this ticket:\n\nTicket: ${ticketGoalDesc}\n\nChanged files:\n${changedFilesDesc}\n\nBuild diff:\n${buildDiffDesc}`;
 
           const testerStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "tester");
-          const testerResult = await this.withHeartbeat(runId, ticket.id, "tester", "Running tests.", () =>
-            this.gateway.runTesterInWorkspace!({
-              cwd: workspace.worktreePath,
-              prompt: `Test ONLY the features related to this ticket:\n\nTicket: ${ticketGoalDesc}\n\nChanged files:\n${changedFilesDesc}\n\nBuild diff:\n${buildDiffDesc}`,
-              runId,
+          const contResult = await this.withHeartbeat(runId, ticket.id, "tester", "Running tests.", () =>
+            runContinuableTester({
               ticketId: ticket.id,
               epicId: ticket.epicId,
-              onStream: testerStream.onStream
+              runId,
+              cwd: workspace.worktreePath,
+              prompt: testerPrompt,
+              gateway: this.gateway,
+              onStream: testerStream.onStream,
             })
           ).finally(() => {
             this.endScopedAgentStream(runId, "tester", testerStream.sessionId);
           });
+          const testerResult = contResult.output as any;
           
           testSummary = testerResult.testResults === "PASS" 
             ? `PASS (score: ${testerResult.testNecessityScore}/100)\n${testerResult.testNecessityReason}\n\nTest output:\n${testerResult.testOutput}`
@@ -2525,8 +2590,6 @@ export class TicketRunner {
     const reviewerContext = this.buildReviewerContext(ticket, diff, guard, contract);
     const useMediatedReviewer = reviewerMode === "mediated-deep" && Boolean(this.gateway.runReviewerInWorkspace);
     let lastError: unknown = null;
-    let reviewerStallCount = 0;
-    let reviewerPromptOverride: string | null = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         this.recordAgentStream({
@@ -2544,28 +2607,45 @@ export class TicketRunner {
             changedFiles: guard.metadata.changedFiles,
           }
         });
-        const reviewerStream = useMediatedReviewer
-          ? this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "reviewer")
-          : null;
-        const verdict = await this.withHeartbeat(runId, ticket.id, "reviewer", "Reviewing diff.", () =>
-          useMediatedReviewer
-            ? this.gateway.runReviewerInWorkspace!({
-                cwd: workspace.worktreePath,
-                prompt: reviewerPromptOverride ?? reviewerToolingPrompt(ticket, diff),
-                runId,
-                ticketId: ticket.id,
-                epicId: ticket.epicId,
-                timeoutMs: reviewerTimeoutMs,
-                onStream: reviewerStream!.onStream
-              })
-            : this.withTimeout(
-                this.gateway.getReviewerVerdict(reviewerPrompt(ticket, null, null, diff)),
-                reviewerTimeoutMs,
-                `Reviewer timed out after ${reviewerTimeoutMs}ms`
-              )
-        ).finally(() => {
-          if (reviewerStream) this.endScopedAgentStream(runId, "reviewer", reviewerStream.sessionId);
-        });
+        let verdict: ReviewerVerdict;
+        if (useMediatedReviewer) {
+          const reviewerStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "reviewer");
+          try {
+            const contResult = await runContinuableReviewer({
+              ticketId: ticket.id,
+              epicId: ticket.epicId,
+              runId,
+              cwd: workspace.worktreePath,
+              prompt: reviewerToolingPrompt(ticket, diff),
+              timeoutMs: reviewerTimeoutMs,
+              gateway: this.gateway,
+              onStream: reviewerStream.onStream,
+            });
+            this.recordAgentStream({
+              agentRole: "reviewer",
+              source: "continuation-controller",
+              streamKind: "status",
+              content: `Reviewer completed: ${contResult.totalModelCalls} model calls, ${contResult.loopletCount} looplets, ${contResult.recoveredStalls} stall recoveries.`,
+              runId,
+              ticketId: ticket.id,
+              epicId: ticket.epicId,
+            });
+            verdict = contResult.output as ReviewerVerdict;
+            if (!verdict) {
+              throw new Error("Reviewer produced no verdict after continuation looplets.");
+            }
+          } finally {
+            this.endScopedAgentStream(runId, "reviewer", reviewerStream.sessionId);
+          }
+        } else {
+          verdict = await this.withHeartbeat(runId, ticket.id, "reviewer", "Reviewing diff.", () =>
+            this.withTimeout(
+              this.gateway.getReviewerVerdict(reviewerPrompt(ticket, null, null, diff)),
+              reviewerTimeoutMs,
+              `Reviewer timed out after ${reviewerTimeoutMs}ms`
+            )
+          );
+        }
 
         const blockers = [...new Set([...verdict.blockers, ...guard.blockers])];
         const suggestions = [...new Set([...verdict.suggestions, ...guard.suggestions])];
@@ -2595,40 +2675,21 @@ export class TicketRunner {
         lastError = error;
         const isStall = error instanceof StagnationError || error instanceof LoopTimeoutError;
 
-        // Two-tier stall recovery for reviewer
+        // For mediated reviewers, stalls are handled internally by the continuation controller.
+        // Only handle infra errors here.
         if (isStall && useMediatedReviewer) {
-          reviewerStallCount++;
-          if (reviewerStallCount === 1) {
-            this.recordAgentStream({
-              agentRole: "reviewer",
-              source: "orchestrator",
-              streamKind: "status",
-              content: `Reviewer stalled. Sending "continue" nudge...`,
-              runId,
-              ticketId: ticket.id,
-              epicId: ticket.epicId,
-              sequence: attempt,
-            });
-            reviewerPromptOverride = reviewerToolingPrompt(ticket, diff) + "\n\ncontinue";
-            attempt--;
-            continue;
-          }
-          const reason = error instanceof StagnationError
-            ? `${error.reason}: ${error.message}`
-            : `Loop timed out after ${error.elapsedMs}ms`;
-          reviewerPromptOverride = reviewerToolingPrompt(ticket, diff) + `\n\nSTALL RECOVERY: Previous attempt stalled because: ${reason}\nResume from where you left off. Do not restart from the beginning.`;
+          // Stalls should not escape the continuation controller, but if they do,
+          // treat as an infra error and retry.
           this.recordAgentStream({
             agentRole: "reviewer",
             source: "orchestrator",
             streamKind: "status",
-            content: `Reviewer stalled again (${reason.slice(0, 100)}). Hot-reset #${reviewerStallCount - 1} — retrying with stall context...`,
+            content: `Reviewer continuation controller threw stall error. Retrying...`,
             runId,
             ticketId: ticket.id,
             epicId: ticket.epicId,
             sequence: attempt,
           });
-          attempt--;
-          continue;
         }
 
         const errMsg = error instanceof Error ? error.message : String(error);
@@ -2819,51 +2880,29 @@ export class TicketRunner {
     ticket: TicketRecord,
     worktreePath: string,
     prompt: string,
-    stallCount = 0,
+    _stallCount?: number,
   ): Promise<string> {
     const explorerStream = this.startScopedAgentStream(runId, ticket.id, ticket.epicId, "explorer");
     try {
-      return await this.gateway.runExplorerInWorkspace!({
+      const result = await runContinuableExplorer({
+        ticketId: ticket.id,
+        epicId: ticket.epicId,
+        runId,
         cwd: worktreePath,
         prompt,
-        runId,
-        ticketId: ticket.id,
-        epicId: ticket.epicId,
+        gateway: this.gateway,
         onStream: explorerStream.onStream,
       });
-    } catch (err) {
-      const isStall = err instanceof StagnationError || err instanceof LoopTimeoutError;
-      if (!isStall) throw err;
-
-      stallCount++;
-      if (stallCount === 1) {
-        this.recordAgentStream({
-          agentRole: "explorer",
-          source: "orchestrator",
-          streamKind: "status",
-          content: `Explorer stalled. Sending "continue" nudge...`,
-          runId,
-          ticketId: ticket.id,
-          epicId: ticket.epicId,
-        });
-        return this.runExplorerWithStallRecovery(runId, ticket, worktreePath, prompt + "\n\ncontinue", stallCount);
-      }
-      const reason = err instanceof StagnationError
-        ? `${err.reason}: ${err.message}`
-        : `Loop timed out after ${err.elapsedMs}ms`;
       this.recordAgentStream({
         agentRole: "explorer",
-        source: "orchestrator",
+        source: "continuation-controller",
         streamKind: "status",
-        content: `Explorer stalled again (${reason.slice(0, 100)}). Hot-reset #${stallCount - 1} — retrying with stall context...`,
+        content: `Explorer completed: ${result.totalModelCalls} model calls, ${result.loopletCount} looplets, ${result.recoveredStalls} stall recoveries.`,
         runId,
         ticketId: ticket.id,
         epicId: ticket.epicId,
       });
-      return this.runExplorerWithStallRecovery(runId, ticket, worktreePath,
-        prompt + `\n\nSTALL RECOVERY: Previous attempt stalled because: ${reason}\nResume from where you left off. Do not restart from the beginning.`,
-        stallCount,
-      );
+      return result.output as string;
     } finally {
       this.endScopedAgentStream(runId, "explorer", explorerStream.sessionId);
     }

@@ -14,6 +14,7 @@ import { git } from "../bridge/git.ts";
 import { parseJsonText, validateGoalDecomposition } from "./validation.ts";
 import { readWorkspaceConfig } from "../config.ts";
 import { resolveRuntimeProfile } from "../runtime-profile.ts";
+import { runContinuableEpicDecoder } from "./continuation/controller.ts";
 
 export interface PlanRunInput {
   cwd: string;
@@ -134,16 +135,21 @@ export async function runPlanDecoder(input: PlanRunInput): Promise<PlanRunResult
   // mediated:<model> / anthropic-mediated:<model> — runs via MediatedAgentHarness
   if (gateway.runEpicDecoderInWorkspace && (configuredModel.startsWith("mediated:") || configuredModel.startsWith("anthropic-mediated:"))) {
     try {
-      const result = await gateway.runEpicDecoderInWorkspace({
+      const result = await runContinuableEpicDecoder({
+        epicId: planSessionId,
+        runId: null,
         cwd: input.cwd,
         prompt,
-        runId: null,
-        epicId: planSessionId,
+        gateway,
         onStream: input.onStream,
       });
-      return { plan: result, rawText: JSON.stringify(result) };
+      const output = result.output;
+      if (output && typeof output === "object" && "tickets" in output) {
+        return { plan: output as GoalDecomposition, rawText: JSON.stringify(output) };
+      }
+      return { plan: output as GoalDecomposition, rawText: JSON.stringify(output) };
     } catch (err) {
-      console.warn(`[PlanRunner] Mediated harness failed: ${err}. Falling back to Ollama.`);
+      console.warn(`[PlanRunner] Continuation decoder failed: ${err}. Falling back to Ollama.`);
     }
   }
 
